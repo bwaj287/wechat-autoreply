@@ -380,10 +380,10 @@ class AutoReplyRunner:
             roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= sweep_interval
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
             menu_signal_rising = actionable_menu_signal and current_menu_signal != last_claim_menu_signal
-            pending_follow_up_sweep = bool(queue) and actionable_menu_signal and roster_sweep_due
             should_sweep = (
                 idle_seconds >= idle_threshold
-                and (menu_signal_rising or pending_follow_up_sweep)
+                and actionable_menu_signal
+                and (menu_signal_rising or roster_sweep_due)
             )
             claim_result: dict[str, Any] | None = None
             if should_sweep:

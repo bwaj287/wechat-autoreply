@@ -931,6 +931,58 @@ def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
     assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
 
 
+def run_empty_queue_persistent_unread_sweeps_after_interval_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 30
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 9_150.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True, True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "no_candidate", first
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+
+    clock["now"] = 9_170.0
+    second = runner.tick()
+    assert second["status"] == "idle_wait", second
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+
+    clock["now"] = 9_182.0
+    third = runner.tick()
+    assert third["status"] == "no_candidate", third
+    assert fake_ui.calls == [
+        "activate",
+        ("probe", None),
+        "hide",
+        "activate",
+        ("probe", None),
+        "hide",
+    ], fake_ui.calls
+
+
 def run_send_confirmation_retry_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -1384,6 +1436,7 @@ def main() -> int:
     run_unknown_menu_signal_does_not_claim_path()
     run_non_whitelist_unread_cleared_path()
     run_empty_queue_persistent_unread_waits_for_signal_change_path()
+    run_empty_queue_persistent_unread_sweeps_after_interval_path()
     print("selftest: ok")
     return 0
 
