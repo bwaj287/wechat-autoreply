@@ -14,6 +14,11 @@ from .ocr import ocr_image
 
 
 DIGIT_RE = re.compile(r"\d+")
+BADGE_ROI_X_RATIO = 0.58
+BADGE_ROI_Y_RATIO = 0.12
+BADGE_ROI_H_RATIO = 0.76
+OCR_UPSCALE_FACTOR = 3
+ADAPTIVE_THRESHOLD_OFFSET = 8
 
 
 def _control_center_items() -> list[dict[str, Any]]:
@@ -246,8 +251,24 @@ def _digit_like_component_exists(path: Path) -> bool:
 
 
 def _read_badge_digits(path: Path) -> str:
+    variants = _prepare_badge_ocr_variants(path)
     try:
-        observations = ocr_image(path)
+        for variant in variants:
+            digits = _extract_badge_digits(ocr_image(variant), min_x=0.0)
+            if digits:
+                return digits
+        return _extract_badge_digits(ocr_image(path), min_x=0.5)
+    except Exception:
+        return ""
+    finally:
+        for variant in variants:
+            variant.unlink(missing_ok=True)
+
+
+def _extract_badge_digits(observations: list[dict[str, Any]], min_x: float = 0.0) -> str:
+    try:
+        if not isinstance(observations, list):
+            return ""
     except Exception:
         return ""
     best = ""
@@ -266,6 +287,67 @@ def _read_badge_digits(path: Path) -> str:
             best = digits
             best_x = x
     return best
+
+
+def _badge_roi_bounds(width: int, height: int) -> tuple[int, int, int, int]:
+    x0 = max(0, min(width - 2, int(width * BADGE_ROI_X_RATIO)))
+    y0 = max(0, min(height - 2, int(height * BADGE_ROI_Y_RATIO)))
+    roi_h = max(2, int(height * BADGE_ROI_H_RATIO))
+    y1 = min(height, y0 + roi_h)
+    if y1 - y0 < 2:
+        y0 = max(0, height - 2)
+        y1 = height
+    x1 = width
+    return x0, y0, x1, y1
+
+
+def _prepare_badge_ocr_variants(path: Path) -> list[Path]:
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+    except Exception:
+        return []
+
+    source = Image.open(path).convert("RGB")
+    width, height = source.size
+    x0, y0, x1, y1 = _badge_roi_bounds(width, height)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return []
+
+    roi = source.crop((x0, y0, x1, y1))
+    upscaled = roi.resize(
+        (max(2, roi.width * OCR_UPSCALE_FACTOR), max(2, roi.height * OCR_UPSCALE_FACTOR)),
+        resample=Image.Resampling.BICUBIC,
+    )
+    grayscale = ImageOps.grayscale(upscaled)
+
+    local_mean = grayscale.filter(ImageFilter.BoxBlur(2))
+    src_px = grayscale.load()
+    mean_px = local_mean.load()
+    bw = Image.new("L", grayscale.size, 255)
+    bw_px = bw.load()
+    black_pixels = 0
+    total_pixels = max(1, grayscale.width * grayscale.height)
+    for y in range(grayscale.height):
+        for x in range(grayscale.width):
+            if int(src_px[x, y]) >= int(mean_px[x, y]) + ADAPTIVE_THRESHOLD_OFFSET:
+                bw_px[x, y] = 0
+                black_pixels += 1
+            else:
+                bw_px[x, y] = 255
+
+    variants: list[Path] = []
+    images = [bw, ImageOps.invert(bw)]
+    black_ratio = black_pixels / float(total_pixels)
+    if black_ratio < 0.01 or black_ratio > 0.60:
+        images.insert(0, grayscale)
+
+    for image in images:
+        handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        handle.close()
+        variant_path = Path(handle.name)
+        image.save(variant_path, format="PNG")
+        variants.append(variant_path)
+    return variants
 
 
 def unread_signal() -> str:
