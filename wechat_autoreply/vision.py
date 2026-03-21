@@ -278,7 +278,12 @@ def unread_signal() -> str:
     try:
         if not _digit_like_component_exists(capture_path):
             return ""
-        return _read_badge_digits(capture_path) or "?"
+        digits = _read_badge_digits(capture_path)
+        if digits:
+            return digits
+        # OCR occasionally misses tiny menubar digits (e.g. "1") even when badge glyphs are present.
+        # Fall back to a conservative actionable signal so claim flow still runs.
+        return "1"
     finally:
         capture_path.unlink(missing_ok=True)
 
