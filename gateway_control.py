@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import datetime
 from typing import Any
 
@@ -23,7 +24,7 @@ TRACE_TYPES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control the WeChat auto-reply runner.")
-    parser.add_argument("command", choices=["on", "off", "status"])
+    parser.add_argument("command", choices=["on", "off", "status", "queue"])
     return parser.parse_args()
 
 
@@ -89,13 +90,43 @@ def recent_trace_lines(limit: int = 5) -> list[str]:
 
 
 def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
-    pending_queue = state.get("pending_queue") or []
-    pending_count = len(pending_queue) if isinstance(pending_queue, list) else (1 if state.get("pending") else 0)
+    pending_queue = _pending_queue(state)
+    pending_count = len(pending_queue)
     base = status_line(config, pending_count)
     traces = recent_trace_lines()
     if not traces:
         return base
     return "\n".join([base, "最近记录：", *traces])
+
+
+def _pending_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
+    pending_queue = state.get("pending_queue")
+    if isinstance(pending_queue, list):
+        return [item for item in pending_queue if isinstance(item, dict)]
+    pending = state.get("pending")
+    return [pending] if isinstance(pending, dict) else []
+
+
+def _format_queue_item(index: int, item: dict[str, Any], now: float) -> str:
+    contact = str(item.get("contact") or "?").strip()
+    inbound = _shorten(str(item.get("inbound_text") or ""), 36) or "-"
+    draft = _shorten(str(item.get("draft_text") or ""), 42) or "-"
+    due_at = float(item.get("due_at", 0.0) or 0.0)
+    due_seconds = int(round(due_at - now)) if due_at else 0
+    due_label = f"{max(due_seconds, 0)}s后" if due_seconds >= 0 else f"已超时{abs(due_seconds)}s"
+    return f"{index}. {contact} · {due_label} | 入站：{inbound} | 草稿：{draft}"
+
+
+def queue_output(config: dict[str, Any], state: dict[str, Any]) -> str:
+    queue = _pending_queue(state)
+    base = status_line(config, len(queue))
+    if not queue:
+        return f"{base}\n队列为空"
+    now = time.time()
+    lines = [base, "待发送队列："]
+    for idx, item in enumerate(queue, 1):
+        lines.append(_format_queue_item(idx, item, now))
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -111,9 +142,10 @@ def main() -> int:
     state = load_state()
     if args.command == "status":
         print(status_output(config, state))
+    elif args.command == "queue":
+        print(queue_output(config, state))
     else:
-        pending_queue = state.get("pending_queue") or []
-        pending_count = len(pending_queue) if isinstance(pending_queue, list) else (1 if state.get("pending") else 0)
+        pending_count = len(_pending_queue(state))
         print(status_line(config, pending_count))
     return 0
 
