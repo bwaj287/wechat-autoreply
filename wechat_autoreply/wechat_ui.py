@@ -1,0 +1,685 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from .ocr import ocr_image
+from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, ROW_BADGE_HELPER, WECHAT_APP
+from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
+
+IGNORE_TEXTS = {
+    "Search",
+    "Hold to Fn to use voice input",
+}
+TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+DOCK_WECHAT_NAMES = ["WeChat", "Weixin"]
+TEXT_SIGNAL_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
+EMOJI_CHAR_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u27BF"
+    "]"
+)
+NON_TEXT_HINT_RE = re.compile(r"(表情|emoji|sticker|贴纸|动画表情|动画|emoticon)", re.IGNORECASE)
+BRACKETED_HINT_RE = re.compile(r"^[\[\(（【<〈《].{1,12}[\]\)）】>〉》]$")
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def normalize_name_for_match(text: str) -> str:
+    value = normalize_text(text)
+    return value.translate(str.maketrans({"0": "o"}))
+
+
+def names_match(a: str, b: str) -> bool:
+    an = normalize_name_for_match(a)
+    bn = normalize_name_for_match(b)
+    return bool(an and bn and (an == bn or an in bn or bn in an))
+
+
+def has_text_signal(text: str) -> bool:
+    return bool(TEXT_SIGNAL_RE.search((text or "").strip()))
+
+
+def is_nontext_message(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    if NON_TEXT_HINT_RE.search(value):
+        return True
+    if BRACKETED_HINT_RE.fullmatch(value) and not has_text_signal(value):
+        return True
+    return bool(EMOJI_CHAR_RE.search(value))
+
+
+def has_meaningful_text(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    return has_text_signal(value) or is_nontext_message(value)
+
+
+def has_signal_text(text: str) -> bool:
+    return has_meaningful_text(text)
+
+
+def _click_dock_item(name: str) -> bool:
+    script = f"""
+tell application "System Events"
+  tell process "Dock"
+    try
+      click UI element "{name}" of list 1
+      return "clicked"
+    on error
+      return "missing"
+    end try
+  end tell
+end tell
+"""
+    out = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
+    return out == "clicked"
+
+
+def activate_wechat() -> None:
+    for name in DOCK_WECHAT_NAMES:
+        if _click_dock_item(name):
+            time.sleep(0.5)
+            return
+    run(["osascript", "-e", 'tell application "WeChat" to activate', "-e", "delay 0.4"], timeout=30)
+
+
+def hide_wechat() -> None:
+    scripts = [
+        """
+tell application "System Events"
+  if exists process "WeChat" then
+    set visible of process "WeChat" to false
+    return "hidden"
+  end if
+end tell
+return "missing"
+""",
+        """
+tell application "System Events"
+  if exists process "Weixin" then
+    set visible of process "Weixin" to false
+    return "hidden"
+  end if
+end tell
+return "missing"
+""",
+        """
+tell application "System Events"
+  keystroke "h" using {command down}
+end tell
+return "hidden"
+""",
+    ]
+    errors: list[str] = []
+    for script in scripts:
+        try:
+            result = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
+            if result in {"hidden", "missing", ""}:
+                return
+        except Exception as exc:  # pragma: no cover - exercised only on macOS host
+            errors.append(str(exc))
+    raise RuntimeError(" ; ".join(errors) or "failed to hide wechat")
+
+
+def list_wechat_windows() -> list[dict[str, Any]]:
+    payload = json.loads(
+        run_peekaboo_variants(
+            peekaboo_commands(["list", "windows", "--app", WECHAT_APP, "--json"]),
+            timeout=120,
+        ).stdout
+    )
+    windows: list[dict[str, Any]] = []
+    for window in payload.get("data", {}).get("windows", []):
+        bounds = window.get("bounds") or []
+        if len(bounds) != 2:
+            continue
+        (x, y), (width, height) = bounds
+        if width < 50 or height < 50:
+            continue
+        windows.append(
+            {
+                "title": (window.get("title") or "").strip(),
+                "x": int(x),
+                "y": int(y),
+                "width": int(width),
+                "height": int(height),
+                "window_id": int(window.get("window_id", 0) or 0),
+                "index": int(window.get("index", 0) or 0),
+                "isMainWindow": bool(window.get("isMainWindow", False)),
+            }
+        )
+    return windows
+
+
+def choose_roster_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = [window for window in windows if window["title"] == "Weixin"]
+    if not candidates:
+        raise RuntimeError(f"no roster window found: {windows!r}")
+    return max(candidates, key=lambda item: item["width"] * item["height"])
+
+
+def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [
+        window
+        for window in windows
+        if window["width"] >= 250
+        and window["height"] >= 250
+        and window["title"] not in {"Weixin", "WeChat (Window)"}
+    ]
+    if not candidates:
+        return None
+    main_candidates = [window for window in candidates if window.get("isMainWindow")]
+    if main_candidates:
+        return max(main_candidates, key=lambda item: item["width"] * item["height"])
+    return max(candidates, key=lambda item: item["width"] * item["height"])
+
+
+def capture_window(path: Path, info: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "image",
+        "--app",
+        WECHAT_APP,
+        "--mode",
+        "window",
+        "--path",
+        str(path),
+        "--json",
+    ]
+    if info.get("window_id"):
+        args.extend(["--window-id", str(info["window_id"])])
+    else:
+        args.extend(["--window-title", info["title"]])
+    run_peekaboo_variants(peekaboo_commands(args), timeout=120)
+    return path
+
+
+def _is_time(text: str) -> bool:
+    return bool(TIME_RE.fullmatch(text.strip().rstrip(".")))
+
+
+def _global_coords(info: dict[str, Any], obs: dict[str, Any]) -> tuple[int, int]:
+    bbox = obs["bbox"]
+    gx = info["x"] + (float(bbox["x"]) + float(bbox["w"]) / 2.0) * info["width"]
+    gy = info["y"] + (1.0 - (float(bbox["y"]) + float(bbox["h"]) / 2.0)) * info["height"]
+    return int(round(gx)), int(round(gy))
+
+
+def _cluster_rows(items: list[dict[str, Any]], threshold: float = 0.06) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in sorted(items, key=lambda candidate: candidate["center"]["y"]):
+        cy = item["center"]["y"]
+        placed = False
+        for row in rows:
+            if abs(row["cy"] - cy) <= threshold:
+                row["items"].append(item)
+                row["cy"] = sum(entry["center"]["y"] for entry in row["items"]) / len(row["items"])
+                placed = True
+                break
+        if not placed:
+            rows.append({"cy": cy, "items": [item]})
+    return rows
+
+
+def _prepare_ocr_items(image_path: Path) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for item in ocr_image(image_path):
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        bbox = item.get("bbox") or {}
+        x = float(bbox.get("x", 0.0))
+        y = float(bbox.get("y", 0.0))
+        w = float(bbox.get("w", 0.0))
+        h = float(bbox.get("h", 0.0))
+        top = 1.0 - (y + h)
+        prepared.append(
+            {
+                "text": text,
+                "confidence": float(item.get("confidence", 0.0)),
+                "bbox": {"x": x, "y": y, "w": w, "h": h, "top": top, "left": x},
+                "center": {"x": x + w / 2.0, "y": top + h / 2.0},
+            }
+        )
+    _annotate_bubble_roles(prepared, image_path)
+    return prepared
+
+
+def _annotate_bubble_roles(items: list[dict[str, Any]], image_path: Path) -> None:
+    if not items:
+        return
+    payload = [
+        {
+            "index": index,
+            "x": float(item["bbox"].get("x", 0.0)),
+            "y": float(item["bbox"].get("y", 0.0)),
+            "w": float(item["bbox"].get("w", 0.0)),
+            "h": float(item["bbox"].get("h", 0.0)),
+        }
+        for index, item in enumerate(items)
+    ]
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        tmp_path = Path(handle.name)
+    try:
+        proc = subprocess.run(
+            ["swift", str(BUBBLE_ROLE_HELPER), str(image_path), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+        role_payload = json.loads(proc.stdout)
+    except Exception:
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    for role_item in role_payload.get("items", []):
+        index = int(role_item.get("index", -1))
+        if 0 <= index < len(items):
+            items[index]["bubbleRole"] = str(role_item.get("role", "unknown"))
+            items[index]["greenPixels"] = int(role_item.get("greenPixels", 0))
+            items[index]["grayPixels"] = int(role_item.get("grayPixels", 0))
+
+
+def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str, Any]) -> list[dict[str, Any]]:
+    if window_info.get("width", 0) >= 1000:
+        min_left, max_left, min_width = 0.025, 0.26, 0.015
+    else:
+        min_left, max_left, min_width = 0.12, 0.38, 0.025
+    candidates: list[dict[str, Any]] = []
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    for obs in obs_list:
+        left = obs["bbox"]["left"]
+        top = obs["bbox"]["top"]
+        width = obs["bbox"]["w"]
+        if left < min_left or left > max_left:
+            continue
+        if top < 0.08 or top > 0.985:
+            continue
+        if width < min_width:
+            continue
+        if normalize_text(obs["text"]) in ignored:
+            continue
+        candidates.append(obs)
+
+    chats: list[dict[str, Any]] = []
+    for row in _cluster_rows(candidates):
+        items = sorted(row["items"], key=lambda entry: (entry["bbox"]["top"], entry["bbox"]["left"]))
+        name_item = None
+        preview_item = None
+        time_item = None
+        for item in items:
+            if _is_time(item["text"]):
+                time_item = item
+                continue
+            if not name_item:
+                name_item = item
+            elif not preview_item and item["text"] != name_item["text"]:
+                preview_item = item
+        if not name_item:
+            continue
+        if len(name_item["text"]) <= 1 and not re.search(r"[A-Za-z\u4e00-\u9fff]", name_item["text"]):
+            continue
+        gx, gy = _global_coords(window_info, name_item)
+        chats.append(
+            {
+                "name": name_item["text"],
+                "preview": preview_item["text"] if preview_item else "",
+                "time": time_item["text"] if time_item else "",
+                "ocrTop": round(name_item["bbox"]["top"], 4),
+                "click": {"x": gx, "y": gy},
+            }
+        )
+    chats.sort(key=lambda item: item["ocrTop"])
+    return chats
+
+
+def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> list[dict[str, Any]]:
+    if not chats:
+        return chats
+    rows: list[dict[str, Any]] = []
+    tops = [chat["ocrTop"] for chat in chats]
+    for index, chat in enumerate(chats):
+        current = tops[index]
+        prev_mid = (tops[index - 1] + current) / 2.0 if index > 0 else max(0.08, current - 0.08)
+        next_mid = (current + tops[index + 1]) / 2.0 if index + 1 < len(tops) else min(0.96, current + 0.12)
+        rows.append(
+            {
+                "index": index,
+                "name": chat["name"],
+                "rowTop": round(prev_mid, 4),
+                "rowBottom": round(next_mid, 4),
+            }
+        )
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+        json.dump(rows, handle, ensure_ascii=False)
+        tmp_path = Path(handle.name)
+    try:
+        payload = json.loads(
+            run(["swift", str(ROW_BADGE_HELPER), str(roster_path), str(tmp_path)], timeout=120).stdout
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    marks = {item["index"]: item for item in payload.get("rows", [])}
+    for index, chat in enumerate(chats):
+        mark = marks.get(index, {})
+        chat["redPixelCount"] = int(mark.get("redPixelCount", 0))
+        chat["unread"] = bool(mark.get("unread", False))
+    return chats
+
+
+def find_chat(chats: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
+    for chat in chats:
+        if names_match(chat["name"], target):
+            return chat
+    return None
+
+
+def click_coords(x: int, y: int) -> None:
+    run_peekaboo_variants(
+        peekaboo_commands(["click", "--coords", f"{x},{y}", "--app", WECHAT_APP, "--json"]),
+        timeout=60,
+    )
+
+
+def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
+    candidates: list[dict[str, Any]] = []
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    for obs in obs_list:
+        text = obs["text"]
+        left = obs["bbox"]["left"]
+        top = obs["bbox"]["top"]
+        width = obs["bbox"]["w"]
+        if left < 0.38 or top > 0.12 or width < 0.04:
+            continue
+        if _is_time(text):
+            continue
+        if normalize_text(text) in ignored:
+            continue
+        candidates.append(obs)
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item["bbox"]["top"], -item["bbox"]["w"]))
+    return candidates[0]["text"]
+
+
+def _pick_chat_window_title(obs_list: list[dict[str, Any]]) -> str:
+    candidates: list[dict[str, Any]] = []
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    for obs in obs_list:
+        text = obs["text"]
+        left = obs["bbox"]["left"]
+        top = obs["bbox"]["top"]
+        width = obs["bbox"]["w"]
+        if top > 0.15 or left > 0.30 or width < 0.04:
+            continue
+        if _is_time(text):
+            continue
+        if normalize_text(text) in ignored:
+            continue
+        candidates.append(obs)
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))
+    return candidates[0]["text"]
+
+
+def _join_texts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    return "".join(parts) if any(re.search(r"[\u4e00-\u9fff]", part) for part in parts) else " ".join(parts)
+
+
+def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    rows = _cluster_rows(
+        [
+            {
+                "text": item["text"],
+                "bbox": {"top": item["top"], "left": item["left"], "w": item["width"]},
+                "center": {"y": item["top"] + 0.01},
+            }
+            for item in items
+        ],
+        threshold=0.07,
+    )
+    collapsed: list[dict[str, Any]] = []
+    for row in rows:
+        row_items = sorted(row["items"], key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))
+        collapsed.append(
+            {
+                "text": _join_texts([item["text"] for item in row_items]),
+                "top": round(min(item["bbox"]["top"] for item in row_items), 4),
+                "left": round(min(item["bbox"]["left"] for item in row_items), 4),
+                "width": round(max(item["bbox"]["w"] for item in row_items), 4),
+            }
+        )
+    collapsed.sort(key=lambda item: item["top"])
+    return collapsed
+
+
+def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
+    inbound_raw: list[dict[str, Any]] = []
+    outbound_raw: list[dict[str, Any]] = []
+    misc_raw: list[dict[str, Any]] = []
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    for obs in sorted(obs_list, key=lambda item: item["bbox"]["top"]):
+        text = obs["text"]
+        left = obs["bbox"]["left"]
+        top = obs["bbox"]["top"]
+        width = obs["bbox"]["w"]
+        if top < 0.11 or top > 0.90:
+            continue
+        if left < 0.38 or width < 0.02:
+            continue
+        if _is_time(text) or text == selected_title:
+            continue
+        if normalize_text(text) in ignored or text.startswith("Hold to Fn"):
+            continue
+        if not has_signal_text(text):
+            continue
+        bucket = {
+            "text": text,
+            "top": round(top, 4),
+            "left": round(left, 4),
+            "width": round(width, 4),
+            "bubbleRole": str(obs.get("bubbleRole", "unknown")),
+        }
+        bubble_role = str(obs.get("bubbleRole", "unknown"))
+        if bubble_role == "outbound" or left >= 0.72:
+            outbound_raw.append(bucket)
+        elif bubble_role == "inbound" or left >= 0.44:
+            inbound_raw.append(bucket)
+        else:
+            misc_raw.append(bucket)
+    inbound = _collapse_panel_lines(inbound_raw)
+    outbound = _collapse_panel_lines(outbound_raw)
+    misc = _collapse_panel_lines(misc_raw)
+    return {
+        "title": selected_title,
+        "latestInbound": inbound[-1]["text"] if inbound else "",
+        "latestOutbound": outbound[-1]["text"] if outbound else "",
+        "inbound": inbound,
+        "outbound": outbound,
+        "misc": misc,
+    }
+
+
+def _extract_chat_window_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
+    inbound_raw: list[dict[str, Any]] = []
+    outbound_raw: list[dict[str, Any]] = []
+    misc_raw: list[dict[str, Any]] = []
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    for obs in sorted(obs_list, key=lambda item: item["bbox"]["top"]):
+        text = obs["text"]
+        left = obs["bbox"]["left"]
+        top = obs["bbox"]["top"]
+        width = obs["bbox"]["w"]
+        if top < 0.12 or top > 0.92 or width < 0.025:
+            continue
+        if _is_time(text) or text == selected_title:
+            continue
+        if normalize_text(text) in ignored or text.startswith("Hold to Fn"):
+            continue
+        if top > 0.82 and left < 0.40 and width < 0.15:
+            continue
+        if not has_signal_text(text):
+            continue
+        bucket = {
+            "text": text,
+            "top": round(top, 4),
+            "left": round(left, 4),
+            "width": round(width, 4),
+            "bubbleRole": str(obs.get("bubbleRole", "unknown")),
+        }
+        bubble_role = str(obs.get("bubbleRole", "unknown"))
+        if bubble_role == "outbound" or left >= 0.55:
+            outbound_raw.append(bucket)
+        elif bubble_role == "inbound" or left >= 0.08:
+            inbound_raw.append(bucket)
+        else:
+            misc_raw.append(bucket)
+    inbound = _collapse_panel_lines(inbound_raw)
+    outbound = _collapse_panel_lines(outbound_raw)
+    misc = _collapse_panel_lines(misc_raw)
+    return {
+        "title": selected_title,
+        "latestInbound": inbound[-1]["text"] if inbound else "",
+        "latestOutbound": outbound[-1]["text"] if outbound else "",
+        "inbound": inbound,
+        "outbound": outbound,
+        "misc": misc,
+    }
+
+
+def _panel_has_content(panel: dict[str, Any]) -> bool:
+    return bool(
+        panel.get("title")
+        or panel.get("latestInbound")
+        or panel.get("latestOutbound")
+        or panel.get("inbound")
+        or panel.get("outbound")
+        or panel.get("misc")
+    )
+
+
+def probe(select_chat: str | None = None, sleep_after_click: float = 1.0) -> dict[str, Any]:
+    activate_wechat()
+    windows = list_wechat_windows()
+    roster_info = choose_roster_window(windows)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    roster_path = CAPTURE_DIR / f"wechat-roster-{timestamp}.png"
+    capture_window(roster_path, roster_info)
+    roster_obs = _prepare_ocr_items(roster_path)
+    chats = annotate_unread_chats(extract_visible_chats(roster_obs, roster_info), roster_path)
+
+    selected_requested = select_chat or ""
+    selected_chat = None
+    if select_chat:
+        match = find_chat(chats, select_chat)
+        if not match:
+            return {
+                "status": "chat_not_visible",
+                "target": select_chat,
+                "window": roster_info,
+                "screenshot": str(roster_path),
+                "visibleChats": chats,
+            }
+        click_coords(match["click"]["x"], match["click"]["y"])
+        time.sleep(max(sleep_after_click, 0.2))
+        windows = list_wechat_windows()
+        roster_info = choose_roster_window(windows)
+        capture_window(roster_path, roster_info)
+        roster_obs = _prepare_ocr_items(roster_path)
+        chats = annotate_unread_chats(extract_visible_chats(roster_obs, roster_info), roster_path)
+        selected_chat = match["name"]
+
+    windows = list_wechat_windows()
+    chat_window = choose_chat_window(windows)
+    fallback_title = selected_chat or _pick_selected_title(roster_obs)
+    if chat_window:
+        chat_path = CAPTURE_DIR / f"wechat-chat-{timestamp}.png"
+        capture_window(chat_path, chat_window)
+        chat_obs = _prepare_ocr_items(chat_path)
+        title = _pick_chat_window_title(chat_obs)
+        panel = _extract_chat_window_panel(chat_obs, selected_title=title)
+        if not _panel_has_content(panel):
+            title = fallback_title
+            panel = _extract_chat_panel(roster_obs, selected_title=title)
+            chat_path = roster_path
+    else:
+        chat_path = None
+        panel = _extract_chat_panel(roster_obs, selected_title=fallback_title)
+
+    active_chat = (chat_window or {}).get("title") or panel.get("title") or ""
+    return {
+        "status": "ok",
+        "window": roster_info,
+        "chatWindow": chat_window,
+        "screenshot": str(chat_path or roster_path),
+        "screenshots": {"roster": str(roster_path), "chat": str(chat_path) if chat_path else ""},
+        "visibleChats": chats,
+        "selectedChat": selected_chat,
+        "selectedChatRequested": selected_requested,
+        "activeChat": active_chat,
+        "selectionConfirmed": True if not selected_requested else names_match(selected_requested, active_chat),
+        "chatPanel": panel,
+    }
+
+
+def _input_coords(probe_result: dict[str, Any]) -> tuple[int, int]:
+    window = probe_result.get("chatWindow") or probe_result.get("window") or {}
+    is_split_chat = bool(probe_result.get("chatWindow"))
+    if is_split_chat:
+        x = window["x"] + int(window["width"] * 0.28)
+        y = window["y"] + int(window["height"] * 0.92)
+    else:
+        x = window["x"] + int(window["width"] * 0.63)
+        y = window["y"] + int(window["height"] * 0.91)
+    return x, y
+
+
+def focus_input_box(probe_result: dict[str, Any]) -> None:
+    x, y = _input_coords(probe_result)
+    click_coords(x, y)
+    time.sleep(0.15)
+    click_coords(x, y)
+    time.sleep(0.2)
+
+
+def paste_text(text: str) -> None:
+    run_peekaboo_variants(
+        peekaboo_commands(["paste", "--text", text, "--app", WECHAT_APP, "--json"]),
+        timeout=60,
+    )
+    time.sleep(0.2)
+
+
+def send_message() -> None:
+    run_peekaboo_variants(
+        peekaboo_commands(["press", "return", "--app", WECHAT_APP, "--json"]),
+        timeout=60,
+    )
+    time.sleep(0.5)
