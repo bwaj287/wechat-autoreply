@@ -123,7 +123,10 @@ def _format_event_compact(event: dict[str, Any]) -> str:
     event_type = str(event.get("type") or "")
     contact = str(event.get("contact") or "").strip()
     reason = str(event.get("reason") or "").strip()
-    parts = [f"[{ts}]", event_type]
+    display_type = "非正常状态栏数字和红点" if event_type == "claim_logic_bug" else event_type
+    if event_type == "claim_logic_bug":
+        reason = "非正常状态栏数字和红点"
+    parts = [f"[{ts}]", display_type]
     if contact:
         parts.append(f"contact={contact}")
     if reason:

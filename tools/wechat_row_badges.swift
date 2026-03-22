@@ -169,15 +169,17 @@ func findComponents(
 var results: [RowResult] = []
 for row in rows {
     let nameLeft = row.nameLeft ?? 0.15
-    let minScanX = Swift.max(0.01, nameLeft - 0.14)
-    let maxScanX = Swift.min(0.30, nameLeft + 0.08)
+    // Only scan the avatar top-right badge lane to avoid false positives
+    // from colorful avatars or preview snippets.
+    let minScanX = Swift.max(0.03, nameLeft - 0.08)
+    let maxScanX = Swift.min(0.20, nameLeft - 0.005)
     let x0 = clamp(Int(Double(width) * minScanX), min: 0, max: width - 1)
     let x1 = clamp(Int(Double(width) * maxScanX), min: x0 + 1, max: width)
     let yTop = clamp(Int(row.rowTop * Double(height)), min: 0, max: height - 1)
     let yBottom = clamp(Int(row.rowBottom * Double(height)), min: yTop + 1, max: height)
     let rowHeight = Swift.max(1, yBottom - yTop)
-    let minBadgeHeight = Swift.max(5, Int(Double(rowHeight) * 0.12))
-    let maxBadgeHeight = Swift.max(minBadgeHeight + 3, Int(Double(rowHeight) * 0.52))
+    let minBadgeHeight = Swift.max(6, Int(Double(rowHeight) * 0.14))
+    let maxBadgeHeight = Swift.max(minBadgeHeight + 3, Int(Double(rowHeight) * 0.38))
     let minBadgeWidth = minBadgeHeight
     let maxBadgeWidth = Swift.max(maxBadgeHeight, Int(Double(rowHeight) * 1.05))
     let minPixels = Swift.max(14, Int(Double(minBadgeHeight * minBadgeHeight) * 0.28))
@@ -197,11 +199,11 @@ for row in rows {
             && component.height <= maxBadgeHeight
             && component.fillRatio >= 0.20
             && aspect >= 0.45
-            && aspect <= 3.20
+            && aspect <= 2.30
             && centerXNorm >= minCenterX
             && centerXNorm <= maxCenterX
-            && centerYNorm >= 0.18
-            && centerYNorm <= 0.74
+            && centerYNorm >= 0.08
+            && centerYNorm <= 0.52
     }
     let best = candidates.max(by: { lhs, rhs in
         if lhs.count == rhs.count {

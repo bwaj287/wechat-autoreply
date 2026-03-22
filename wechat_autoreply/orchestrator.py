@@ -305,7 +305,7 @@ def queued_contacts(queue: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("contact", "")).strip() for item in queue if item.get("contact")]
 
 
-def latest_committed_outbound(panel: dict[str, Any], max_top: float = 0.78) -> str:
+def latest_committed_outbound(panel: dict[str, Any], max_top: float = 0.90) -> str:
     item = latest_committed_outbound_item(panel, max_top=max_top)
     if not item:
         if list(panel.get("outbound") or []):
@@ -314,7 +314,7 @@ def latest_committed_outbound(panel: dict[str, Any], max_top: float = 0.78) -> s
     return str(item.get("text", "")).strip()
 
 
-def latest_committed_outbound_item(panel: dict[str, Any], max_top: float = 0.78) -> dict[str, Any]:
+def latest_committed_outbound_item(panel: dict[str, Any], max_top: float = 0.90) -> dict[str, Any]:
     outbound = list(panel.get("outbound") or [])
     if not outbound:
         return {}
@@ -331,7 +331,7 @@ def latest_meaningful_inbound_top(panel: dict[str, Any]) -> float | None:
     return max(float(item.get("top", 0.0) or 0.0) for item in inbound_items)
 
 
-def latest_message_is_outbound(panel: dict[str, Any], *, max_top: float = 0.78, epsilon: float = 0.01) -> bool:
+def latest_message_is_outbound(panel: dict[str, Any], *, max_top: float = 0.90, epsilon: float = 0.01) -> bool:
     inbound_top = latest_meaningful_inbound_top(panel)
     outbound_item = latest_committed_outbound_item(panel, max_top=max_top)
     if inbound_top is None or not outbound_item:
@@ -436,14 +436,34 @@ class AutoReplyRunner:
                 result = {"status": "disabled"}
                 return result
 
-            if now - float(state.get("last_menu_check_at", 0.0) or 0.0) >= float(
-                config.get("menubar_check_interval_seconds", 15)
-            ):
+            idle_seconds = float(self.idle.get_idle_time_seconds())
+            idle_threshold = float(config.get("idle_threshold_seconds", 30))
+            idle_probe_armed = bool(state.get("idle_probe_armed", True))
+            if idle_seconds < idle_threshold:
+                # While user is active, don't sample menubar digits; clear transient menu signal
+                # to avoid stale "has digit" state triggering a late false open.
+                state["idle_probe_armed"] = True
+                idle_probe_armed = True
+                state["last_menu_unread"] = False
+                state["last_menu_signal"] = ""
+                state["last_claim_menu_signal"] = ""
+                state["pending_menu_clear_streak"] = 0
+
+            menu_checked_now = False
+            should_check_menu = False
+            if idle_seconds >= idle_threshold:
+                check_interval_due = now - float(state.get("last_menu_check_at", 0.0) or 0.0) >= float(
+                    config.get("menubar_check_interval_seconds", 15)
+                )
+                should_check_menu = check_interval_due or idle_probe_armed
+            if should_check_menu:
                 menu_signal = self._menu_unread_signal()
                 has_unread = bool(menu_signal)
                 state["last_menu_unread"] = has_unread
                 state["last_menu_signal"] = menu_signal
                 state["last_menu_check_at"] = now
+                menu_checked_now = True
+                state["idle_probe_armed"] = False
                 pending_snapshot = state.get("pending_queue")
                 has_pending_snapshot = isinstance(pending_snapshot, list) and bool(pending_snapshot)
                 if not has_pending_snapshot and state.get("pending"):
@@ -476,10 +496,6 @@ class AutoReplyRunner:
                         retention_seconds=float(cleanup.get("retention_seconds", 0.0) or 0.0),
                     )
 
-            idle_seconds = float(self.idle.get_idle_time_seconds())
-            idle_threshold = float(config.get("idle_threshold_seconds", 30))
-            if idle_seconds < idle_threshold:
-                state["idle_probe_armed"] = True
             queue = sync_pending_state(state)
             stale_ttl_seconds = float(config.get("pending_stale_ttl_seconds", 86400))
             queue, stale_removed = prune_stale_pending(queue, now=now, ttl_seconds=stale_ttl_seconds)
@@ -495,22 +511,22 @@ class AutoReplyRunner:
                 )
             had_queue = bool(queue)
             current_menu_signal = str(state.get("last_menu_signal") or "")
-            last_claim_menu_signal = str(state.get("last_claim_menu_signal") or "")
-            sweep_interval = float(config.get("roster_sweep_interval_seconds", 60))
-            roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= sweep_interval
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
-            menu_signal_rising = actionable_menu_signal and current_menu_signal != last_claim_menu_signal
-            sweep_while_pending = bool(config.get("sweep_while_pending", False))
-            allow_periodic_sweep = (not had_queue) or sweep_while_pending
             should_sweep = (
                 idle_seconds >= idle_threshold
                 and actionable_menu_signal
-                and (menu_signal_rising or (allow_periodic_sweep and roster_sweep_due))
+                and menu_checked_now
             )
             claim_result: dict[str, Any] | None = None
             if should_sweep:
+                state["idle_probe_armed"] = False
                 state["last_claim_menu_signal"] = current_menu_signal
-                claim_result = self._handle_claim(config, state, idle_seconds, now)
+                claim_result = self._handle_claim(
+                    config,
+                    state,
+                    idle_seconds,
+                    now,
+                )
                 queue = sync_pending_state(state)
 
             if claim_result and not had_queue and claim_result.get("status") in {"draft_saved", "drafts_saved"}:
@@ -564,19 +580,6 @@ class AutoReplyRunner:
             queue = sync_pending_state(state)
             probe_result = self.ui.probe()
             candidates = choose_whitelist_candidates(probe_result, allowed_contacts)
-            if not candidates:
-                active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
-                if active_fallback:
-                    candidates = [active_fallback]
-            if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
-                preview_fallback = choose_whitelist_preview_fallback_candidate(
-                    probe_result,
-                    allowed_contacts,
-                    queue=queue,
-                    last_seen_inbound=dict(state.get("last_seen_inbound") or {}),
-                )
-                if preview_fallback:
-                    candidates = [preview_fallback]
             self.append_event(
                 "claim_candidates",
                 contacts=[chat.get("name", "") for chat in candidates],
@@ -584,6 +587,7 @@ class AutoReplyRunner:
             )
             if not candidates:
                 non_whitelist_unread = choose_non_whitelist_unread(probe_result, allowed_contacts)
+                non_whitelist_cleared = False
                 if non_whitelist_unread:
                     cleared_contacts: list[str] = []
                     seen_names: set[str] = set()
@@ -596,12 +600,24 @@ class AutoReplyRunner:
                         self.ui.probe(select_chat=contact, sleep_after_click=0.25)
                         cleared_contacts.append(contact)
                     if cleared_contacts:
+                        non_whitelist_cleared = True
                         self.append_event(
                             "non_whitelist_unread_cleared",
                             contacts=cleared_contacts,
                             queue_contacts=queued_contacts(queue),
                         )
                 self.append_event("claim_skipped", reason="no_visible_whitelist_unread")
+                if (
+                    is_actionable_menu_signal(str(state.get("last_menu_signal") or ""))
+                    and not non_whitelist_cleared
+                ):
+                    self.append_event(
+                        "claim_logic_bug",
+                        reason="非正常状态栏数字和红点",
+                        signal=str(state.get("last_menu_signal") or ""),
+                        visible_chat_count=len(list(probe_result.get("visibleChats") or [])),
+                        queue_contacts=queued_contacts(queue),
+                    )
                 return {"status": "no_candidate"}
 
             added: list[str] = []
@@ -613,14 +629,33 @@ class AutoReplyRunner:
                 nonlocal queue_fingerprints
                 for candidate in snapshot_candidates:
                     contact = candidate_contact_name(candidate)
+                    existing_index = find_queue_index_for_contact(queue, contact)
                     selected = self.ui.probe(select_chat=contact)
                     if selected.get("status") != "ok" or not selected.get("selectionConfirmed"):
                         self.append_event("claim_skipped", reason="selection_not_confirmed", contact=contact)
                         continue
 
                     panel = selected.get("chatPanel", {}) or {}
+                    preview_text = str(candidate.get("preview") or "")
+                    outbound_snapshot = latest_committed_outbound(panel)
+                    if _text_matches_outbound(preview_text, outbound_snapshot):
+                        if existing_index >= 0:
+                            pending_existing = queue[existing_index]
+                            self._cancel_pending(
+                                state,
+                                "manual_reply_detected_preview",
+                                pending_existing,
+                                current_outbound=outbound_snapshot,
+                            )
+                            queue = sync_pending_state(state)
+                            queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
+                        self.append_event(
+                            "claim_skipped",
+                            reason="preview_matches_outbound",
+                            contact=contact,
+                        )
+                        continue
                     if latest_message_is_outbound(panel):
-                        existing_index = find_queue_index_for_contact(queue, contact)
                         if existing_index >= 0:
                             pending_existing = queue[existing_index]
                             self._cancel_pending(
@@ -633,16 +668,22 @@ class AutoReplyRunner:
                         self.append_event("claim_skipped", reason="latest_message_outbound", contact=contact)
                         continue
                     inbound_text = choose_inbound_text(panel, str(candidate.get("preview") or ""))
-                    outbound_snapshot = latest_committed_outbound(panel)
                     if not inbound_text:
                         self.append_event("claim_skipped", reason="empty_inbound", contact=contact)
                         continue
 
                     message_time = str(candidate.get("time") or "")
                     inbound_fingerprint = fingerprint(contact, inbound_text, message_time)
-                    existing_index = find_queue_index_for_contact(queue, contact)
                     if existing_index >= 0:
                         existing = queue[existing_index]
+                        if inbound_variant_equivalent(
+                            str(existing.get("inbound_text", "")),
+                            inbound_text,
+                            pending_time=str(existing.get("message_time", "")),
+                            current_time=message_time,
+                        ):
+                            self.append_event("claim_skipped", reason="inbound_variant_equivalent", contact=contact)
+                            continue
                         if inbound_fingerprint == existing.get("inbound_fingerprint"):
                             self.append_event("claim_skipped", reason="already_queued", contact=contact)
                             continue
@@ -814,7 +855,7 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
-        self.append_event("wechat_window_action", action="open", reason="pending_send_or_refresh", contact=contact)
+        self.append_event("wechat_window_action", action="open", reason="pending_send_due", contact=contact)
         self.ui.activate_wechat()
         try:
             selected = self.ui.probe(select_chat=contact)
@@ -828,6 +869,13 @@ class AutoReplyRunner:
             current_inbound = choose_inbound_text(panel, current_preview)
             current_outbound_item = latest_committed_outbound_item(panel)
             current_outbound = latest_committed_outbound(panel)
+            if current_outbound and _text_matches_outbound(current_preview, current_outbound):
+                return self._cancel_pending(
+                    state,
+                    "manual_reply_detected_preview",
+                    pending,
+                    current_outbound=current_outbound,
+                )
             current_outbound_top = (
                 float(current_outbound_item.get("top", 0.0) or 0.0) if current_outbound_item else None
             )
@@ -965,7 +1013,7 @@ class AutoReplyRunner:
                 "send_attempts": updated["send_attempts"],
             }
         finally:
-            self.append_event("wechat_window_action", action="hide", reason="pending_send_or_refresh", contact=contact)
+            self.append_event("wechat_window_action", action="hide", reason="pending_send_due", contact=contact)
             self.ui.hide_wechat()
 
 
