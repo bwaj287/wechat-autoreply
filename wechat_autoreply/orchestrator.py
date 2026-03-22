@@ -19,6 +19,8 @@ HISTORY_MARKER_RE = re.compile(
     r"(?i)^(?:(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"mon|tue|wed|thu|fri|sat|sun|今天|昨天|前天)\s+)?\d{1,2}:\d{2}$"
 )
+DIGIT_PUNCT_SHORT_RE = re.compile(r"^[0-9０-９]+[~～`'\"!！?？.,，。…·•\-_/\\|]*$")
+SYMBOL_ONLY_SHORT_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\-_/\\|]+$")
 
 
 def normalize_text(text: str) -> str:
@@ -85,6 +87,9 @@ def _clean_multiline_latest_inbound(latest_inbound: str, preview: str) -> str:
     lines = [line.strip() for line in value.splitlines() if line.strip() and not is_history_marker(line)]
     if not lines:
         return ""
+    lines = _sanitize_inbound_lines(lines, preview)
+    if not lines:
+        return ""
     preview_value = str(preview or "").strip()
     if preview_value:
         preview_norm = normalize_text(preview_value)
@@ -105,6 +110,67 @@ def _text_matches_outbound(preview: str, latest_outbound: str) -> bool:
         or preview_norm in outbound_norm
         or outbound_norm in preview_norm
     )
+
+
+def _is_likely_ocr_noise_line(line: str) -> bool:
+    value = str(line or "").strip()
+    if not value:
+        return True
+    if is_history_marker(value):
+        return True
+    if re.search(r"[\u4e00-\u9fffA-Za-z]", value):
+        return False
+    normalized = normalize_text(value)
+    if len(normalized) <= 4 and DIGIT_PUNCT_SHORT_RE.fullmatch(value):
+        return True
+    if len(normalized) <= 4 and SYMBOL_ONLY_SHORT_RE.fullmatch(value):
+        return True
+    if len(normalized) <= 2 and not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", value):
+        return True
+    return False
+
+
+def _sanitize_inbound_lines(lines: list[str], preview: str = "") -> list[str]:
+    cleaned = [str(line).strip() for line in lines if str(line).strip()]
+    if not cleaned:
+        return []
+
+    deduped: list[str] = []
+    for line in cleaned:
+        if deduped and normalize_text(deduped[-1]) == normalize_text(line):
+            continue
+        deduped.append(line)
+    cleaned = deduped
+
+    preview_value = str(preview or "").strip()
+    preview_norm = normalize_text(preview_value)
+    preview_is_meaningful = wechat_ui.has_meaningful_text(preview_value) and not is_history_marker(preview_value)
+    has_preview_line = bool(preview_norm) and any(normalize_text(line) == preview_norm for line in cleaned)
+
+    # Trim noisy tail fragments such as OCR artifacts ("8~", isolated punctuation).
+    while len(cleaned) > 1:
+        tail = cleaned[-1]
+        if not _is_likely_ocr_noise_line(tail):
+            break
+        if has_preview_line and normalize_text(tail) != preview_norm:
+            cleaned.pop()
+            continue
+        # If preview is meaningful and tail is noisy-but-different, trust preview.
+        if preview_is_meaningful and preview_norm and normalize_text(tail) != preview_norm:
+            cleaned[-1] = preview_value
+            break
+        break
+
+    if (
+        len(cleaned) == 1
+        and preview_is_meaningful
+        and preview_norm
+        and normalize_text(cleaned[0]) != preview_norm
+        and _is_likely_ocr_noise_line(cleaned[0])
+    ):
+        cleaned = [preview_value]
+
+    return [line for line in cleaned if line]
 
 
 def inbound_variant_equivalent(
@@ -155,14 +221,24 @@ def choose_inbound_text(panel: dict[str, Any], fallback_preview: str = "") -> st
                 ]
             )
             if recent_rows:
-                return "\n".join(str(item.get("text", "")).strip() for item in recent_rows if item.get("text"))
+                lines = [
+                    str(item.get("text", "")).strip()
+                    for item in recent_rows
+                    if item.get("text")
+                ]
+                lines = _sanitize_inbound_lines(lines, preview)
+                if lines:
+                    return "\n".join(lines)
         tail_rows = _tail_cluster(inbound_items)
         if tail_rows:
-            return "\n".join(
+            lines = [
                 str(item.get("text", "")).strip()
                 for item in tail_rows[-3:]
                 if item.get("text")
-            )
+            ]
+            lines = _sanitize_inbound_lines(lines, preview)
+            if lines:
+                return "\n".join(lines)
     latest_inbound = str(panel.get("latestInbound") or "").strip()
     if is_history_marker(latest_inbound):
         latest_inbound = ""
@@ -354,6 +430,9 @@ class AutoReplyRunner:
                 pass
         return "1" if bool(self.vision.check_unread_dot()) else ""
 
+    def _live_idle_seconds(self) -> float:
+        return float(self.idle.get_idle_time_seconds())
+
     def tick(self) -> dict[str, Any]:
         config = self.load_config()
         state = self.load_state()
@@ -455,6 +534,20 @@ class AutoReplyRunner:
         idle_seconds: float,
         now: float,
     ) -> dict[str, Any]:
+        idle_threshold = float(config.get("idle_threshold_seconds", 30))
+        live_idle_seconds = self._live_idle_seconds()
+        if live_idle_seconds < idle_threshold:
+            self.append_event(
+                "claim_deferred_user_active",
+                idle_seconds=round(live_idle_seconds, 2),
+                threshold=idle_threshold,
+                queue_contacts=queued_contacts(sync_pending_state(state)),
+            )
+            return {
+                "status": "idle_wait",
+                "idle_seconds": round(live_idle_seconds, 2),
+                "menu_unread": bool(state.get("last_menu_unread")),
+            }
         state["last_roster_sweep_at"] = now
         self.ui.activate_wechat()
         try:
@@ -672,10 +765,27 @@ class AutoReplyRunner:
         now: float,
     ) -> dict[str, Any]:
         queue = sync_pending_state(state)
-        if idle_seconds < float(config.get("idle_threshold_seconds", 30)):
+        idle_threshold = float(config.get("idle_threshold_seconds", 30))
+        if idle_seconds < idle_threshold:
             return {
                 "status": "pending_wait_user_active",
                 "idle_seconds": round(idle_seconds, 2),
+                "contact": pending.get("contact"),
+                "queue_length": len(queue),
+            }
+        live_idle_seconds = self._live_idle_seconds()
+        if live_idle_seconds < idle_threshold:
+            self.append_event(
+                "pending_deferred_user_active",
+                contact=str(pending.get("contact", "")).strip(),
+                idle_seconds=round(live_idle_seconds, 2),
+                threshold=idle_threshold,
+                queue_length=len(queue),
+                queue_contacts=queued_contacts(queue),
+            )
+            return {
+                "status": "pending_wait_user_active",
+                "idle_seconds": round(live_idle_seconds, 2),
                 "contact": pending.get("contact"),
                 "queue_length": len(queue),
             }

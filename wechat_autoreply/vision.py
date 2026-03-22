@@ -7,18 +7,20 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from AppKit import NSBitmapImageRep, NSImage
+from AppKit import NSBitmapImageRep, NSImage, NSScreen
 from Quartz import CGWindowListCopyWindowInfo, kCGNullWindowID, kCGWindowListOptionOnScreenOnly
 
 from .ocr import ocr_image
 
 
 DIGIT_RE = re.compile(r"\d+")
-BADGE_ROI_X_RATIO = 0.58
+BADGE_ROI_X_RATIO = 0.66
 BADGE_ROI_Y_RATIO = 0.12
 BADGE_ROI_H_RATIO = 0.76
 OCR_UPSCALE_FACTOR = 3
 ADAPTIVE_THRESHOLD_OFFSET = 8
+DOCK_CAPTURE_HEIGHT_RATIO = 0.22
+DOCK_CAPTURE_MIN_HEIGHT = 120
 
 
 def _control_center_items() -> list[dict[str, Any]]:
@@ -197,7 +199,7 @@ def _digit_like_component_exists(path: Path) -> bool:
     rep = _bitmap_rep(path)
     width = int(rep.pixelsWide())
     height = int(rep.pixelsHigh())
-    x_start = int(width * 0.58)
+    x_start = int(width * BADGE_ROI_X_RATIO)
     x_end = width
     y_start = int(height * 0.12)
     y_end = int(height * 0.88)
@@ -244,7 +246,7 @@ def _digit_like_component_exists(path: Path) -> bool:
                 continue
             if component_height < 10 or component_height > int(height * 0.7):
                 continue
-            if max(xs) < int(width * 0.68):
+            if max(xs) < int(width * 0.76):
                 continue
             return True
     return False
@@ -280,7 +282,7 @@ def _extract_badge_digits(observations: list[dict[str, Any]], min_x: float = 0.0
             continue
         bbox = obs.get("bbox") or {}
         x = float(bbox.get("x", 0.0) or 0.0)
-        if x < 0.5:
+        if x < float(min_x):
             continue
         digits = match.group(0)
         if x > best_x:
@@ -350,24 +352,200 @@ def _prepare_badge_ocr_variants(path: Path) -> list[Path]:
     return variants
 
 
-def unread_signal() -> str:
-    item = _choose_wechat_item(_control_center_items())
-    if not item:
-        return ""
+def _dock_capture_region() -> dict[str, int]:
+    frame = NSScreen.mainScreen().frame()
+    width = int(frame.size.width)
+    height = int(frame.size.height)
+    capture_height = max(DOCK_CAPTURE_MIN_HEIGHT, int(height * DOCK_CAPTURE_HEIGHT_RATIO))
+    y = max(0, height - capture_height)
+    return {"x": 0, "y": y, "width": width, "height": capture_height}
 
-    path = _capture_region(item)
-    capture_path = Path(path)
+
+def _green_icon_candidates(path: Path) -> list[dict[str, int]]:
     try:
-        if not _digit_like_component_exists(capture_path):
+        from PIL import Image
+    except Exception:
+        return []
+
+    image = Image.open(path).convert("RGB")
+    width, height = image.size
+    pixels = image.load()
+    mask = [[False] * width for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            red, green, blue = pixels[x, y]
+            if green < 120:
+                continue
+            if red > 170 or blue > 180:
+                continue
+            if (green - red) < 25 or (green - blue) < 15:
+                continue
+            mask[y][x] = True
+
+    min_area = max(700, int(width * height * 0.00035))
+    min_side = max(40, int(width * 0.012))
+    max_side = max(min_side + 20, int(width * 0.08))
+
+    seen = [[False] * width for _ in range(height)]
+    candidates: list[dict[str, int]] = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            queue = deque([(x, y)])
+            seen[y][x] = True
+            points: list[tuple[int, int]] = []
+            while queue:
+                cx, cy = queue.popleft()
+                points.append((cx, cy))
+                for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                    if nx < 0 or nx >= width or ny < 0 or ny >= height:
+                        continue
+                    if seen[ny][nx] or not mask[ny][nx]:
+                        continue
+                    seen[ny][nx] = True
+                    queue.append((nx, ny))
+            area = len(points)
+            if area < min_area:
+                continue
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            x0 = min(xs)
+            x1 = max(xs)
+            y0 = min(ys)
+            y1 = max(ys)
+            box_width = x1 - x0 + 1
+            box_height = y1 - y0 + 1
+            if box_width < min_side or box_height < min_side:
+                continue
+            if box_width > max_side or box_height > max_side:
+                continue
+            if abs(box_width - box_height) > max(24, int(max_side * 0.45)):
+                continue
+            candidates.append(
+                {
+                    "x0": x0,
+                    "x1": x1,
+                    "y0": y0,
+                    "y1": y1,
+                    "width": box_width,
+                    "height": box_height,
+                    "area": area,
+                }
+            )
+    return candidates
+
+
+def _white_bubble_component_count(path: Path, candidate: dict[str, int]) -> int:
+    try:
+        from PIL import Image
+    except Exception:
+        return 0
+
+    image = Image.open(path).convert("RGB")
+    pixels = image.load()
+    x0 = int(candidate["x0"])
+    x1 = int(candidate["x1"])
+    y0 = int(candidate["y0"])
+    y1 = int(candidate["y1"])
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    mask = [[False] * width for _ in range(height)]
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            red, green, blue = pixels[x, y]
+            if red < 190 or green < 190 or blue < 190:
+                continue
+            if max(red, green, blue) - min(red, green, blue) > 45:
+                continue
+            mask[y - y0][x - x0] = True
+
+    min_component_area = max(120, int(width * height * 0.055))
+    seen = [[False] * width for _ in range(height)]
+    component_count = 0
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            queue = deque([(x, y)])
+            seen[y][x] = True
+            area = 0
+            while queue:
+                cx, cy = queue.popleft()
+                area += 1
+                for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                    if nx < 0 or nx >= width or ny < 0 or ny >= height:
+                        continue
+                    if seen[ny][nx] or not mask[ny][nx]:
+                        continue
+                    seen[ny][nx] = True
+                    queue.append((nx, ny))
+            if area >= min_component_area:
+                component_count += 1
+    return component_count
+
+
+def _red_badge_pixels(path: Path, candidate: dict[str, int]) -> int:
+    try:
+        from PIL import Image
+    except Exception:
+        return 0
+
+    image = Image.open(path).convert("RGB")
+    pixels = image.load()
+    image_width, image_height = image.size
+    x1 = int(candidate["x1"])
+    y0 = int(candidate["y0"])
+    width = int(candidate["width"])
+    height = int(candidate["height"])
+    # Keep badge ROI tightly around the icon's own top-right corner
+    # so red pixels from neighboring Dock apps don't leak in.
+    badge_x0 = max(0, x1 - int(width * 0.08))
+    badge_x1 = min(image_width, x1 + int(width * 0.20))
+    badge_y0 = max(0, y0 - int(height * 0.20))
+    badge_y1 = min(image_height, y0 + int(height * 0.24))
+    count = 0
+    for y in range(badge_y0, badge_y1):
+        for x in range(badge_x0, badge_x1):
+            red, green, blue = pixels[x, y]
+            if red < 185:
+                continue
+            if green > 120 or blue > 120:
+                continue
+            if (red - green) < 55 or (red - blue) < 55:
+                continue
+            count += 1
+    return count
+
+
+def _dock_unread_signal() -> str:
+    capture_path = _capture_region(_dock_capture_region())
+    try:
+        candidates = _green_icon_candidates(capture_path)
+        if not candidates:
             return ""
-        digits = _read_badge_digits(capture_path)
-        if digits:
-            return digits
-        # OCR occasionally misses tiny menubar digits (e.g. "1") even when badge glyphs are present.
-        # Fall back to a conservative actionable signal so claim flow still runs.
-        return "1"
+        # Filter tiny incidental green blobs (for example icon accents / overlays)
+        # by keeping candidates close to the dominant Dock icon size in this frame.
+        side_lengths = sorted(min(int(item["width"]), int(item["height"])) for item in candidates)
+        median_side = side_lengths[len(side_lengths) // 2]
+        min_side = max(40, int(median_side * 0.74))
+        for candidate in candidates:
+            if min(int(candidate["width"]), int(candidate["height"])) < min_side:
+                continue
+            bubbles = _white_bubble_component_count(capture_path, candidate)
+            if bubbles < 2:
+                continue
+            red_pixels = _red_badge_pixels(capture_path, candidate)
+            min_red = max(160, int(candidate["area"] * 0.03))
+            if red_pixels >= min_red:
+                return "1"
+        return ""
     finally:
         capture_path.unlink(missing_ok=True)
+
+
+def unread_signal() -> str:
+    return _dock_unread_signal()
 
 
 def check_unread_dot() -> bool:

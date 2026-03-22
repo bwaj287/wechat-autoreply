@@ -179,7 +179,12 @@ def choose_roster_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    usable = [window for window in windows if window["title"] not in {"Weixin", "WeChat (Window)"}]
+    usable = [
+        window
+        for window in windows
+        if str(window.get("title") or "").strip()
+        and window["title"] not in {"Weixin", "WeChat (Window)"}
+    ]
     if not usable:
         return None
     max_area = max(window["width"] * window["height"] for window in usable)
@@ -677,6 +682,9 @@ def probe(select_chat: str | None = None, sleep_after_click: float = 1.0) -> dic
             title = fallback_title
             panel = _extract_chat_panel(roster_obs, selected_title=title)
             chat_path = roster_path
+            # Chat subwindow capture is empty or stale; force downstream typing to use
+            # the main roster window input coordinates.
+            chat_window = None
     else:
         chat_path = None
         panel = _extract_chat_panel(roster_obs, selected_title=fallback_title)
