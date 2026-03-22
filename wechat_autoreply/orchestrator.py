@@ -212,6 +212,32 @@ def choose_non_whitelist_unread(probe_result: dict[str, Any], allowed_contacts: 
     return unread
 
 
+def choose_active_whitelist_candidate(probe_result: dict[str, Any], allowed_contacts: list[str]) -> dict[str, Any]:
+    active_chat = str(probe_result.get("activeChat") or "").strip()
+    if not active_chat:
+        return {}
+    matched_contact = next(
+        (allowed for allowed in allowed_contacts if wechat_ui.names_match(active_chat, allowed)),
+        "",
+    )
+    if not matched_contact:
+        return {}
+    panel = probe_result.get("chatPanel", {}) or {}
+    if latest_message_is_outbound(panel):
+        return {}
+    visible = find_visible_chat(probe_result, matched_contact)
+    inbound_text = choose_inbound_text(panel, str(visible.get("preview") or ""))
+    if not inbound_text:
+        return {}
+    return {
+        "name": active_chat,
+        "matchedContact": matched_contact,
+        "preview": str(visible.get("preview") or ""),
+        "time": str(visible.get("time") or ""),
+        "source": "active_chat_fallback",
+    }
+
+
 def find_visible_chat(probe_result: dict[str, Any], contact: str) -> dict[str, Any]:
     for chat in probe_result.get("visibleChats", []):
         if wechat_ui.names_match(str(chat.get("name", "")), contact):
@@ -436,6 +462,10 @@ class AutoReplyRunner:
             queue = sync_pending_state(state)
             probe_result = self.ui.probe()
             candidates = choose_whitelist_candidates(probe_result, allowed_contacts)
+            if not candidates:
+                active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
+                if active_fallback:
+                    candidates = [active_fallback]
             self.append_event(
                 "claim_candidates",
                 contacts=[chat.get("name", "") for chat in candidates],

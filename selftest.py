@@ -891,6 +891,104 @@ def run_non_whitelist_unread_cleared_path() -> None:
     assert any(event["type"] == "non_whitelist_unread_cleared" for event in store.events)
 
 
+def run_active_whitelist_chat_claim_without_unread_badge_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "activeChat": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": "晚上打不打守望先锋", "time": "19:51", "unread": False}],
+                "chatPanel": {
+                    "latestInbound": "晚上打不打守望先锋\n我们有四个人",
+                    "latestOutbound": "加了",
+                    "inbound": [
+                        {"text": "晚上打不打守望先锋", "top": 0.55},
+                        {"text": "我们有四个人", "top": 0.64},
+                    ],
+                    "outbound": [{"text": "加了", "top": 0.28}],
+                },
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": "晚上打不打守望先锋", "time": "19:51", "unread": False}],
+                "chatPanel": {
+                    "latestInbound": "晚上打不打守望先锋\n我们有四个人",
+                    "latestOutbound": "加了",
+                    "inbound": [
+                        {"text": "晚上打不打守望先锋", "top": 0.55},
+                        {"text": "我们有四个人", "top": 0.64},
+                    ],
+                    "outbound": [{"text": "加了", "top": 0.28}],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 9_250.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("行，来吧。"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "1ock", result
+    assert store.state["pending"]["contact"] == "1ock"
+    assert "我们有四个人" in store.state["pending"]["inbound_text"]
+
+
+def run_active_whitelist_chat_latest_outbound_skips_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "activeChat": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": "晚上打不打守望先锋", "time": "19:51", "unread": False}],
+                "chatPanel": {
+                    "latestInbound": "晚上打不打守望先锋",
+                    "latestOutbound": "我知道了",
+                    "inbound": [{"text": "晚上打不打守望先锋", "top": 0.46}],
+                    "outbound": [{"text": "我知道了", "top": 0.66}],
+                },
+            },
+        ]
+    )
+    clock = {"now": 9_260.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("行。"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+
+
 def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -1435,6 +1533,8 @@ def main() -> int:
     run_queue_claims_while_pending_after_sweep_interval_path()
     run_unknown_menu_signal_does_not_claim_path()
     run_non_whitelist_unread_cleared_path()
+    run_active_whitelist_chat_claim_without_unread_badge_path()
+    run_active_whitelist_chat_latest_outbound_skips_path()
     run_empty_queue_persistent_unread_waits_for_signal_change_path()
     run_empty_queue_persistent_unread_sweeps_after_interval_path()
     print("selftest: ok")
