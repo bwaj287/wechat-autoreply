@@ -8,6 +8,7 @@ struct RowSpec: Codable {
     let name: String
     let rowTop: Double
     let rowBottom: Double
+    let nameLeft: Double?
 }
 
 struct RowResult: Codable {
@@ -177,6 +178,9 @@ for row in rows {
         let centerXNorm = component.centerX / Double(width)
         let centerYNorm = (component.centerY - Double(yTop)) / Double(max(rowHeight, 1))
         let aspect = Double(component.width) / Double(max(component.height, 1))
+        let nameLeft = row.nameLeft ?? 0.15
+        let minCenterX = Swift.max(0.09, nameLeft - 0.04)
+        let maxCenterX = Swift.min(0.23, nameLeft + 0.02)
         return component.count >= 40
             && component.count <= 360
             && component.width >= 7
@@ -186,8 +190,8 @@ for row in rows {
             && component.fillRatio >= 0.35
             && aspect >= 0.70
             && aspect <= 1.80
-            && centerXNorm >= 0.145
-            && centerXNorm <= 0.180
+            && centerXNorm >= minCenterX
+            && centerXNorm <= maxCenterX
             && centerYNorm >= 0.30
             && centerYNorm <= 0.62
     }

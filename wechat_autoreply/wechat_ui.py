@@ -348,6 +348,7 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
                 "preview": preview_item["text"] if preview_item else "",
                 "time": time_item["text"] if time_item else "",
                 "ocrTop": round(name_item["bbox"]["top"], 4),
+                "ocrLeft": round(name_item["bbox"]["left"], 4),
                 "click": {"x": gx, "y": gy},
             }
         )
@@ -370,6 +371,7 @@ def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> lis
                 "name": chat["name"],
                 "rowTop": round(prev_mid, 4),
                 "rowBottom": round(next_mid, 4),
+                "nameLeft": float(chat.get("ocrLeft", 0.15) or 0.15),
             }
         )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
