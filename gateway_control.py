@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 from datetime import datetime
 from typing import Any
 
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
 from wechat_autoreply.paths import EVENTS_PATH
-from wechat_autoreply.state_store import load_state
+from wechat_autoreply.state_store import default_state, load_state, save_state, utc_now_iso
 
 
 TRACE_TYPES = {
@@ -24,7 +25,7 @@ TRACE_TYPES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control the WeChat auto-reply runner.")
-    parser.add_argument("command", choices=["on", "off", "status", "queue"])
+    parser.add_argument("command", choices=["on", "off", "status", "queue", "reset", "restart"])
     return parser.parse_args()
 
 
@@ -129,21 +130,42 @@ def queue_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
+    config = load_config()
+    config["enabled"] = True
+    save_config(config)
+
+    state = default_state()
+    state["last_run_at"] = utc_now_iso()
+    save_state(state)
+
+    subprocess.run(
+        ["pkill", "-f", "/Users/shawnwang/Documents/Playground/main.py"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return config, state
+
+
 def main() -> int:
     args = parse_args()
     if args.command == "on":
         config = set_enabled(True)
     elif args.command == "off":
         config = set_enabled(False)
+    elif args.command in {"reset", "restart"}:
+        config, state = reset_runtime_state()
     else:
         config = load_config()
         save_config(config)
-
-    state = load_state()
+        state = load_state()
     if args.command == "status":
         print(status_output(config, state))
     elif args.command == "queue":
         print(queue_output(config, state))
+    elif args.command in {"reset", "restart"}:
+        print("微信自动回复：已重置并重启（待发送 0）")
     else:
         pending_count = len(_pending_queue(state))
         print(status_line(config, pending_count))
