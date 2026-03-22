@@ -406,10 +406,12 @@ class AutoReplyRunner:
             roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= sweep_interval
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
             menu_signal_rising = actionable_menu_signal and current_menu_signal != last_claim_menu_signal
+            sweep_while_pending = bool(config.get("sweep_while_pending", False))
+            allow_periodic_sweep = (not had_queue) or sweep_while_pending
             should_sweep = (
                 idle_seconds >= idle_threshold
                 and actionable_menu_signal
-                and (menu_signal_rising or roster_sweep_due)
+                and (menu_signal_rising or (allow_periodic_sweep and roster_sweep_due))
             )
             claim_result: dict[str, Any] | None = None
             if should_sweep:
@@ -498,6 +500,7 @@ class AutoReplyRunner:
             queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
             llm = self._build_llm(config)
             def process_candidates(snapshot_candidates: list[dict[str, Any]]) -> None:
+                nonlocal queue
                 nonlocal queue_fingerprints
                 for candidate in snapshot_candidates:
                     contact = candidate_contact_name(candidate)
@@ -507,6 +510,19 @@ class AutoReplyRunner:
                         continue
 
                     panel = selected.get("chatPanel", {}) or {}
+                    if latest_message_is_outbound(panel):
+                        existing_index = find_queue_index_for_contact(queue, contact)
+                        if existing_index >= 0:
+                            pending_existing = queue[existing_index]
+                            self._cancel_pending(
+                                state,
+                                "manual_reply_detected_claim",
+                                pending_existing,
+                            )
+                            queue = sync_pending_state(state)
+                            queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
+                        self.append_event("claim_skipped", reason="latest_message_outbound", contact=contact)
+                        continue
                     inbound_text = choose_inbound_text(panel, str(candidate.get("preview") or ""))
                     outbound_snapshot = latest_committed_outbound(panel)
                     if not inbound_text:

@@ -52,6 +52,7 @@ def default_config() -> dict[str, Any]:
         "capture_retention_days": 1,
         "passive_roster_sweep_enabled": False,
         "roster_sweep_interval_seconds": 60,
+        "sweep_while_pending": False,
         "allowed_contacts": seed_allowed_contacts(),
         "ollama_model": "qwen3.5:9b",
         "ollama_url": "http://127.0.0.1:11434/api/generate",
