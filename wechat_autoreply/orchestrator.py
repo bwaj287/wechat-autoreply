@@ -406,8 +406,21 @@ class AutoReplyRunner:
                 state["last_menu_unread"] = has_unread
                 state["last_menu_signal"] = menu_signal
                 state["last_menu_check_at"] = now
-                if not has_unread:
-                    state["last_claim_menu_signal"] = ""
+                pending_snapshot = state.get("pending_queue")
+                has_pending_snapshot = isinstance(pending_snapshot, list) and bool(pending_snapshot)
+                if not has_pending_snapshot and state.get("pending"):
+                    has_pending_snapshot = True
+                if has_unread:
+                    state["pending_menu_clear_streak"] = 0
+                else:
+                    if not has_pending_snapshot:
+                        state["last_claim_menu_signal"] = ""
+                        state["pending_menu_clear_streak"] = 0
+                    else:
+                        streak = int(state.get("pending_menu_clear_streak", 0) or 0) + 1
+                        state["pending_menu_clear_streak"] = streak
+                        if streak >= 2:
+                            state["last_claim_menu_signal"] = ""
                 self.append_event("menu_bar_checked", unread=has_unread, signal=menu_signal)
 
             cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 3600))

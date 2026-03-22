@@ -206,21 +206,31 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
 
 
 def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
+    def stop_runner_processes() -> None:
+        for target in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "apps" / "runner" / "cli.py"):
+            subprocess.run(
+                ["pkill", "-f", str(target)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
     config = load_config()
-    config["enabled"] = True
+    # Freeze runner first to avoid queue/state races during reset.
+    config["enabled"] = False
     save_config(config)
+
+    stop_runner_processes()
 
     state = default_state()
     state["last_run_at"] = utc_now_iso()
     save_state(state)
 
-    for target in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "apps" / "runner" / "cli.py"):
-        subprocess.run(
-            ["pkill", "-f", str(target)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    # One more stop in case launchd auto-respawned during reset.
+    stop_runner_processes()
+    config["enabled"] = True
+    save_config(config)
+    state = load_state()
     return config, state
 
 

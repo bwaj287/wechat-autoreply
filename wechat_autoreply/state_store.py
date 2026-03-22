@@ -20,6 +20,7 @@ def default_state() -> dict[str, Any]:
         "last_menu_unread": False,
         "last_menu_signal": "",
         "last_claim_menu_signal": "",
+        "pending_menu_clear_streak": 0,
         "last_capture_cleanup_at": 0.0,
         "last_roster_sweep_at": 0.0,
         "last_seen_inbound": {},

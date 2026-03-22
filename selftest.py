@@ -662,6 +662,50 @@ def run_no_claim_sweep_while_pending_wait_path() -> None:
     ], fake_ui.calls
 
 
+def run_pending_menu_flicker_does_not_trigger_claim_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    pending = {
+        "contact": "shawn",
+        "inbound_text": "hi",
+        "message_time": "10:00",
+        "inbound_fingerprint": "fp-shawn",
+        "draft_text": "yo",
+        "created_at": 8_900.0,
+        "due_at": 9_500.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "shawn",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    store.state["last_claim_menu_signal"] = "1"
+    store.state["last_menu_signal"] = "1"
+    fake_ui = FakeUI([])
+    clock = {"now": 9_000.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False, True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "pending_wait_delay", first
+    assert store.state["last_claim_menu_signal"] == "1"
+
+    clock["now"] = 9_020.0
+    second = runner.tick()
+    assert second["status"] == "pending_wait_delay", second
+    assert store.state["last_claim_menu_signal"] == "1"
+    assert fake_ui.calls == [], fake_ui.calls
+    assert not any(event["type"] == "claim_candidates" for event in store.events), store.events
+
+
 def run_queue_claims_on_menu_rising_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -703,7 +747,7 @@ def run_queue_claims_on_menu_rising_path() -> None:
     )
     clock = {"now": 9200.0}
     runner = AutoReplyRunner(
-        vision_sensor=FakeVision([True, False, True]),
+        vision_sensor=FakeVision([1, 1, 2]),
         idle_sensor=FakeIdle(45),
         ui=fake_ui,
         llm_client=MappingLLM({"shawn": "yo", "May": "在呢"}),
@@ -1624,6 +1668,7 @@ def main() -> int:
     run_capture_cleanup_deletes_old_snapshots_path()
     run_ocr_variant_same_message_does_not_refresh_path()
     run_no_claim_sweep_while_pending_wait_path()
+    run_pending_menu_flicker_does_not_trigger_claim_path()
     run_queue_claims_on_menu_rising_path()
     run_queue_claims_while_pending_after_sweep_interval_path()
     run_stale_pending_gc_path()
