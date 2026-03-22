@@ -179,13 +179,19 @@ def choose_roster_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    usable = [window for window in windows if window["title"] not in {"Weixin", "WeChat (Window)"}]
+    if not usable:
+        return None
+    max_area = max(window["width"] * window["height"] for window in usable)
+    min_area = max(55_000, int(max_area * 0.09))
+    min_side = max(180, int((max_area**0.5) * 0.28))
     candidates = [
         window
-        for window in windows
-        if window["width"] >= 250
-        and window["height"] >= 250
-        and window["title"] not in {"Weixin", "WeChat (Window)"}
+        for window in usable
+        if window["width"] * window["height"] >= min_area and min(window["width"], window["height"]) >= min_side
     ]
+    if not candidates:
+        candidates = usable
     if not candidates:
         return None
     main_candidates = [window for window in candidates if window.get("isMainWindow")]
@@ -239,6 +245,36 @@ def _cluster_rows(items: list[dict[str, Any]], threshold: float = 0.06) -> list[
         if not placed:
             rows.append({"cy": cy, "items": [item]})
     return rows
+
+
+def _median_gap(values: list[float], min_gap: float, max_gap: float, default: float) -> float:
+    if len(values) < 2:
+        return default
+    diffs = [values[i + 1] - values[i] for i in range(len(values) - 1) if min_gap <= values[i + 1] - values[i] <= max_gap]
+    if not diffs:
+        return default
+    diffs.sort()
+    mid = len(diffs) // 2
+    if len(diffs) % 2 == 1:
+        return diffs[mid]
+    return (diffs[mid - 1] + diffs[mid]) / 2.0
+
+
+def _adaptive_row_threshold(items: list[dict[str, Any]], default: float = 0.06) -> float:
+    ys = sorted(float(item.get("center", {}).get("y", 0.0) or 0.0) for item in items)
+    median_gap = _median_gap(ys, min_gap=0.012, max_gap=0.25, default=default / 0.58)
+    return max(0.035, min(0.09, median_gap * 0.58))
+
+
+def _roster_band_profiles(window_info: dict[str, Any]) -> list[tuple[float, float, float]]:
+    width = float(window_info.get("width", 0) or 0)
+    # Compact windows push roster text slightly right; wider windows shift slightly left.
+    t = 0.0
+    if width > 0:
+        t = max(0.0, min(1.0, (width - 520.0) / 680.0))
+    primary = (0.12 - 0.06 * t, 0.38 - 0.08 * t, 0.025 - 0.01 * t)
+    fallback = (max(0.03, primary[0] - 0.05), min(0.45, primary[1] + 0.07), max(0.012, primary[2] - 0.01))
+    return [primary, fallback]
 
 
 def _prepare_ocr_items(image_path: Path) -> list[dict[str, Any]]:
@@ -303,57 +339,61 @@ def _annotate_bubble_roles(items: list[dict[str, Any]], image_path: Path) -> Non
 
 
 def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str, Any]) -> list[dict[str, Any]]:
-    if window_info.get("width", 0) >= 1000:
-        min_left, max_left, min_width = 0.025, 0.26, 0.015
-    else:
-        min_left, max_left, min_width = 0.12, 0.38, 0.025
-    candidates: list[dict[str, Any]] = []
     ignored = {normalize_text(item) for item in IGNORE_TEXTS}
-    for obs in obs_list:
-        left = obs["bbox"]["left"]
-        top = obs["bbox"]["top"]
-        width = obs["bbox"]["w"]
-        if left < min_left or left > max_left:
-            continue
-        if top < 0.08 or top > 0.985:
-            continue
-        if width < min_width:
-            continue
-        if normalize_text(obs["text"]) in ignored:
-            continue
-        candidates.append(obs)
 
-    chats: list[dict[str, Any]] = []
-    for row in _cluster_rows(candidates):
-        items = sorted(row["items"], key=lambda entry: (entry["bbox"]["top"], entry["bbox"]["left"]))
-        name_item = None
-        preview_item = None
-        time_item = None
-        for item in items:
-            if _is_time(item["text"]):
-                time_item = item
-                continue
+    def parse_chats(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        threshold = _adaptive_row_threshold(candidates, default=0.06)
+        chats: list[dict[str, Any]] = []
+        for row in _cluster_rows(candidates, threshold=threshold):
+            items = sorted(row["items"], key=lambda entry: (entry["bbox"]["top"], entry["bbox"]["left"]))
+            name_item = None
+            preview_item = None
+            time_item = None
+            for item in items:
+                if _is_time(item["text"]):
+                    time_item = item
+                    continue
+                if not name_item:
+                    name_item = item
+                elif not preview_item and item["text"] != name_item["text"]:
+                    preview_item = item
             if not name_item:
-                name_item = item
-            elif not preview_item and item["text"] != name_item["text"]:
-                preview_item = item
-        if not name_item:
-            continue
-        if len(name_item["text"]) <= 1 and not re.search(r"[A-Za-z\u4e00-\u9fff]", name_item["text"]):
-            continue
-        gx, gy = _global_coords(window_info, name_item)
-        chats.append(
-            {
-                "name": name_item["text"],
-                "preview": preview_item["text"] if preview_item else "",
-                "time": time_item["text"] if time_item else "",
-                "ocrTop": round(name_item["bbox"]["top"], 4),
-                "ocrLeft": round(name_item["bbox"]["left"], 4),
-                "click": {"x": gx, "y": gy},
-            }
-        )
-    chats.sort(key=lambda item: item["ocrTop"])
-    return chats
+                continue
+            if len(name_item["text"]) <= 1 and not re.search(r"[A-Za-z\u4e00-\u9fff]", name_item["text"]):
+                continue
+            gx, gy = _global_coords(window_info, name_item)
+            chats.append(
+                {
+                    "name": name_item["text"],
+                    "preview": preview_item["text"] if preview_item else "",
+                    "time": time_item["text"] if time_item else "",
+                    "ocrTop": round(name_item["bbox"]["top"], 4),
+                    "ocrLeft": round(name_item["bbox"]["left"], 4),
+                    "click": {"x": gx, "y": gy},
+                }
+            )
+        chats.sort(key=lambda item: item["ocrTop"])
+        return chats
+
+    for min_left, max_left, min_width in _roster_band_profiles(window_info):
+        candidates: list[dict[str, Any]] = []
+        for obs in obs_list:
+            left = obs["bbox"]["left"]
+            top = obs["bbox"]["top"]
+            width = obs["bbox"]["w"]
+            if left < min_left or left > max_left:
+                continue
+            if top < 0.08 or top > 0.985:
+                continue
+            if width < min_width:
+                continue
+            if normalize_text(obs["text"]) in ignored:
+                continue
+            candidates.append(obs)
+        chats = parse_chats(candidates)
+        if chats:
+            return chats
+    return []
 
 
 def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> list[dict[str, Any]]:
@@ -361,10 +401,18 @@ def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> lis
         return chats
     rows: list[dict[str, Any]] = []
     tops = [chat["ocrTop"] for chat in chats]
+    median_row_gap = _median_gap(tops, min_gap=0.018, max_gap=0.28, default=0.11)
+    head_pad = max(0.045, min(0.11, median_row_gap * 0.62))
+    tail_pad = max(0.07, min(0.17, median_row_gap * 0.95))
+    min_span = max(0.05, min(0.16, median_row_gap * 0.72))
     for index, chat in enumerate(chats):
         current = tops[index]
-        prev_mid = (tops[index - 1] + current) / 2.0 if index > 0 else max(0.08, current - 0.08)
-        next_mid = (current + tops[index + 1]) / 2.0 if index + 1 < len(tops) else min(0.96, current + 0.12)
+        prev_mid = (tops[index - 1] + current) / 2.0 if index > 0 else max(0.04, current - head_pad)
+        next_mid = (current + tops[index + 1]) / 2.0 if index + 1 < len(tops) else min(0.98, current + tail_pad)
+        if next_mid - prev_mid < min_span:
+            grow = (min_span - (next_mid - prev_mid)) / 2.0
+            prev_mid = max(0.02, prev_mid - grow)
+            next_mid = min(0.99, next_mid + grow)
         rows.append(
             {
                 "index": index,
@@ -456,17 +504,15 @@ def _join_texts(parts: list[str]) -> str:
 def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not items:
         return []
-    rows = _cluster_rows(
-        [
-            {
-                "text": item["text"],
-                "bbox": {"top": item["top"], "left": item["left"], "w": item["width"]},
-                "center": {"y": item["top"] + 0.01},
-            }
-            for item in items
-        ],
-        threshold=0.07,
-    )
+    clustered_items = [
+        {
+            "text": item["text"],
+            "bbox": {"top": item["top"], "left": item["left"], "w": item["width"]},
+            "center": {"y": item["top"] + 0.01},
+        }
+        for item in items
+    ]
+    rows = _cluster_rows(clustered_items, threshold=_adaptive_row_threshold(clustered_items, default=0.07))
     collapsed: list[dict[str, Any]] = []
     for row in rows:
         row_items = sorted(row["items"], key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))

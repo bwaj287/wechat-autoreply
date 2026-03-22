@@ -152,8 +152,10 @@ def main() -> int:
     args = parse_args()
     if args.command == "on":
         config = set_enabled(True)
+        state = load_state()
     elif args.command == "off":
         config = set_enabled(False)
+        state = load_state()
     elif args.command in {"reset", "restart"}:
         config, state = reset_runtime_state()
     else:

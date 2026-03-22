@@ -168,32 +168,40 @@ func findComponents(
 
 var results: [RowResult] = []
 for row in rows {
-    let x0 = clamp(Int(Double(width) * 0.02), min: 0, max: width - 1)
-    let x1 = clamp(Int(Double(width) * 0.24), min: x0 + 1, max: width)
+    let nameLeft = row.nameLeft ?? 0.15
+    let minScanX = Swift.max(0.01, nameLeft - 0.14)
+    let maxScanX = Swift.min(0.30, nameLeft + 0.08)
+    let x0 = clamp(Int(Double(width) * minScanX), min: 0, max: width - 1)
+    let x1 = clamp(Int(Double(width) * maxScanX), min: x0 + 1, max: width)
     let yTop = clamp(Int(row.rowTop * Double(height)), min: 0, max: height - 1)
     let yBottom = clamp(Int(row.rowBottom * Double(height)), min: yTop + 1, max: height)
-    let rowHeight = yBottom - yTop
+    let rowHeight = Swift.max(1, yBottom - yTop)
+    let minBadgeHeight = Swift.max(5, Int(Double(rowHeight) * 0.12))
+    let maxBadgeHeight = Swift.max(minBadgeHeight + 3, Int(Double(rowHeight) * 0.52))
+    let minBadgeWidth = minBadgeHeight
+    let maxBadgeWidth = Swift.max(maxBadgeHeight, Int(Double(rowHeight) * 1.05))
+    let minPixels = Swift.max(14, Int(Double(minBadgeHeight * minBadgeHeight) * 0.28))
+    let maxPixels = Swift.max(minPixels + 120, Int(Double(maxBadgeWidth * maxBadgeHeight) * 1.40))
     let components = findComponents(bitmap: bitmap, x0: x0, x1: x1, yTop: yTop, yBottom: yBottom)
     let candidates = components.filter { component in
         let centerXNorm = component.centerX / Double(width)
         let centerYNorm = (component.centerY - Double(yTop)) / Double(max(rowHeight, 1))
         let aspect = Double(component.width) / Double(max(component.height, 1))
-        let nameLeft = row.nameLeft ?? 0.15
-        let minCenterX = Swift.max(0.09, nameLeft - 0.04)
-        let maxCenterX = Swift.min(0.23, nameLeft + 0.02)
-        return component.count >= 40
-            && component.count <= 360
-            && component.width >= 7
-            && component.width <= 34
-            && component.height >= 7
-            && component.height <= 20
-            && component.fillRatio >= 0.35
-            && aspect >= 0.70
-            && aspect <= 1.80
+        let minCenterX = Swift.max(0.07, nameLeft - 0.06)
+        let maxCenterX = Swift.min(0.28, nameLeft + 0.05)
+        return component.count >= minPixels
+            && component.count <= maxPixels
+            && component.width >= minBadgeWidth
+            && component.width <= maxBadgeWidth
+            && component.height >= minBadgeHeight
+            && component.height <= maxBadgeHeight
+            && component.fillRatio >= 0.20
+            && aspect >= 0.45
+            && aspect <= 3.20
             && centerXNorm >= minCenterX
             && centerXNorm <= maxCenterX
-            && centerYNorm >= 0.30
-            && centerYNorm <= 0.62
+            && centerYNorm >= 0.18
+            && centerYNorm <= 0.74
     }
     let best = candidates.max(by: { lhs, rhs in
         if lhs.count == rhs.count {
