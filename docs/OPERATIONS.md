@@ -5,6 +5,7 @@
 ```bash
 /Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh status
 /Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh queue
+/Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh diagnose
 ```
 
 ## Safe Recovery

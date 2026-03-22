@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
-from wechat_autoreply.paths import EVENTS_PATH
+from wechat_autoreply.paths import EVENTS_PATH, PROJECT_ROOT
 from wechat_autoreply.state_store import default_state, load_state, save_state, utc_now_iso
 
 
@@ -25,7 +25,7 @@ TRACE_TYPES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control the WeChat auto-reply runner.")
-    parser.add_argument("command", choices=["on", "off", "status", "queue", "reset", "restart"])
+    parser.add_argument("command", choices=["on", "off", "status", "queue", "diagnose", "reset", "restart"])
     return parser.parse_args()
 
 
@@ -90,6 +90,51 @@ def recent_trace_lines(limit: int = 5) -> list[str]:
     return lines
 
 
+def _recent_events(limit: int = 20) -> list[dict[str, Any]]:
+    if not EVENTS_PATH.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for raw in reversed(EVENTS_PATH.read_text(encoding="utf-8").splitlines()):
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events.append(event)
+        if len(events) >= limit:
+            break
+    events.reverse()
+    return events
+
+
+def _format_epoch(raw: Any) -> str:
+    try:
+        value = float(raw or 0.0)
+    except Exception:
+        return "-"
+    if value <= 0:
+        return "-"
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_event_compact(event: dict[str, Any]) -> str:
+    ts = _format_ts(str(event.get("ts") or ""))
+    event_type = str(event.get("type") or "")
+    contact = str(event.get("contact") or "").strip()
+    reason = str(event.get("reason") or "").strip()
+    parts = [f"[{ts}]", event_type]
+    if contact:
+        parts.append(f"contact={contact}")
+    if reason:
+        parts.append(f"reason={reason}")
+    if event_type == "menu_bar_checked":
+        parts.append(f"signal={event.get('signal', '')}")
+    if event_type == "pending_gc_removed":
+        parts.append(f"removed={event.get('removed_count', 0)}")
+    return " ".join(parts)
+
+
 def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     pending_queue = _pending_queue(state)
     pending_count = len(pending_queue)
@@ -130,6 +175,36 @@ def queue_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
+    queue = _pending_queue(state)
+    lines: list[str] = [status_line(config, len(queue)), "诊断信息："]
+    lines.append(f"- enabled: {bool(config.get('enabled'))}")
+    lines.append(f"- queue_length: {len(queue)}")
+    lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
+    lines.append(f"- last_error: {state.get('last_error') or '-'}")
+    lines.append(f"- last_menu_signal: {state.get('last_menu_signal') or '-'}")
+    lines.append(f"- last_menu_unread: {bool(state.get('last_menu_unread'))}")
+    lines.append(f"- last_menu_check_at: {_format_epoch(state.get('last_menu_check_at'))}")
+    lines.append(f"- last_roster_sweep_at: {_format_epoch(state.get('last_roster_sweep_at'))}")
+    lines.append(
+        f"- stale_pending_ttl_seconds: {int(float(config.get('pending_stale_ttl_seconds', 86400) or 86400))}"
+    )
+    if queue:
+        lines.append("待发送队列：")
+        now = time.time()
+        for idx, item in enumerate(queue, 1):
+            lines.append(_format_queue_item(idx, item, now))
+    else:
+        lines.append("待发送队列：空")
+
+    recent = _recent_events(limit=20)
+    if recent:
+        lines.append("最近事件(20)：")
+        for event in recent:
+            lines.append(_format_event_compact(event))
+    return "\n".join(lines)
+
+
 def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
     config = load_config()
     config["enabled"] = True
@@ -139,12 +214,13 @@ def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
     state["last_run_at"] = utc_now_iso()
     save_state(state)
 
-    subprocess.run(
-        ["pkill", "-f", "/Users/shawnwang/Documents/Playground/main.py"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    for target in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "apps" / "runner" / "cli.py"):
+        subprocess.run(
+            ["pkill", "-f", str(target)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     return config, state
 
 
@@ -166,10 +242,11 @@ def main() -> int:
         print(status_output(config, state))
     elif args.command == "queue":
         print(queue_output(config, state))
+    elif args.command == "diagnose":
+        print(diagnose_output(config, state))
     elif args.command in {"reset", "restart"}:
         print("微信自动回复：已重置并重启（待发送 0）")
     else:
         pending_count = len(_pending_queue(state))
         print(status_line(config, pending_count))
     return 0
-

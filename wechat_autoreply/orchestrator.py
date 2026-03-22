@@ -320,6 +320,37 @@ def remove_pending_by_fingerprint(queue: list[dict[str, Any]], pending: dict[str
     ]
 
 
+def _pending_anchor_ts(item: dict[str, Any]) -> float:
+    due_at = float(item.get("due_at", 0.0) or 0.0)
+    created_at = float(item.get("created_at", 0.0) or 0.0)
+    if due_at > 0:
+        return due_at
+    return created_at
+
+
+def prune_stale_pending(
+    queue: list[dict[str, Any]],
+    *,
+    now: float,
+    ttl_seconds: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if ttl_seconds <= 0:
+        return list(queue), []
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for item in queue:
+        anchor = _pending_anchor_ts(item)
+        if anchor <= 0:
+            kept.append(item)
+            continue
+        age = now - anchor
+        if age > ttl_seconds:
+            removed.append(item)
+            continue
+        kept.append(item)
+    return kept, removed
+
+
 class AutoReplyRunner:
     def __init__(
         self,
@@ -399,6 +430,18 @@ class AutoReplyRunner:
             if idle_seconds < idle_threshold:
                 state["idle_probe_armed"] = True
             queue = sync_pending_state(state)
+            stale_ttl_seconds = float(config.get("pending_stale_ttl_seconds", 86400))
+            queue, stale_removed = prune_stale_pending(queue, now=now, ttl_seconds=stale_ttl_seconds)
+            if stale_removed:
+                sync_pending_state(state, queue)
+                self.append_event(
+                    "pending_gc_removed",
+                    removed_count=len(stale_removed),
+                    removed_contacts=queued_contacts(stale_removed),
+                    ttl_seconds=stale_ttl_seconds,
+                    queue_length=len(queue),
+                    queue_contacts=queued_contacts(queue),
+                )
             had_queue = bool(queue)
             current_menu_signal = str(state.get("last_menu_signal") or "")
             last_claim_menu_signal = str(state.get("last_claim_menu_signal") or "")
@@ -458,6 +501,12 @@ class AutoReplyRunner:
         now: float,
     ) -> dict[str, Any]:
         state["last_roster_sweep_at"] = now
+        self.append_event(
+            "wechat_window_action",
+            action="open",
+            reason="claim_scan",
+            queue_contacts=queued_contacts(sync_pending_state(state)),
+        )
         self.ui.activate_wechat()
         try:
             allowed_contacts = list(config.get("allowed_contacts", []))
@@ -613,6 +662,7 @@ class AutoReplyRunner:
                 return {"status": "draft_saved", "contact": changed[0], "queue_length": len(queue)}
             return {"status": "drafts_saved", "contacts": changed, "queue_length": len(queue)}
         finally:
+            self.append_event("wechat_window_action", action="hide", reason="claim_scan")
             self.ui.hide_wechat()
 
     def _refresh_pending(
@@ -704,6 +754,7 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
+        self.append_event("wechat_window_action", action="open", reason="pending_send_or_refresh", contact=contact)
         self.ui.activate_wechat()
         try:
             selected = self.ui.probe(select_chat=contact)
@@ -854,6 +905,7 @@ class AutoReplyRunner:
                 "send_attempts": updated["send_attempts"],
             }
         finally:
+            self.append_event("wechat_window_action", action="hide", reason="pending_send_or_refresh", contact=contact)
             self.ui.hide_wechat()
 
 

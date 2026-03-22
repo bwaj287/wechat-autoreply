@@ -29,6 +29,7 @@ These legacy paths are intentionally kept for existing scripts:
 ./wechat_env/bin/python selftest.py
 /Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh status
 /Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh queue
+/Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh diagnose
 /Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-control.sh reset
 ```
 

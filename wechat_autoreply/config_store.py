@@ -46,6 +46,7 @@ def default_config() -> dict[str, Any]:
         "send_delay_seconds": 300,
         "send_verify_retry_seconds": 45,
         "send_max_attempts": 2,
+        "pending_stale_ttl_seconds": 86400,
         "poll_interval_seconds": 5,
         "menubar_check_interval_seconds": 15,
         "capture_cleanup_interval_seconds": 3600,

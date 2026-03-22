@@ -815,6 +815,47 @@ def run_queue_claims_while_pending_after_sweep_interval_path() -> None:
     ], fake_ui.calls
 
 
+def run_stale_pending_gc_path() -> None:
+    store = MemoryStore()
+    store.config["pending_stale_ttl_seconds"] = 30
+    store.config["roster_sweep_interval_seconds"] = 9999
+    stale_item = {
+        "contact": "Barrys",
+        "inbound_text": "hi",
+        "message_time": "10:00",
+        "inbound_fingerprint": "fp1",
+        "draft_text": "yo",
+        "created_at": 9500.0,
+        "due_at": 9550.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "Barrys",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(stale_item)]
+    store.state["pending"] = copy.deepcopy(stale_item)
+    fake_ui = FakeUI([])
+    clock = {"now": 9600.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "idle_wait", result
+    assert store.state["pending"] is None
+    assert store.state["pending_queue"] == []
+    assert any(
+        event["type"] == "pending_gc_removed" and event.get("removed_count") == 1 for event in store.events
+    ), store.events
+    assert fake_ui.calls == [], fake_ui.calls
+
+
 def run_unknown_menu_signal_does_not_claim_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 30
@@ -1585,6 +1626,7 @@ def main() -> int:
     run_no_claim_sweep_while_pending_wait_path()
     run_queue_claims_on_menu_rising_path()
     run_queue_claims_while_pending_after_sweep_interval_path()
+    run_stale_pending_gc_path()
     run_unknown_menu_signal_does_not_claim_path()
     run_non_whitelist_unread_cleared_path()
     run_active_whitelist_chat_claim_without_unread_badge_path()
