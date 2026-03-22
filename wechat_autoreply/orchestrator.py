@@ -238,6 +238,44 @@ def choose_active_whitelist_candidate(probe_result: dict[str, Any], allowed_cont
     }
 
 
+def choose_whitelist_preview_fallback_candidate(
+    probe_result: dict[str, Any],
+    allowed_contacts: list[str],
+    *,
+    queue: list[dict[str, Any]],
+    last_seen_inbound: dict[str, str],
+) -> dict[str, Any]:
+    active_chat = str(probe_result.get("activeChat") or "").strip()
+    active_panel = probe_result.get("chatPanel", {}) or {}
+    active_latest_outbound = latest_message_is_outbound(active_panel)
+    for chat in probe_result.get("visibleChats", []):
+        matched_contact = next(
+            (allowed for allowed in allowed_contacts if wechat_ui.names_match(chat.get("name", ""), allowed)),
+            "",
+        )
+        if not matched_contact:
+            continue
+        if active_chat and active_latest_outbound and wechat_ui.names_match(matched_contact, active_chat):
+            continue
+        preview = str(chat.get("preview") or "").strip()
+        if not preview or is_history_marker(preview) or not wechat_ui.has_meaningful_text(preview):
+            continue
+        message_time = str(chat.get("time") or "")
+        preview_fp = fingerprint(matched_contact, preview, message_time)
+        if str(last_seen_inbound.get(matched_contact, "")) == preview_fp:
+            continue
+        existing_index = find_queue_index_for_contact(queue, matched_contact)
+        if existing_index >= 0:
+            existing_fp = str(queue[existing_index].get("inbound_fingerprint", ""))
+            if existing_fp == preview_fp:
+                continue
+        candidate = copy.deepcopy(chat)
+        candidate["matchedContact"] = matched_contact
+        candidate["source"] = "preview_fallback"
+        return candidate
+    return {}
+
+
 def find_visible_chat(probe_result: dict[str, Any], contact: str) -> dict[str, Any]:
     for chat in probe_result.get("visibleChats", []):
         if wechat_ui.names_match(str(chat.get("name", "")), contact):
@@ -530,6 +568,15 @@ class AutoReplyRunner:
                 active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
                 if active_fallback:
                     candidates = [active_fallback]
+            if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
+                preview_fallback = choose_whitelist_preview_fallback_candidate(
+                    probe_result,
+                    allowed_contacts,
+                    queue=queue,
+                    last_seen_inbound=dict(state.get("last_seen_inbound") or {}),
+                )
+                if preview_fallback:
+                    candidates = [preview_fallback]
             self.append_event(
                 "claim_candidates",
                 contacts=[chat.get("name", "") for chat in candidates],

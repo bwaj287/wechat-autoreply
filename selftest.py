@@ -1069,6 +1069,49 @@ def run_active_whitelist_chat_latest_outbound_skips_path() -> None:
     assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
 
 
+def run_whitelist_preview_fallback_claim_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "May", "preview": "在吗", "time": "20:59", "unread": False}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {"latestInbound": "在吗", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 11_200.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("在呢，怎么了？"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "May", result
+    assert store.state["pending"]["contact"] == "May"
+    assert store.state["pending"]["inbound_text"] == "在吗"
+
+
 def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -1676,6 +1719,7 @@ def main() -> int:
     run_non_whitelist_unread_cleared_path()
     run_active_whitelist_chat_claim_without_unread_badge_path()
     run_active_whitelist_chat_latest_outbound_skips_path()
+    run_whitelist_preview_fallback_claim_path()
     run_unread_whitelist_candidate_latest_outbound_skips_path()
     run_empty_queue_persistent_unread_waits_for_signal_change_path()
     run_empty_queue_persistent_unread_sweeps_after_interval_path()
