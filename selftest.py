@@ -11,7 +11,7 @@ from wechat_autoreply.capture_cleanup import delete_capture_snapshots_older_than
 from wechat_autoreply.config_store import default_config
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import find_chat
+from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat
 
 
 class MemoryStore:
@@ -560,6 +560,20 @@ def run_latest_message_refresh_path() -> None:
                 "activeChat": "Barrys",
                 "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
                 "chatPanel": {"latestInbound": "", "latestOutbound": "哈哈，收到你的表情了。"},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
+                "chatPanel": {"latestInbound": "[表情]", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
+                "chatPanel": {"latestInbound": "[表情]", "latestOutbound": "哈哈，收到你的表情了。"},
             },
         ]
     )
@@ -1135,6 +1149,17 @@ def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
             },
             {
                 "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                "chatPanel": {
+                    "latestInbound": "你在吗",
+                    "latestOutbound": "在，刚忙完",
+                    "inbound": [{"text": "你在吗", "top": 0.49}],
+                    "outbound": [{"text": "在，刚忙完", "top": 0.66}],
+                },
+            },
+            {
+                "status": "ok",
                 "visibleChats": [],
                 "chatPanel": {},
             },
@@ -1154,17 +1179,26 @@ def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
     )
 
     result = runner.tick()
-    assert result["status"] == "no_candidate", result
-    assert store.state["pending"] is None
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "Barrys", result
+    assert store.state["pending"]["contact"] == "Barrys"
+    assert store.state["pending"]["inbound_text"] == "你在吗"
     assert any(
-        event.get("type") == "claim_skipped"
-        and event.get("reason") == "latest_message_outbound"
+        event.get("type") == "claim_outbound_recheck"
+        and event.get("contact") == "Barrys"
+        and event.get("still_outbound") is True
+        for event in store.events
+    ), store.events
+    assert any(
+        event.get("type") == "claim_preview_fallback"
+        and event.get("reason") == "latest_outbound_recheck"
         and event.get("contact") == "Barrys"
         for event in store.events
     ), store.events
     assert fake_ui.calls == [
         "activate",
         ("probe", None),
+        ("probe", "Barrys"),
         ("probe", "Barrys"),
         ("probe", None),
         "hide",
@@ -1355,6 +1389,13 @@ def run_empty_inbound_recheck_cancels_pending_path() -> None:
                 "status": "ok",
                 "visibleChats": [],
                 "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": "", "time": "19:02", "unread": False}],
+                "chatPanel": {"latestInbound": "", "latestOutbound": ""},
             },
             {
                 "status": "ok",
@@ -1592,6 +1633,72 @@ def run_ocr_alias_contact_round_trip_path() -> None:
     assert store.state["pending"] is None
 
 
+def run_claim_preview_fallback_on_panel_mismatch_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [
+                    {"name": "10ck", "preview": "你咋看的啊", "time": "13:29", "unread": True},
+                    {"name": "Barrys", "preview": "帮我看看big datat", "time": "13:22", "unread": True},
+                ],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "chatPanel": {"latestInbound": "你咋看的啊", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                # Simulate stale panel content from previous chat; claim should fallback to preview.
+                "chatPanel": {"latestInbound": "你咋看的啊", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 13_000.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=PairMappingLLM(
+            {
+                ("1ock", "你咋看的啊"): "刚刷的 感觉有点意思 你看了没",
+                ("Barrys", "帮我看看big datat"): "我看了，稍后给你细说",
+            }
+        ),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] in {"draft_saved", "drafts_saved"}, first
+    queue = list(store.state.get("pending_queue") or [])
+    assert len(queue) == 2, queue
+    mapping = {item["contact"]: item["inbound_text"] for item in queue}
+    assert mapping.get("1ock") == "你咋看的啊", mapping
+    assert mapping.get("Barrys") == "帮我看看big datat", mapping
+    assert any(
+        event["type"] == "claim_preview_fallback"
+        and event.get("contact") == "Barrys"
+        and event.get("reason") == "panel_preview_mismatch"
+        for event in store.events
+    ), store.events
+
+
 def run_find_chat_alias_match_path() -> None:
     chats = [{"name": "1ock"}, {"name": "王哥"}]
     assert find_chat(chats, "10ck") == {"name": "1ock"}
@@ -1692,6 +1799,105 @@ def run_ocr_variant_same_message_does_not_refresh_path() -> None:
     assert not any(event["type"] == "pending_refreshed_latest" for event in store.events), store.events
 
 
+def run_right_side_bubble_overrides_inbound_color_misclass_path() -> None:
+    panel = _extract_chat_panel(
+        [
+            {
+                "text": "后天上",
+                "bbox": {"top": 0.361, "left": 0.531, "w": 0.069},
+                "bubbleRole": "inbound",
+                "greenPixels": 0,
+                "grayPixels": 2376,
+            },
+            {
+                "text": "看热闹不嫌事大",
+                "bbox": {"top": 0.625, "left": 0.687, "w": 0.191},
+                "bubbleRole": "inbound",
+                "greenPixels": 0,
+                "grayPixels": 8200,
+            },
+            {
+                "text": "我在twitch领箱子",
+                "bbox": {"top": 0.722, "left": 0.688, "w": 0.181},
+                "bubbleRole": "inbound",
+                "greenPixels": 0,
+                "grayPixels": 7106,
+            },
+        ]
+    )
+    assert panel["latestInbound"] == "后天上", panel
+    assert panel["latestOutbound"] == "我在twitch领箱子", panel
+
+
+def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "May", "preview": "昨晚睡了", "time": "13:44", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {"latestInbound": "昨晚睡了", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {
+                    "latestInbound": "G",
+                    "latestOutbound": "我在twitch领箱子",
+                    "inbound": [{"text": "G", "top": 0.84}],
+                    "outbound": [{"text": "我在twitch领箱子", "top": 0.72}],
+                },
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {
+                    "latestInbound": "",
+                    "latestOutbound": "我在twitch领箱子",
+                    "inbound": [{"text": "G", "top": 0.84}],
+                    "outbound": [{"text": "我在twitch领箱子", "top": 0.72}],
+                },
+            },
+        ]
+    )
+    clock = {"now": 50_000.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("那就好，睡饱了才精神，今天加油"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "draft_saved", first
+
+    clock["now"] = 50_305.0
+    second = runner.tick()
+    assert second["status"] == "cancelled", second
+    assert second["reason"] == "manual_reply_detected", second
+    assert store.state["pending"] is None
+    assert "send" not in fake_ui.calls
+
+
 def main() -> int:
     run_happy_path()
     run_manual_reply_cancel()
@@ -1707,9 +1913,12 @@ def main() -> int:
     run_compose_text_does_not_count_as_sent()
     run_repeated_identical_text_new_time_path()
     run_ocr_alias_contact_round_trip_path()
+    run_claim_preview_fallback_on_panel_mismatch_path()
     run_find_chat_alias_match_path()
     run_capture_cleanup_deletes_old_snapshots_path()
     run_ocr_variant_same_message_does_not_refresh_path()
+    run_right_side_bubble_overrides_inbound_color_misclass_path()
+    run_manual_reply_cancels_even_with_noisy_inbound_tail_path()
     run_no_claim_sweep_while_pending_wait_path()
     run_pending_menu_flicker_does_not_trigger_claim_path()
     run_queue_claims_on_menu_rising_path()

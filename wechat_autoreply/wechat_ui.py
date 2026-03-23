@@ -35,6 +35,7 @@ EMOJI_CHAR_RE = re.compile(
 )
 NON_TEXT_HINT_RE = re.compile(r"(表情|emoji|sticker|贴纸|动画表情|动画|emoticon)", re.IGNORECASE)
 BRACKETED_HINT_RE = re.compile(r"^[\[\(（【<〈《].{1,12}[\]\)）】>〉》]$")
+SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
 
 
 def normalize_text(text: str) -> str:
@@ -71,6 +72,8 @@ def has_meaningful_text(text: str) -> bool:
     value = (text or "").strip()
     if not value:
         return False
+    if SHORT_PING_RE.fullmatch(value):
+        return True
     return has_text_signal(value) or is_nontext_message(value)
 
 
@@ -268,7 +271,9 @@ def _median_gap(values: list[float], min_gap: float, max_gap: float, default: fl
 def _adaptive_row_threshold(items: list[dict[str, Any]], default: float = 0.06) -> float:
     ys = sorted(float(item.get("center", {}).get("y", 0.0) or 0.0) for item in items)
     median_gap = _median_gap(ys, min_gap=0.012, max_gap=0.25, default=default / 0.58)
-    return max(0.035, min(0.09, median_gap * 0.58))
+    # Keep a slightly higher floor so name + preview lines from the same
+    # chat cell are clustered together instead of split into fake contacts.
+    return max(0.04, min(0.09, median_gap * 0.58))
 
 
 def _roster_band_profiles(window_info: dict[str, Any]) -> list[tuple[float, float, float]]:
@@ -378,7 +383,29 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
                 }
             )
         chats.sort(key=lambda item: item["ocrTop"])
-        return chats
+        if not chats:
+            return chats
+        near_dup_gap = max(
+            0.03,
+            min(0.07, _median_gap([item["ocrTop"] for item in chats], min_gap=0.018, max_gap=0.25, default=0.10) * 0.62),
+        )
+        cleaned: list[dict[str, Any]] = []
+        for chat in chats:
+            if cleaned:
+                prev = cleaned[-1]
+                gap = float(chat.get("ocrTop", 0.0)) - float(prev.get("ocrTop", 0.0))
+                if gap < near_dup_gap:
+                    prev_score = int(bool(prev.get("time"))) + int(bool(prev.get("preview")))
+                    cur_score = int(bool(chat.get("time"))) + int(bool(chat.get("preview")))
+                    same_name = normalize_text(chat["name"]) == normalize_text(prev.get("name", ""))
+                    preview_split = normalize_text(chat["name"]) == normalize_text(prev.get("preview", ""))
+                    # Keep the richer row when OCR accidentally splits one chat cell.
+                    if same_name or preview_split or cur_score <= prev_score:
+                        continue
+                    cleaned[-1] = chat
+                    continue
+            cleaned.append(chat)
+        return cleaned
 
     for min_left, max_left, min_width in _roster_band_profiles(window_info):
         candidates: list[dict[str, Any]] = []
@@ -412,7 +439,7 @@ def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> lis
     min_span = max(0.05, min(0.16, median_row_gap * 0.72))
     for index, chat in enumerate(chats):
         current = tops[index]
-        prev_mid = (tops[index - 1] + current) / 2.0 if index > 0 else max(0.04, current - head_pad)
+        prev_mid = (tops[index - 1] + current) / 2.0 if index > 0 else max(0.015, current - head_pad * 1.2)
         next_mid = (current + tops[index + 1]) / 2.0 if index + 1 < len(tops) else min(0.98, current + tail_pad)
         if next_mid - prev_mid < min_span:
             grow = (min_span - (next_mid - prev_mid)) / 2.0
@@ -514,6 +541,7 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "text": item["text"],
             "bbox": {"top": item["top"], "left": item["left"], "w": item["width"]},
             "center": {"y": item["top"] + 0.01},
+            "confidence": float(item.get("confidence", 0.0) or 0.0),
         }
         for item in items
     ]
@@ -527,10 +555,66 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "top": round(min(item["bbox"]["top"] for item in row_items), 4),
                 "left": round(min(item["bbox"]["left"] for item in row_items), 4),
                 "width": round(max(item["bbox"]["w"] for item in row_items), 4),
+                "confidence": round(
+                    (
+                        sum(float(item.get("confidence", 0.0) or 0.0) for item in row_items)
+                        / max(1, len(row_items))
+                    ),
+                    4,
+                ),
             }
         )
     collapsed.sort(key=lambda item: item["top"])
     return collapsed
+
+
+def _resolve_chat_bubble_role(
+    *,
+    bubble_role: str,
+    left: float,
+    width: float,
+    green_pixels: int,
+    gray_pixels: int,
+    panel_kind: str,
+) -> str:
+    role = str(bubble_role or "unknown").strip().lower()
+    right = float(left) + float(width)
+
+    # Right-side bubbles are outbound even when color sampling is noisy in dark mode.
+    if panel_kind == "roster":
+        force_outbound_left = 0.63
+        force_outbound_right = 0.82
+        force_inbound_left = 0.50
+        force_inbound_right = 0.72
+        fallback_outbound_left = 0.58
+        fallback_outbound_right = 0.79
+        fallback_inbound_left = 0.30
+    else:
+        force_outbound_left = 0.57
+        force_outbound_right = 0.78
+        force_inbound_left = 0.43
+        force_inbound_right = 0.68
+        fallback_outbound_left = 0.52
+        fallback_outbound_right = 0.76
+        fallback_inbound_left = 0.08
+
+    if role == "inbound" and (left >= force_outbound_left or right >= force_outbound_right):
+        role = "outbound"
+    elif role == "outbound" and left <= force_inbound_left and right <= force_inbound_right:
+        role = "inbound"
+
+    if role not in {"outbound", "inbound"}:
+        if green_pixels >= 28 and green_pixels >= gray_pixels:
+            return "outbound"
+        if gray_pixels >= 44 and gray_pixels > int(green_pixels * 1.2):
+            return "inbound"
+        if left >= fallback_outbound_left or right >= fallback_outbound_right:
+            return "outbound"
+        if left >= fallback_inbound_left:
+            return "inbound"
+        return "unknown"
+
+    return role
 
 
 def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
@@ -558,12 +642,20 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
             "top": round(top, 4),
             "left": round(left, 4),
             "width": round(width, 4),
+            "confidence": round(float(obs.get("confidence", 0.0) or 0.0), 4),
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
         }
-        bubble_role = str(obs.get("bubbleRole", "unknown"))
-        if bubble_role == "outbound" or left >= 0.72:
+        bubble_role = _resolve_chat_bubble_role(
+            bubble_role=str(obs.get("bubbleRole", "unknown")),
+            left=float(left),
+            width=float(width),
+            green_pixels=int(obs.get("greenPixels", 0) or 0),
+            gray_pixels=int(obs.get("grayPixels", 0) or 0),
+            panel_kind="roster",
+        )
+        if bubble_role == "outbound":
             outbound_raw.append(bucket)
-        elif bubble_role == "inbound" or left >= 0.44:
+        elif bubble_role == "inbound":
             inbound_raw.append(bucket)
         else:
             misc_raw.append(bucket)
@@ -605,12 +697,20 @@ def _extract_chat_window_panel(obs_list: list[dict[str, Any]], selected_title: s
             "top": round(top, 4),
             "left": round(left, 4),
             "width": round(width, 4),
+            "confidence": round(float(obs.get("confidence", 0.0) or 0.0), 4),
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
         }
-        bubble_role = str(obs.get("bubbleRole", "unknown"))
-        if bubble_role == "outbound" or left >= 0.55:
+        bubble_role = _resolve_chat_bubble_role(
+            bubble_role=str(obs.get("bubbleRole", "unknown")),
+            left=float(left),
+            width=float(width),
+            green_pixels=int(obs.get("greenPixels", 0) or 0),
+            gray_pixels=int(obs.get("grayPixels", 0) or 0),
+            panel_kind="chat",
+        )
+        if bubble_role == "outbound":
             outbound_raw.append(bucket)
-        elif bubble_role == "inbound" or left >= 0.08:
+        elif bubble_role == "inbound":
             inbound_raw.append(bucket)
         else:
             misc_raw.append(bucket)

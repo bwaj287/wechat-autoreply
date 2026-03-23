@@ -35,6 +35,7 @@ def seed_allowed_contacts() -> list[str]:
         "可乐",
         "Ted Liu",
         "王哥",
+        "刘若愚",
     ]
 
 
@@ -44,7 +45,17 @@ def default_config() -> dict[str, Any]:
         "enabled": False,
         "idle_threshold_seconds": 30,
         "send_delay_seconds": 300,
+        "pending_refresh_delay_seconds": 180,
         "send_verify_retry_seconds": 45,
+        "recheck_vote_frames": 1,
+        "recheck_vote_interval_seconds": 0.25,
+        "recheck_min_confidence": 0.0,
+        "recheck_low_confidence_delay_seconds": 60,
+        "recheck_low_confidence_max_delay_seconds": 900,
+        "recheck_low_confidence_max_retries": 4,
+        "recheck_low_confidence_snooze_seconds": 1800,
+        "recheck_tail_min_top": 0.52,
+        "recheck_tail_span": 0.28,
         "send_max_attempts": 2,
         "pending_stale_ttl_seconds": 86400,
         "poll_interval_seconds": 5,
@@ -58,6 +69,10 @@ def default_config() -> dict[str, Any]:
         "ollama_model": "qwen3.5:9b",
         "ollama_url": "http://127.0.0.1:11434/api/generate",
         "max_reply_chars": 90,
+        "emoji_pack_zip_path": str(Path.home() / "Downloads" / "wechat-emoji-main.zip"),
+        "reply_emoji_enabled": True,
+        "reply_emoji_min_count": 1,
+        "reply_emoji_max_count": 2,
         "reply_style_instructions": (
             "Write like Shawn texting on WeChat. "
             "Natural, casual, short, and human. "
@@ -66,6 +81,8 @@ def default_config() -> dict[str, Any]:
             "Do not explain yourself. "
             "Do not use bullet points. "
             "Do not use quotes around the reply. "
+            "Omit sentence-final periods in each reply. "
+            "Use WeChat emoji codes naturally, usually 1-2 per reply (for example [捂脸] [旺柴]). "
             "Avoid phrases like 当然可以, 好的我来帮你, 根据你的需求, 很高兴为你服务. "
             "If the incoming message is in Chinese, reply in natural spoken Chinese."
         ),

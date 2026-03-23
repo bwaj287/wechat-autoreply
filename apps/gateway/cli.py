@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
+from wechat_autoreply.event_log import append_event
 from wechat_autoreply.paths import EVENTS_PATH, PROJECT_ROOT
 from wechat_autoreply.state_store import default_state, load_state, save_state, utc_now_iso
 
@@ -17,16 +18,42 @@ from wechat_autoreply.state_store import default_state, load_state, save_state, 
 TRACE_TYPES = {
     "draft_saved_locally",
     "pending_refreshed_latest",
+    "pending_message_changed_recheck",
     "auto_sent",
     "pending_cancelled",
     "runner_error",
 }
 
+SUPPORTED_COMMANDS = [
+    "on",
+    "off",
+    "status",
+    "queue",
+    "diagnose",
+    "reset",
+    "restart",
+    "style-show",
+    "style-set",
+    "command",
+    "/command",
+    "help",
+    "/help",
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control the WeChat auto-reply runner.")
-    parser.add_argument("command", choices=["on", "off", "status", "queue", "diagnose", "reset", "restart"])
-    return parser.parse_args()
+    parser.add_argument(
+        "command",
+        choices=SUPPORTED_COMMANDS,
+    )
+    parser.add_argument("style_text", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.command != "style-set" and args.style_text:
+        parser.error("only style-set accepts style text")
+    if args.command == "style-set" and not " ".join(args.style_text).strip():
+        parser.error('style-set requires style text, e.g. style-set "Natural, short, no period"')
+    return args
 
 
 def _shorten(text: str, limit: int = 48) -> str:
@@ -56,6 +83,14 @@ def _format_trace(event: dict[str, Any]) -> str:
     if event_type == "pending_refreshed_latest":
         draft = _shorten(str(event.get("draft_text") or ""))
         return f"{prefix} 草稿已更新：{draft}"
+    if event_type == "pending_message_changed_recheck":
+        delay_seconds = int(float(event.get("delay_seconds", 0) or 0))
+        delay_label = f"{delay_seconds}秒"
+        if delay_seconds % 60 == 0 and delay_seconds > 0:
+            delay_label = f"{delay_seconds // 60}分钟"
+        truncation_like = bool(event.get("truncation_like"))
+        suffix = "（疑似截断/OCR抖动）" if truncation_like else ""
+        return f"{prefix} 发送前检测消息变化，延后{delay_label}复检{suffix}"
     if event_type == "auto_sent":
         draft = _shorten(str(event.get("draft_text") or ""))
         return f"{prefix} 已发送：{draft}"
@@ -208,7 +243,44 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
+def style_show_output(config: dict[str, Any]) -> str:
+    style = str(config.get("reply_style_instructions") or "").strip()
+    if not style:
+        style = "（空）"
+    return "\n".join(["微信自动回复语气规则：", style])
+
+
+def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
+    lines = [
+        status_line(config, len(_pending_queue(state))),
+        "Gateway 指令帮助：",
+        "",
+        "基础控制：",
+        "- on：开启自动回复",
+        "- off：关闭自动回复",
+        "- status：查看开关状态 + 最近关键记录",
+        "- queue：查看待发送队列",
+        "- diagnose：查看详细诊断与最近事件",
+        "- reset：清空 runtime state 并重启（等价 restart）",
+        "- restart：清空 runtime state 并重启",
+        "",
+        "语气设置：",
+        "- style-show：查看当前语气规则",
+        '- style-set "<规则>"：更新语气规则',
+        "",
+        "帮助：",
+        "- command：显示本帮助",
+        "- /command：显示本帮助（聊天里更顺手）",
+        "",
+        "示例：",
+        "- ./wechat_env/bin/python gateway_control.py queue",
+        "- ./wechat_env/bin/python gateway_control.py command",
+        '- ./wechat_env/bin/python gateway_control.py style-set "自然、简短、口语化，不要句号"',
+    ]
+    return "\n".join(lines)
+
+
+def reset_runtime_state(command: str = "restart") -> tuple[dict[str, Any], dict[str, Any]]:
     def stop_runner_processes() -> None:
         for target in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "apps" / "runner" / "cli.py"):
             subprocess.run(
@@ -219,6 +291,15 @@ def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
             )
 
     config = load_config()
+    before_state = load_state()
+    before_queue = _pending_queue(before_state)
+    append_event(
+        "gateway_runtime_reset",
+        command=command,
+        pending_count_before=len(before_queue),
+        pending_contacts_before=[str(item.get("contact") or "").strip() for item in before_queue if item.get("contact")],
+        enabled_before=bool(config.get("enabled")),
+    )
     # Freeze runner first to avoid queue/state races during reset.
     config["enabled"] = False
     save_config(config)
@@ -234,31 +315,53 @@ def reset_runtime_state() -> tuple[dict[str, Any], dict[str, Any]]:
     config["enabled"] = True
     save_config(config)
     state = load_state()
+    append_event(
+        "gateway_runtime_reset_done",
+        command=command,
+        pending_count_after=len(_pending_queue(state)),
+        enabled_after=bool(config.get("enabled")),
+    )
     return config, state
 
 
 def main() -> int:
     args = parse_args()
-    if args.command == "on":
+    command = args.command
+    if command in {"help", "/help", "command", "/command"}:
+        command = "command"
+    if command == "on":
         config = set_enabled(True)
         state = load_state()
-    elif args.command == "off":
+    elif command == "off":
         config = set_enabled(False)
         state = load_state()
-    elif args.command in {"reset", "restart"}:
-        config, state = reset_runtime_state()
-    else:
+    elif command in {"reset", "restart"}:
+        config, state = reset_runtime_state(command)
+    elif command == "style-set":
         config = load_config()
+        config["reply_style_instructions"] = " ".join(args.style_text).strip()
         save_config(config)
         state = load_state()
-    if args.command == "status":
+    else:
+        config = load_config()
+        if command not in {"style-show", "command"}:
+            save_config(config)
+        state = load_state()
+    if command == "status":
         print(status_output(config, state))
-    elif args.command == "queue":
+    elif command == "queue":
         print(queue_output(config, state))
-    elif args.command == "diagnose":
+    elif command == "diagnose":
         print(diagnose_output(config, state))
-    elif args.command in {"reset", "restart"}:
+    elif command == "style-show":
+        print(style_show_output(config))
+    elif command == "style-set":
+        print("微信自动回复：语气规则已更新")
+        print(style_show_output(config))
+    elif command in {"reset", "restart"}:
         print("微信自动回复：已重置并重启（待发送 0）")
+    elif command == "command":
+        print(help_output(config, state))
     else:
         pending_count = len(_pending_queue(state))
         print(status_line(config, pending_count))

@@ -81,7 +81,14 @@ func isRedBadge(_ color: NSColor) -> Bool {
     let g = Double(c.greenComponent)
     let b = Double(c.blueComponent)
     let a = Double(c.alphaComponent)
-    return a > 0.25 && r > 0.35 && g < 0.60 && b < 0.60 && (r - g) > 0.06 && (r - b) > 0.06
+    // Tune for WeChat macOS dark mode where unread badge red can be softer than pure red.
+    // Geometry filters below still reject most avatar/background red noise.
+    return a > 0.25
+        && r > 0.55
+        && g < 0.65
+        && b < 0.65
+        && (r - g) > 0.07
+        && (r - b) > 0.07
 }
 
 func findComponents(
@@ -169,17 +176,18 @@ func findComponents(
 var results: [RowResult] = []
 for row in rows {
     let nameLeft = row.nameLeft ?? 0.15
-    // Only scan the avatar top-right badge lane to avoid false positives
-    // from colorful avatars or preview snippets.
-    let minScanX = Swift.max(0.03, nameLeft - 0.08)
-    let maxScanX = Swift.min(0.20, nameLeft - 0.005)
+    // Scan the whole avatar badge neighborhood (left+right of avatar top edge).
+    // Some WeChat UI variants render unread badges near avatar top-left instead
+    // of top-right, especially for the first visible row.
+    let minScanX = Swift.max(0.02, nameLeft - 0.13)
+    let maxScanX = Swift.min(0.24, nameLeft + 0.025)
     let x0 = clamp(Int(Double(width) * minScanX), min: 0, max: width - 1)
     let x1 = clamp(Int(Double(width) * maxScanX), min: x0 + 1, max: width)
     let yTop = clamp(Int(row.rowTop * Double(height)), min: 0, max: height - 1)
     let yBottom = clamp(Int(row.rowBottom * Double(height)), min: yTop + 1, max: height)
     let rowHeight = Swift.max(1, yBottom - yTop)
-    let minBadgeHeight = Swift.max(6, Int(Double(rowHeight) * 0.14))
-    let maxBadgeHeight = Swift.max(minBadgeHeight + 3, Int(Double(rowHeight) * 0.38))
+    let minBadgeHeight = Swift.max(8, Int(Double(rowHeight) * 0.18))
+    let maxBadgeHeight = Swift.max(minBadgeHeight + 3, Int(Double(rowHeight) * 0.40))
     let minBadgeWidth = minBadgeHeight
     let maxBadgeWidth = Swift.max(maxBadgeHeight, Int(Double(rowHeight) * 1.05))
     let minPixels = Swift.max(14, Int(Double(minBadgeHeight * minBadgeHeight) * 0.28))
@@ -189,8 +197,10 @@ for row in rows {
         let centerXNorm = component.centerX / Double(width)
         let centerYNorm = (component.centerY - Double(yTop)) / Double(max(rowHeight, 1))
         let aspect = Double(component.width) / Double(max(component.height, 1))
-        let minCenterX = Swift.max(0.07, nameLeft - 0.06)
-        let maxCenterX = Swift.min(0.28, nameLeft + 0.05)
+        let minCenterX = Swift.max(0.03, nameLeft - 0.12)
+        let maxCenterX = Swift.min(0.30, nameLeft + 0.07)
+        let maxCenterY = row.index == 0 ? 0.72 : 0.52
+        let minCenterY = row.index == 0 ? 0.03 : 0.08
         return component.count >= minPixels
             && component.count <= maxPixels
             && component.width >= minBadgeWidth
@@ -202,8 +212,8 @@ for row in rows {
             && aspect <= 2.30
             && centerXNorm >= minCenterX
             && centerXNorm <= maxCenterX
-            && centerYNorm >= 0.08
-            && centerYNorm <= 0.52
+            && centerYNorm >= minCenterY
+            && centerYNorm <= maxCenterY
     }
     let best = candidates.max(by: { lhs, rhs in
         if lhs.count == rhs.count {

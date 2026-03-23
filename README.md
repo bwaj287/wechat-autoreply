@@ -126,13 +126,42 @@ runtime/
 ./wechat_env/bin/python gateway_control.py status
 ./wechat_env/bin/python gateway_control.py queue
 ./wechat_env/bin/python gateway_control.py diagnose
+./wechat_env/bin/python gateway_control.py reset
 ./wechat_env/bin/python gateway_control.py restart
+./wechat_env/bin/python gateway_control.py style-show
+./wechat_env/bin/python gateway_control.py style-set "自然、简短、口语化，不要句号"
+./wechat_env/bin/python gateway_control.py command
+./wechat_env/bin/python gateway_control.py /command
 ```
 
 说明：
 
+- `on`：开启微信自动回复 runner。
+- `off`：关闭微信自动回复 runner（不再认领和发送）。
+- `status`：查看当前开关状态与最近关键记录。
+- `queue`：查看当前待发送队列（联系人、剩余时间、入站、草稿）。
+- `diagnose`：输出详细诊断（最近事件、状态栏信号、错误、队列）。
+- `reset`：清空 runtime state 并重启 runner（等价于快速回到干净状态）。
 - `restart`：清空 runtime state 并重启 runner（用于回到“干净聆听状态”）。
-- `diagnose`：查看队列、最近事件、状态栏信号、最后错误等。
+- `style-show`：查看当前微信自动回复语气规则。
+- `style-set "<文本>"`：更新微信自动回复语气规则（写入 `reply_style_instructions`）。
+- `command` / `/command`：查看全部 Gateway 指令说明。
+
+## 回复语气配置（微信自动回复专用）
+
+- 配置文件：`runtime/config.json`
+- 字段：`reply_style_instructions`
+- 当前规则包含：回复句尾不加句号（`Omit sentence-final periods in each reply.`）
+- Emoji 相关字段：
+  - `emoji_pack_zip_path`（默认 `/Users/<你的用户名>/Downloads/wechat-emoji-main.zip`）
+  - `reply_emoji_enabled`（默认 `true`）
+  - `reply_emoji_min_count`（默认 `1`）
+  - `reply_emoji_max_count`（默认 `2`）
+- 程序会优先读取 `emoji_pack_zip_path` 里的微信默认表情代码名（例如 `[微笑]`、`[捂脸]`、`[旺柴]`），用于提示词与自动补表情。
+- 修改该字段后执行 `./wechat_env/bin/python gateway_control.py restart` 使配置立即生效
+- 也可直接用 Gateway：
+  - `./wechat_env/bin/python gateway_control.py style-show`
+  - `./wechat_env/bin/python gateway_control.py style-set "你的语气规则"`
 
 ## 关键日志事件
 

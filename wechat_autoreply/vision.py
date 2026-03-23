@@ -21,6 +21,7 @@ OCR_UPSCALE_FACTOR = 3
 ADAPTIVE_THRESHOLD_OFFSET = 8
 DOCK_CAPTURE_HEIGHT_RATIO = 0.22
 DOCK_CAPTURE_MIN_HEIGHT = 120
+DOCK_WECHAT_NAMES = ("WeChat", "Weixin")
 
 
 def _control_center_items() -> list[dict[str, Any]]:
@@ -65,6 +66,105 @@ def _capture_region(info: dict[str, Any]) -> Path:
         stderr=subprocess.DEVNULL,
     )
     return path
+
+
+def _dock_item_bounds(name: str) -> dict[str, int] | None:
+    script = f"""
+tell application "System Events"
+  tell process "Dock"
+    try
+      set el to UI element "{name}" of list 1
+      set p to position of el
+      set s to size of el
+      return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
+    on error
+      return ""
+    end try
+  end tell
+end tell
+"""
+    try:
+        output = subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        return None
+    if not output:
+        return None
+    nums = re.findall(r"-?\d+", output)
+    if len(nums) < 4:
+        return None
+    x, y, w, h = [int(nums[i]) for i in range(4)]
+    if w < 20 or h < 20:
+        return None
+    return {"x": x, "y": y, "width": w, "height": h}
+
+
+def _dock_item_status_label(name: str) -> str:
+    script = f"""
+tell application "System Events"
+  tell process "Dock"
+    try
+      set v to value of attribute "AXStatusLabel" of UI element "{name}" of list 1
+      return v as text
+    on error
+      return ""
+    end try
+  end tell
+end tell
+"""
+    try:
+        return subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _status_label_signal(label: str) -> str:
+    value = str(label or "").strip()
+    if not value:
+        return ""
+    matched = DIGIT_RE.search(value)
+    if not matched:
+        return ""
+    try:
+        count = int(matched.group(0))
+    except Exception:
+        return ""
+    return str(count) if count > 0 else ""
+
+
+def _capture_clamped_region(x: int, y: int, width: int, height: int) -> Path:
+    frame = NSScreen.mainScreen().frame()
+    screen_w = int(frame.size.width)
+    screen_h = int(frame.size.height)
+    x0 = max(0, min(screen_w - 2, int(x)))
+    y0 = max(0, min(screen_h - 2, int(y)))
+    w = max(2, min(screen_w - x0, int(width)))
+    h = max(2, min(screen_h - y0, int(height)))
+    return _capture_region({"x": x0, "y": y0, "width": w, "height": h})
+
+
+def _wechat_icon_badge_result() -> tuple[bool, str]:
+    found_icon = False
+    for name in DOCK_WECHAT_NAMES:
+        bounds = _dock_item_bounds(name)
+        if not bounds:
+            continue
+        found_icon = True
+        status_signal = _status_label_signal(_dock_item_status_label(name))
+        if status_signal:
+            return True, status_signal
+    return found_icon, ""
 
 
 def _bitmap_rep(path: Path) -> NSBitmapImageRep:
@@ -498,50 +598,32 @@ def _red_badge_pixels(path: Path, candidate: dict[str, int]) -> int:
     y0 = int(candidate["y0"])
     width = int(candidate["width"])
     height = int(candidate["height"])
-    # Keep badge ROI tightly around the icon's own top-right corner
-    # so red pixels from neighboring Dock apps don't leak in.
-    badge_x0 = max(0, x1 - int(width * 0.08))
-    badge_x1 = min(image_width, x1 + int(width * 0.20))
-    badge_y0 = max(0, y0 - int(height * 0.20))
-    badge_y1 = min(image_height, y0 + int(height * 0.24))
+    # Badge position drifts with Dock magnification and display scaling.
+    # Use a wider icon-anchored ROI around top-right to avoid missing badge offsets.
+    badge_x0 = max(0, x1 - int(width * 0.20))
+    badge_x1 = min(image_width, x1 + int(width * 0.58))
+    badge_y0 = max(0, y0 - int(height * 0.48))
+    badge_y1 = min(image_height, y0 + int(height * 0.46))
     count = 0
     for y in range(badge_y0, badge_y1):
         for x in range(badge_x0, badge_x1):
             red, green, blue = pixels[x, y]
-            if red < 185:
+            # Dock badges are anti-aliased and can be partially translucent.
+            # Keep the rule "red-dominant" instead of requiring pure red.
+            if red < 150:
                 continue
-            if green > 120 or blue > 120:
+            if (red - green) < 35 or (red - blue) < 35:
                 continue
-            if (red - green) < 55 or (red - blue) < 55:
+            if red < int(green * 1.18) or red < int(blue * 1.18):
                 continue
             count += 1
     return count
 
 
 def _dock_unread_signal() -> str:
-    capture_path = _capture_region(_dock_capture_region())
-    try:
-        candidates = _green_icon_candidates(capture_path)
-        if not candidates:
-            return ""
-        # Filter tiny incidental green blobs (for example icon accents / overlays)
-        # by keeping candidates close to the dominant Dock icon size in this frame.
-        side_lengths = sorted(min(int(item["width"]), int(item["height"])) for item in candidates)
-        median_side = side_lengths[len(side_lengths) // 2]
-        min_side = max(40, int(median_side * 0.74))
-        for candidate in candidates:
-            if min(int(candidate["width"]), int(candidate["height"])) < min_side:
-                continue
-            bubbles = _white_bubble_component_count(capture_path, candidate)
-            if bubbles < 2:
-                continue
-            red_pixels = _red_badge_pixels(capture_path, candidate)
-            min_red = max(160, int(candidate["area"] * 0.03))
-            if red_pixels >= min_red:
-                return "1"
-        return ""
-    finally:
-        capture_path.unlink(missing_ok=True)
+    # Strict mode: only trigger when WeChat Dock item itself reports a numeric badge.
+    _found_icon, strict_signal = _wechat_icon_badge_result()
+    return strict_signal
 
 
 def unread_signal() -> str:
