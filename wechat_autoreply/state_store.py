@@ -1,4 +1,5 @@
 import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ def default_state() -> dict[str, Any]:
         "last_menu_unread": False,
         "last_menu_signal": "",
         "last_claim_menu_signal": "",
+        "pending_menu_clear_streak": 0,
         "last_capture_cleanup_at": 0.0,
         "last_roster_sweep_at": 0.0,
         "last_seen_inbound": {},
@@ -29,9 +31,17 @@ def default_state() -> dict[str, Any]:
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        tmp_path = Path(handle.name)
+    tmp_path.replace(path)
 
 
 def load_state() -> dict[str, Any]:

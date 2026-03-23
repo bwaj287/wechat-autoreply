@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from typing import Iterable
 
 from .paths import BRIDGE_SOCKET, PEEKABOO
@@ -29,9 +30,18 @@ def peekaboo_commands(args: list[str]) -> list[list[str]]:
 
 def run_peekaboo_variants(commands: Iterable[list[str]], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     errors: list[str] = []
+    started = time.monotonic()
     for cmd in commands:
+        elapsed = time.monotonic() - started
+        remaining = int(timeout - elapsed)
+        if remaining <= 0:
+            errors.append("peekaboo variants timeout exhausted")
+            break
+        # Timeout is a total budget across variants (not per variant),
+        # so one bad transport path won't stall the whole claim flow.
+        per_cmd_timeout = max(3, min(remaining, 18))
         try:
-            return run(cmd, timeout=timeout)
+            return run(cmd, timeout=per_cmd_timeout)
         except Exception as exc:  # pragma: no cover - exercised only on macOS host
             errors.append(str(exc))
     raise RuntimeError(" ; ".join(errors) or "peekaboo command failed")
