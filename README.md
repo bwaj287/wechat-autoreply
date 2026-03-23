@@ -1,187 +1,342 @@
 # WeChat Auto-Reply (OpenClaw)
 
-本项目是一个运行在 macOS 本地的微信自动回复 agent，基于 UI 自动化 + OCR，不依赖微信官方 API。
+This repository contains a local macOS WeChat auto-reply agent built with UI automation + OCR.
 
-当前实现重点是“可控、可诊断、可恢复”：
+It does not use any official WeChat API.  
+All behaviors are executed by visual detection, window control, keyboard simulation, and a local LLM.
 
-- 强约束触发逻辑
-- FIFO 待发送队列
-- 明确的日志事件
-- Gateway 命令可直接观测状态
+## Why This Project Exists
 
-## 目录结构
+The main goal is reliable delayed auto-reply with strong guardrails:
+
+- Trigger only when there is a clear unread signal.
+- Never hijack keyboard/mouse while the user is active.
+- Keep a visible FIFO pending queue.
+- Cancel safely when manual reply is detected.
+- Expose everything with Gateway commands + event logs.
+
+## Scope and Safety Model
+
+What it does:
+
+- Watches for unread signals.
+- Claims whitelist inbound messages.
+- Generates draft replies.
+- Sends after delay when safe.
+
+What it does not do:
+
+- No official messaging API integration.
+- No silent background processing without macOS permissions.
+- No forced send when manual activity is detected.
+
+Safety-first principles:
+
+- `idle >= 30s` is required before any UI automation opens WeChat.
+- Sending path includes re-check before paste/send.
+- Pending items are cancellable on multiple safety signals.
+- Runtime state is restartable and inspectable.
+
+## Repository Layout
 
 ```text
 apps/
-  gateway/         # Gateway 控制端（on/off/status/queue/diagnose/restart）
-  runner/          # Runner 主循环入口
+  gateway/                   # Gateway command interface
+  runner/                    # Runner entry (main loop / one-shot)
 docs/
   ARCHITECTURE.md
   OPERATIONS.md
 tools/
-  wechat_row_badges.swift   # 聊天列表红点检测
-  wechat_bubble_roles.swift # 聊天气泡角色（入站/出站）辅助识别
+  wechat_row_badges.swift    # Red unread-dot detection in list rows
+  wechat_bubble_roles.swift  # Inbound vs outbound bubble role helper
 wechat_autoreply/
-  orchestrator.py   # 核心状态机
-  wechat_ui.py      # 微信窗口探测、点击、OCR提取
-  vision.py         # 状态栏微信图标+数字检测
-  idle.py           # 全局空闲时长（Quartz）
+  orchestrator.py            # Core state machine
+  wechat_ui.py               # WeChat probing, OCR extraction, UI actions
+  vision.py                  # Menu signal detection (icon + digit context)
+  idle.py                    # System idle detection via Quartz
+  state_store.py             # Runtime state persistence
+  config_store.py            # Config read/write and toggles
 runtime/
-  config.json
-  state.json
-  events.jsonl
-  captures/
+  config.json                # Runtime config
+  state.json                 # Runtime state snapshot
+  events.jsonl               # Append-only event timeline
+  captures/                  # Debug captures
 ```
 
-## 兼容入口
+Compatibility entrypoints:
 
 - `main.py` -> `apps.runner.cli`
 - `gateway_control.py` -> `apps.gateway.cli`
 
-## 当前核心逻辑（已落地）
+## Prerequisites
 
-### 1) 状态栏检测门控（Idle First）
+- macOS (Apple Silicon supported).
+- WeChat desktop app installed and signed in.
+- Python 3.10+ (tested with local `wechat_env` venv).
+- Local Ollama service running.
+- Terminal permissions:
+  - Accessibility
+  - Screen Recording
 
-- 只有在 `idle >= 30s` 时才会检测状态栏数字。
-- `idle < 30s` 时不采样状态栏，并清空临时 menu signal，避免“旧数字缓存”导致延迟误触发。
+## Quick Start
 
-### 2) 自动打开微信只允许两种原因
-
-- `claim_scan`：认领流程（状态栏检测到有数字后触发）。
-- `pending_send_due`：队列中某条草稿到达 5 分钟发送时间。
-
-除此之外不允许出现其他“自动开微信”业务路径。
-
-### 3) 认领流程（claim_scan）
-
-触发条件：本轮状态栏检测拿到可执行数字（`signal` 为正整数）。
-
-打开微信后只走两类业务分支：
-
-1. 白名单联系人且有未读红点：
-   - 打开该会话
-   - 读取入站文本
-   - 生成草稿
-   - 写入 `pending_queue`
-2. 非白名单联系人但有未读红点：
-   - 依次点开以清除红点（不入队）
-
-如果状态栏有数字，但打开后既没有白名单未读也没有非白名单未读，会记事件：
-
-- `claim_logic_bug`
-- reason: `非正常状态栏数字和红点`
-
-### 4) 待发送队列（pending_queue）
-
-- 队列是 FIFO；发送时总是先处理队头。
-- 每条 pending 包含：`contact`、`inbound_text`、`inbound_fingerprint`、`draft_text`、`created_at`、`due_at`。
-- 默认延时发送：`300s`（5分钟）。
-- 超时垃圾回收：`pending_stale_ttl_seconds`（默认 86400 秒）。
-
-### 5) 到点发送流程（pending_send_due）
-
-触发条件：
-
-- 队列非空
-- 当前 idle 满足阈值
-- 队头 `due_at` 已到
-
-发送逻辑：
-
-1. 打开微信并选中队头联系人
-2. 再次读取当前会话，做安全校验
-3. 若确认可发，粘贴草稿并发送
-4. 二次确认发送结果，成功则出队
-5. 若未确认，进入重试（默认最多 2 次）
-
-### 6) “已手动回复”保护（避免误发）
-
-以下任一满足会取消对应 pending：
-
-- 最新气泡检测为我方出站
-- 会话 preview 与我方最近出站文本匹配
-- 发现我方最新文本变化（非自动草稿回显）
-
-这保证“你已经在别处回过”的消息不会再次自动发送。
-
-### 7) Barrys 相关修复（已包含）
-
-已加入两类防误判：
-
-- 聊天列表红点检测收紧 ROI 与形态阈值，减少把头像红色误当红点。
-- 预览文本匹配我方出站时，不再把 OCR 抖动入站（如 `8~`）认领进队列。
-
-## 识别链路简述
-
-- 状态栏：`vision.py` 检测微信图标右侧数字信号。
-- 列表红点：`tools/wechat_row_badges.swift` 对每行头像区域做红色连通域判断。
-- 聊天气泡角色：`tools/wechat_bubble_roles.swift` + `wechat_ui.py` 辅助区分 inbound/outbound。
-- 文本提取：OCR + 行聚合（防碎片化）。
-
-## Gateway 常用命令
+### 1) Environment
 
 ```bash
-./wechat_env/bin/python gateway_control.py on
-./wechat_env/bin/python gateway_control.py off
+cd /Users/shawnwang/Documents/Playground
+python3 -m venv wechat_env
+./wechat_env/bin/pip install -r requirements.txt
+```
+
+### 2) Configure Runtime
+
+Runtime config file:
+
+- `/Users/shawnwang/Documents/Playground/runtime/config.json`
+
+Whitelist and switch files used by operational flow:
+
+- `/Users/shawnwang/Documents/Playground/wechat-whitelist.txt`
+- `/Users/shawnwang/Documents/Playground/wechat-auto-reply-switch.txt`
+
+### 3) Start Runner
+
+Long-running loop:
+
+```bash
+./wechat_env/bin/python main.py
+```
+
+One-shot tick (debug):
+
+```bash
+./wechat_env/bin/python apps/runner/cli.py --once --json
+```
+
+Dry-run one-shot (no real paste/send):
+
+```bash
+./wechat_env/bin/python apps/runner/cli.py --once --dry-run --json
+```
+
+## Gateway Command Reference
+
+All control commands go through:
+
+```bash
+./wechat_env/bin/python gateway_control.py <command>
+```
+
+Supported commands:
+
+- `on` -> enable auto-reply runner.
+- `off` -> disable claim/send execution.
+- `status` -> show switch + recent trace lines.
+- `queue` -> show pending queue.
+- `diagnose` -> detailed diagnostics and recent events.
+- `reset` -> clear runtime state and restart cleanly.
+- `restart` -> same behavior as reset.
+- `style-show` -> show current reply style instructions.
+- `style-set "<text>"` -> update style instructions.
+- `command` or `/command` -> show command help.
+
+Examples:
+
+```bash
 ./wechat_env/bin/python gateway_control.py status
 ./wechat_env/bin/python gateway_control.py queue
 ./wechat_env/bin/python gateway_control.py diagnose
-./wechat_env/bin/python gateway_control.py reset
-./wechat_env/bin/python gateway_control.py restart
-./wechat_env/bin/python gateway_control.py style-show
-./wechat_env/bin/python gateway_control.py style-set "自然、简短、口语化，不要句号"
-./wechat_env/bin/python gateway_control.py command
-./wechat_env/bin/python gateway_control.py /command
+./wechat_env/bin/python gateway_control.py style-set "Natural, short, conversational, no sentence-final periods"
 ```
 
-说明：
+## Core Runtime Logic
 
-- `on`：开启微信自动回复 runner。
-- `off`：关闭微信自动回复 runner（不再认领和发送）。
-- `status`：查看当前开关状态与最近关键记录。
-- `queue`：查看当前待发送队列（联系人、剩余时间、入站、草稿）。
-- `diagnose`：输出详细诊断（最近事件、状态栏信号、错误、队列）。
-- `reset`：清空 runtime state 并重启 runner（等价于快速回到干净状态）。
-- `restart`：清空 runtime state 并重启 runner（用于回到“干净聆听状态”）。
-- `style-show`：查看当前微信自动回复语气规则。
-- `style-set "<文本>"`：更新微信自动回复语气规则（写入 `reply_style_instructions`）。
-- `command` / `/command`：查看全部 Gateway 指令说明。
+### Tick Gate
 
-## 回复语气配置（微信自动回复专用）
+- Runner polls every `poll_interval_seconds` (default `5`).
+- UI actions require idle gate (`idle_threshold_seconds`, default `30`).
 
-- 配置文件：`runtime/config.json`
-- 字段：`reply_style_instructions`
-- 当前规则包含：回复句尾不加句号（`Omit sentence-final periods in each reply.`）
-- Emoji 相关字段：
-  - `emoji_pack_zip_path`（默认 `/Users/<你的用户名>/Downloads/wechat-emoji-main.zip`）
-  - `reply_emoji_enabled`（默认 `true`）
-  - `reply_emoji_min_count`（默认 `1`）
-  - `reply_emoji_max_count`（默认 `2`）
-- 程序会优先读取 `emoji_pack_zip_path` 里的微信默认表情代码名（例如 `[微笑]`、`[捂脸]`、`[旺柴]`），用于提示词与自动补表情。
-- 修改该字段后执行 `./wechat_env/bin/python gateway_control.py restart` 使配置立即生效
-- 也可直接用 Gateway：
-  - `./wechat_env/bin/python gateway_control.py style-show`
-  - `./wechat_env/bin/python gateway_control.py style-set "你的语气规则"`
+### Unread Trigger
 
-## 关键日志事件
+- Menu signal check runs on interval (`menubar_check_interval_seconds`, default `15`).
+- Signal must be actionable before claim flow starts.
+
+### Allowed WeChat Auto-Open Reasons
+
+Only these are valid:
+
+- `claim_scan` -> unread claim scan path.
+- `pending_send_due` -> due-send path.
+
+Any other unexpected open path should be treated as a bug.
+
+### Claim Flow (`claim_scan`)
+
+When triggered:
+
+1. Open WeChat.
+2. Scan list rows for unread red-dot candidates.
+3. For each unread row:
+   - Whitelist contact: open chat, extract inbound, draft reply, enqueue pending.
+   - Non-whitelist contact: open row to clear unread only.
+4. Hide WeChat and restore previous front app.
+
+### Pending Queue Model
+
+- Queue is FIFO.
+- Due time: `send_delay_seconds` (default `300` seconds).
+- Stale cleanup: `pending_stale_ttl_seconds` (default `86400` seconds).
+- Queue state is persisted under runtime state.
+
+### Due-Send Flow (`pending_send_due`)
+
+When queue head is due and idle gate passes:
+
+1. Open WeChat and select target contact.
+2. Re-read chat panel for latest inbound/outbound.
+3. Run cancellation checks.
+4. If safe, focus input, paste draft, send.
+5. Verify send result; retry if needed.
+6. Hide WeChat and restore foreground app.
+
+## Cancellation Rules
+
+A pending item is cancelled when any of the following is detected:
+
+- Manual reply already exists (`manual_reply_detected`).
+- Input box has manual content (`input_box_modified`).
+- Inbound becomes empty or invalid during recheck.
+- Message fingerprint changes and flow requires refresh/cancel.
+- Probe/read failures exceed retry policy.
+
+## OCR and UI Reliability Notes
+
+The system includes protections against OCR jitter and UI ambiguity:
+
+- Row red-dot detection uses constrained ROI + morphology thresholding.
+- Bubble role helper distinguishes inbound/outbound by visual structure.
+- Inbound text is normalized and fingerprinted.
+- Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
+- Empty panel path triggers reselect attempt before cancel.
+
+Recent hardening included input-box probe sentinel behavior:
+
+- Clipboard sentinel is written before `Cmd+A/C`.
+- If copy fails and sentinel remains, it is treated as empty input.
+- This avoids stale clipboard false positives for `input_box_modified`.
+
+## Config Reference
+
+Primary runtime keys in `runtime/config.json`:
+
+- `enabled`: master switch.
+- `idle_threshold_seconds`: minimum idle before UI automation.
+- `send_delay_seconds`: draft delay before send.
+- `pending_refresh_delay_seconds`: delay when message changed.
+- `send_verify_retry_seconds`: delay before send verification retry.
+- `send_max_attempts`: retry budget for unconfirmed sends.
+- `menubar_check_interval_seconds`: unread signal sampling interval.
+- `pending_stale_ttl_seconds`: stale pending GC TTL.
+- `allowed_contacts`: whitelist contacts.
+- `ollama_url`, `ollama_model`: local LLM endpoint/model.
+- `reply_style_instructions`: reply tone instructions.
+- `emoji_pack_zip_path`: emoji pack zip path.
+- `reply_emoji_enabled`, `reply_emoji_min_count`, `reply_emoji_max_count`: emoji policy.
+
+## Runtime Files and Meanings
+
+- `runtime/config.json`: mutable runtime config.
+- `runtime/state.json`: latest state snapshot.
+- `runtime/events.jsonl`: event timeline for diagnostics.
+- `runtime/captures/`: OCR/debug images for investigation.
+- `runtime/runner.lock`: single-runner process lock.
+
+State file path used in OpenClaw workflow:
+
+- `/Users/shawnwang/.openclaw/workspace/wechat-auto-reply-state.json`
+
+## Event Log Cheatsheet
+
+High-signal events:
 
 - `menu_bar_checked`
 - `wechat_window_action` (`reason=claim_scan|pending_send_due`)
 - `claim_candidates`
 - `draft_saved_locally`
-- `pending_refreshed_latest`
+- `pending_recheck_voted`
+- `pending_message_changed_recheck`
 - `auto_sent`
 - `pending_cancelled`
-- `non_whitelist_unread_cleared`
-- `claim_logic_bug`（在 Gateway 中显示为“非正常状态栏数字和红点”）
+- `claim_logic_bug`
 
-## 运行与维护建议
+Typical successful sequence:
 
-1. 首次运行确认终端具备 macOS 权限：
-   - Accessibility
-   - Screen Recording
-2. 测试前可先 `restart`，确保 queue/state 干净。
-3. 若发现“状态栏有数字但微信内无红点”，优先看 `diagnose` 里的“非正常状态栏数字和红点”事件。
-4. 变更核心逻辑后至少执行：
-   - `./wechat_env/bin/python -m py_compile wechat_autoreply/orchestrator.py`
-   - `./wechat_env/bin/python gateway_control.py diagnose`
+1. `menu_bar_checked signal=<n>`
+2. `wechat_window_action reason=claim_scan`
+3. `claim_candidates`
+4. `draft_saved_locally`
+5. `wechat_window_action reason=pending_send_due`
+6. `pending_recheck_voted`
+7. `auto_sent`
+
+## Troubleshooting
+
+### WeChat opens but does not send
+
+Check `diagnose` and `events.jsonl` for:
+
+- `pending_cancelled reason=input_box_modified`
+- `pending_cancelled reason=manual_reply_detected`
+- `pending_message_changed_recheck`
+
+### Queue is not empty but nothing sends
+
+Confirm:
+
+- `enabled` is true.
+- Idle gate is actually satisfied.
+- No repeated cancellation events are firing.
+- WeChat panel selection is correct for the contact.
+
+### Unread exists but claim does not trigger
+
+Check:
+
+- Menu signal sampling events (`menu_bar_checked`).
+- macOS permissions (Screen Recording, Accessibility).
+- Current display/scale changes that may impact OCR.
+
+### Repeated empty scans
+
+Investigate:
+
+- `pending_reselect_empty_panel` and its result.
+- Unexpected UI layout changes (window size, split chat windows).
+
+## Maintenance Workflow
+
+Recommended operational loop:
+
+1. Before testing, run `restart`.
+2. Trigger a known whitelist message.
+3. Inspect `queue`.
+4. Wait due time and inspect `diagnose`.
+5. Verify `auto_sent` or explicit cancellation reason.
+
+Useful checks:
+
+```bash
+./wechat_env/bin/python -m py_compile wechat_autoreply/orchestrator.py wechat_autoreply/wechat_ui.py
+./wechat_env/bin/python gateway_control.py diagnose
+```
+
+## Development and Git Notes
+
+- Keep switch/whitelist local files out of commits when they include private data.
+- Prefer committing deterministic logic changes and docs separately.
+- For release snapshots, push both feature branch and release branch as needed.
+
+## Legal and Privacy Reminder
+
+This project automates personal messaging behavior.  
+Use responsibly, comply with local laws/platform policies, and avoid sending sensitive data through logs or prompts.
