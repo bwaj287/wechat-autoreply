@@ -7,3 +7,7 @@ runtime/
 
 discord-*.png
 桌面截图我看看
+
+# local private runtime control files
+wechat-auto-reply-switch.txt
+wechat-whitelist.txt
