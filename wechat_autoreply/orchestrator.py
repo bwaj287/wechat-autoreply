@@ -964,6 +964,12 @@ class AutoReplyRunner:
                 "idle_seconds": round(live_idle_seconds, 2),
                 "menu_unread": bool(state.get("last_menu_unread")),
             }
+        restore_app = ""
+        if hasattr(self.ui, "capture_frontmost_app"):
+            try:
+                restore_app = str(self.ui.capture_frontmost_app() or "")
+            except Exception:
+                restore_app = ""
         state["last_roster_sweep_at"] = now
         self.append_event(
             "wechat_window_action",
@@ -976,6 +982,27 @@ class AutoReplyRunner:
             allowed_contacts = list(config.get("allowed_contacts", []))
             queue = sync_pending_state(state)
             probe_result = self.ui.probe()
+
+            def _clear_non_whitelist_unread(snapshot: dict[str, Any]) -> list[str]:
+                non_whitelist_unread = choose_non_whitelist_unread(snapshot, allowed_contacts)
+                cleared_contacts: list[str] = []
+                seen_names: set[str] = set()
+                for chat in non_whitelist_unread:
+                    contact = str(chat.get("name", "")).strip()
+                    key = normalize_text(contact)
+                    if not contact or key in seen_names:
+                        continue
+                    seen_names.add(key)
+                    self.ui.probe(select_chat=contact, sleep_after_click=0.25)
+                    cleared_contacts.append(contact)
+                if cleared_contacts:
+                    self.append_event(
+                        "non_whitelist_unread_cleared",
+                        contacts=cleared_contacts,
+                        queue_contacts=queued_contacts(queue),
+                    )
+                return cleared_contacts
+
             candidates = choose_whitelist_candidates(probe_result, allowed_contacts)
             visible_chats = list(probe_result.get("visibleChats", []) or [])
             unread_rows = [
@@ -1027,26 +1054,7 @@ class AutoReplyRunner:
                         queue_contacts=queued_contacts(queue),
                     )
             if not candidates:
-                non_whitelist_unread = choose_non_whitelist_unread(probe_result, allowed_contacts)
-                non_whitelist_cleared = False
-                if non_whitelist_unread:
-                    cleared_contacts: list[str] = []
-                    seen_names: set[str] = set()
-                    for chat in non_whitelist_unread:
-                        contact = str(chat.get("name", "")).strip()
-                        key = normalize_text(contact)
-                        if not contact or key in seen_names:
-                            continue
-                        seen_names.add(key)
-                        self.ui.probe(select_chat=contact, sleep_after_click=0.25)
-                        cleared_contacts.append(contact)
-                    if cleared_contacts:
-                        non_whitelist_cleared = True
-                        self.append_event(
-                            "non_whitelist_unread_cleared",
-                            contacts=cleared_contacts,
-                            queue_contacts=queued_contacts(queue),
-                        )
+                non_whitelist_cleared = bool(_clear_non_whitelist_unread(probe_result))
                 self.append_event("claim_skipped", reason="no_visible_whitelist_unread")
                 if (
                     is_actionable_menu_signal(str(state.get("last_menu_signal") or ""))
@@ -1306,6 +1314,11 @@ class AutoReplyRunner:
                 )
                 process_candidates(follow_up_candidates)
 
+            try:
+                _clear_non_whitelist_unread(follow_up_probe)
+            except Exception as exc:
+                self.append_event("non_whitelist_clear_failed", error=str(exc), queue_contacts=queued_contacts(queue))
+
             changed = added + refreshed
             if not changed:
                 return {"status": "no_candidate"}
@@ -1315,6 +1328,11 @@ class AutoReplyRunner:
         finally:
             self.append_event("wechat_window_action", action="hide", reason="claim_scan")
             self.ui.hide_wechat()
+            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
+                try:
+                    self.ui.restore_frontmost_app(restore_app)
+                except Exception as exc:
+                    self.append_event("restore_frontmost_failed", context="claim_scan", error=str(exc), app=restore_app)
 
     def _refresh_pending(
         self,
@@ -1429,6 +1447,12 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
+        restore_app = ""
+        if hasattr(self.ui, "capture_frontmost_app"):
+            try:
+                restore_app = str(self.ui.capture_frontmost_app() or "")
+            except Exception:
+                restore_app = ""
         self.append_event("wechat_window_action", action="open", reason="pending_send_due", contact=contact)
         self.ui.activate_wechat()
         try:
@@ -1814,6 +1838,20 @@ class AutoReplyRunner:
                 )
                 return {"status": "dry_run_sent", "contact": contact, "queue_length": len(remaining)}
 
+            manual_input = ""
+            if hasattr(self.ui, "read_input_box_text"):
+                try:
+                    manual_input = str(self.ui.read_input_box_text(selected) or "").strip()
+                except Exception as exc:
+                    return self._cancel_pending(state, "input_box_probe_failed", pending, error=str(exc))
+            if manual_input:
+                return self._cancel_pending(
+                    state,
+                    "input_box_modified",
+                    pending,
+                    input_text=manual_input,
+                )
+
             self.ui.focus_input_box(selected)
             self.ui.paste_text(draft_text)
             self.ui.send_message()
@@ -1866,6 +1904,16 @@ class AutoReplyRunner:
         finally:
             self.append_event("wechat_window_action", action="hide", reason="pending_send_due", contact=contact)
             self.ui.hide_wechat()
+            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
+                try:
+                    self.ui.restore_frontmost_app(restore_app)
+                except Exception as exc:
+                    self.append_event(
+                        "restore_frontmost_failed",
+                        context="pending_send_due",
+                        error=str(exc),
+                        app=restore_app,
+                    )
 
 
 class _VisionSensor:

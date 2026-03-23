@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .paths import STATE_PATH, ensure_runtime_dirs
+from .paths import RUNTIME_DIR, STATE_PATH, ensure_runtime_dirs
+
+LEGACY_STATE_PATH = RUNTIME_DIR / "state.json"
 
 
 def utc_now_iso() -> str:
@@ -44,8 +46,20 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def _migrate_legacy_state_if_needed() -> None:
+    if STATE_PATH.exists() or not LEGACY_STATE_PATH.exists() or LEGACY_STATE_PATH == STATE_PATH:
+        return
+    try:
+        legacy = json.loads(LEGACY_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if isinstance(legacy, dict):
+        _atomic_write(STATE_PATH, legacy)
+
+
 def load_state() -> dict[str, Any]:
     ensure_runtime_dirs()
+    _migrate_legacy_state_if_needed()
     if not STATE_PATH.exists():
         state = default_state()
         _atomic_write(STATE_PATH, state)

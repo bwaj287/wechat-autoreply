@@ -106,6 +106,33 @@ def activate_wechat() -> None:
     run(["osascript", "-e", 'tell application "WeChat" to activate', "-e", "delay 0.4"], timeout=30)
 
 
+def _escape_applescript_string(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def capture_frontmost_app() -> str:
+    script = """
+tell application "System Events"
+  try
+    return name of first process whose frontmost is true
+  on error
+    return ""
+  end try
+end tell
+"""
+    try:
+        return run(["osascript", "-e", script], timeout=30).stdout.strip()
+    except Exception:
+        return ""
+
+
+def restore_frontmost_app(app_name: str) -> None:
+    target = str(app_name or "").strip()
+    if not target or target in {"WeChat", "Weixin"}:
+        return
+    run(["osascript", "-e", f'tell application "{_escape_applescript_string(target)}" to activate'], timeout=30)
+
+
 def hide_wechat() -> None:
     scripts = [
         """
@@ -142,6 +169,27 @@ return "hidden"
         except Exception as exc:  # pragma: no cover - exercised only on macOS host
             errors.append(str(exc))
     raise RuntimeError(" ; ".join(errors) or "failed to hide wechat")
+
+
+def _read_clipboard_text() -> str:
+    try:
+        return run(["pbpaste"], check=False, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def _write_clipboard_text(text: str) -> None:
+    try:
+        subprocess.run(
+            ["pbcopy"],
+            input=str(text),
+            text=True,
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def list_wechat_windows() -> list[dict[str, Any]]:
@@ -823,6 +871,34 @@ def focus_input_box(probe_result: dict[str, Any]) -> None:
     time.sleep(0.15)
     click_coords(x, y)
     time.sleep(0.2)
+
+
+def read_input_box_text(probe_result: dict[str, Any]) -> str:
+    previous_clipboard = _read_clipboard_text()
+    # Put a sentinel into clipboard first. If Cmd+C fails or focus misses
+    # the input box, clipboard stays sentinel and we treat it as "no input"
+    # instead of misclassifying stale clipboard text as manual edits.
+    sentinel = f"__WECHAT_INPUT_PROBE_{time.time_ns()}__"
+    focus_input_box(probe_result)
+    try:
+        _write_clipboard_text(sentinel)
+        time.sleep(0.05)
+        run(
+            ["osascript", "-e", 'tell application "System Events" to keystroke "a" using {command down}'],
+            timeout=30,
+        )
+        time.sleep(0.1)
+        run(
+            ["osascript", "-e", 'tell application "System Events" to keystroke "c" using {command down}'],
+            timeout=30,
+        )
+        time.sleep(0.12)
+        copied = _read_clipboard_text().strip()
+        if not copied or copied == sentinel:
+            return ""
+        return copied
+    finally:
+        _write_clipboard_text(previous_clipboard)
 
 
 def paste_text(text: str) -> None:
