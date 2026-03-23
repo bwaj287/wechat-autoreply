@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .paths import CONFIG_PATH, ensure_runtime_dirs
+from .paths import CONFIG_PATH, SWITCH_PATH, WHITELIST_PATH, ensure_runtime_dirs
 
 
 def _archive_whitelist_candidates() -> list[Path]:
@@ -11,16 +11,83 @@ def _archive_whitelist_candidates() -> list[Path]:
     return sorted(archive_root.glob("wechat-auto-reply-reset-*/documents/wechat-whitelist.txt"))
 
 
-def seed_allowed_contacts() -> list[str]:
-    for candidate in reversed(_archive_whitelist_candidates()):
-        if not candidate.exists():
+def _parse_contacts(lines: list[str]) -> list[str]:
+    contacts: list[str] = []
+    seen: set[str] = set()
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
-        contacts: list[str] = []
-        for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        contacts.append(line)
+    return contacts
+
+
+def _parse_switch(raw: str) -> bool | None:
+    value = str(raw or "").strip().lower()
+    if value in {"on", "1", "true", "enabled"}:
+        return True
+    if value in {"off", "0", "false", "disabled"}:
+        return False
+    return None
+
+
+def _read_switch(default_enabled: bool) -> bool:
+    ensure_runtime_dirs()
+    if SWITCH_PATH.exists():
+        for raw_line in SWITCH_PATH.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
-            contacts.append(line)
+            parsed = _parse_switch(line)
+            if parsed is not None:
+                return parsed
+            break
+    _write_switch(default_enabled)
+    return bool(default_enabled)
+
+
+def _write_switch(enabled: bool) -> None:
+    ensure_runtime_dirs()
+    SWITCH_PATH.write_text(("on" if enabled else "off") + "\n", encoding="utf-8")
+
+
+def _write_whitelist_if_missing(default_contacts: list[str]) -> None:
+    ensure_runtime_dirs()
+    if WHITELIST_PATH.exists():
+        return
+    content = "\n".join(
+        [
+            "# WeChat auto-reply whitelist",
+            "# One contact per line. Lines starting with # are ignored.",
+            *default_contacts,
+            "",
+        ]
+    )
+    WHITELIST_PATH.write_text(content, encoding="utf-8")
+
+
+def load_allowed_contacts(default_contacts: list[str] | None = None) -> list[str]:
+    ensure_runtime_dirs()
+    if WHITELIST_PATH.exists():
+        return _parse_contacts(WHITELIST_PATH.read_text(encoding="utf-8").splitlines())
+    fallback = _parse_contacts(list(default_contacts or []))
+    if not fallback:
+        fallback = _parse_contacts(seed_allowed_contacts())
+    _write_whitelist_if_missing(fallback)
+    return fallback
+
+
+def seed_allowed_contacts() -> list[str]:
+    if WHITELIST_PATH.exists():
+        return _parse_contacts(WHITELIST_PATH.read_text(encoding="utf-8").splitlines())
+    for candidate in reversed(_archive_whitelist_candidates()):
+        if not candidate.exists():
+            continue
+        contacts = _parse_contacts(candidate.read_text(encoding="utf-8").splitlines())
         if contacts:
             return contacts
     return [
@@ -108,11 +175,15 @@ def load_config() -> dict[str, Any]:
     ensure_runtime_dirs()
     if not CONFIG_PATH.exists():
         cfg = default_config()
+        cfg["enabled"] = _read_switch(bool(cfg.get("enabled")))
+        cfg["allowed_contacts"] = load_allowed_contacts(list(cfg.get("allowed_contacts", [])))
         _atomic_write(CONFIG_PATH, cfg)
         return cfg
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     merged = default_config()
     merged.update(cfg)
+    merged["enabled"] = _read_switch(bool(merged.get("enabled")))
+    merged["allowed_contacts"] = load_allowed_contacts(list(merged.get("allowed_contacts", [])))
     if merged != cfg:
         _atomic_write(CONFIG_PATH, merged)
     return merged
@@ -122,6 +193,10 @@ def save_config(config: dict[str, Any]) -> None:
     ensure_runtime_dirs()
     merged = default_config()
     merged.update(config)
+    enabled_value = bool(config.get("enabled")) if "enabled" in config else _read_switch(bool(merged.get("enabled")))
+    _write_switch(enabled_value)
+    merged["enabled"] = enabled_value
+    merged["allowed_contacts"] = load_allowed_contacts(list(merged.get("allowed_contacts", [])))
     _atomic_write(CONFIG_PATH, merged)
 
 
