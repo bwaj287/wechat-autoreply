@@ -515,6 +515,8 @@ def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> lis
     for index, chat in enumerate(chats):
         mark = marks.get(index, {})
         chat["redPixelCount"] = int(mark.get("redPixelCount", 0))
+        chat["digitPixelCount"] = int(mark.get("digitPixelCount", 0))
+        chat["numericBadge"] = bool(mark.get("numericBadge", False))
         chat["unread"] = bool(mark.get("unread", False))
     return chats
 

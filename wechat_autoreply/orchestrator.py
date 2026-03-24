@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 import copy
+from difflib import SequenceMatcher
 import hashlib
 import re
 import shutil
@@ -26,6 +27,8 @@ HISTORY_MARKER_RE = re.compile(
 DIGIT_PUNCT_SHORT_RE = re.compile(r"^[0-9０-９]+[~～`'\"!！?？.,，。…·•\-_/\\|]*$")
 SYMBOL_ONLY_SHORT_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\-_/\\|]+$")
 SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
+EMOJI_CODE_RE = re.compile(r"\[[^\[\]\s]{1,12}\]")
+EMOJI_CHAR_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 
 
 def normalize_text(text: str) -> str:
@@ -270,6 +273,71 @@ def _messages_overlap(first: str, second: str) -> bool:
     if not first_compact or not second_compact:
         return False
     return first_compact in second_compact or second_compact in first_compact
+
+
+def _message_similarity_score(first: str, second: str) -> float:
+    first_compact = _compact_message_text(first)
+    second_compact = _compact_message_text(second)
+    if not first_compact or not second_compact:
+        return 0.0
+    if first_compact == second_compact:
+        return 1.0
+    if first_compact in second_compact or second_compact in first_compact:
+        shorter = min(len(first_compact), len(second_compact))
+        longer = max(len(first_compact), len(second_compact))
+        if longer and (shorter / longer) >= 0.72:
+            return 0.96
+    if len(first_compact) == len(second_compact) and len(first_compact) >= 4:
+        mismatch = sum(1 for left, right in zip(first_compact, second_compact) if left != right)
+        if mismatch <= 1:
+            return 0.97
+    return SequenceMatcher(None, first_compact, second_compact).ratio()
+
+
+def _canonical_reply_text(text: str) -> str:
+    value = normalize_text(text)
+    if not value:
+        return ""
+    # Remove WeChat emoji code tokens like [偷笑] / [旺柴].
+    value = EMOJI_CODE_RE.sub("", value)
+    # Remove rendered emoji glyphs and major separators/punctuations.
+    value = EMOJI_CHAR_RE.sub("", value)
+    value = re.sub(r"[\s…。,，!！?？~～·•`'\"\\\-_/\\\\|:：;；\[\]\(\)（）【】<>{}《》]+", "", value)
+    return value
+
+
+def _draft_match_mode(draft_text: str, outbound_text: str) -> str:
+    draft_norm = normalize_text(draft_text)
+    outbound_norm = normalize_text(outbound_text)
+    if not draft_norm or not outbound_norm:
+        return ""
+    if draft_norm == outbound_norm:
+        return "strict"
+    if draft_norm in outbound_norm or outbound_norm in draft_norm:
+        return "normalized_substring"
+
+    draft_canonical = _canonical_reply_text(draft_norm)
+    outbound_canonical = _canonical_reply_text(outbound_norm)
+    if not draft_canonical or not outbound_canonical:
+        return ""
+    if draft_canonical == outbound_canonical:
+        return "canonical_exact"
+    if draft_canonical in outbound_canonical or outbound_canonical in draft_canonical:
+        return "canonical_substring"
+
+    max_len = max(len(draft_canonical), len(outbound_canonical))
+    if max_len < 6:
+        return ""
+    min_len = min(len(draft_canonical), len(outbound_canonical))
+    if min_len < max(3, int(max_len * 0.55)):
+        return ""
+    draft_counter = Counter(draft_canonical)
+    outbound_counter = Counter(outbound_canonical)
+    overlap = sum((draft_counter & outbound_counter).values())
+    similarity = overlap / max_len if max_len else 0.0
+    if similarity >= 0.82:
+        return "canonical_charbag"
+    return ""
 
 
 def _is_ultra_short_fragment(text: str) -> bool:
@@ -1006,7 +1074,11 @@ class AutoReplyRunner:
             candidates = choose_whitelist_candidates(probe_result, allowed_contacts)
             visible_chats = list(probe_result.get("visibleChats", []) or [])
             unread_rows = [
-                f"{str(chat.get('name', '')).strip()}:{int(chat.get('redPixelCount', 0) or 0)}"
+                (
+                    f"{str(chat.get('name', '')).strip()}:"
+                    f"r{int(chat.get('redPixelCount', 0) or 0)}"
+                    f"/d{int(chat.get('digitPixelCount', 0) or 0)}"
+                )
                 for chat in visible_chats
                 if bool(chat.get("unread")) or int(chat.get("redPixelCount", 0) or 0) > 0
             ]
@@ -1014,6 +1086,8 @@ class AutoReplyRunner:
                 {
                     "name": str(chat.get("name", "")).strip(),
                     "red": int(chat.get("redPixelCount", 0) or 0),
+                    "digit": int(chat.get("digitPixelCount", 0) or 0),
+                    "numericBadge": bool(chat.get("numericBadge", False)),
                     "unread": bool(chat.get("unread")),
                 }
                 for chat in visible_chats[:4]
@@ -1632,7 +1706,8 @@ class AutoReplyRunner:
                 latest_outbound=latest_bubble_outbound,
             )
 
-            if normalize_text(current_outbound) == normalize_text(draft_text) and current_outbound:
+            draft_match_mode = _draft_match_mode(draft_text, current_outbound)
+            if draft_match_mode and current_outbound:
                 if int(pending.get("send_attempts", 0) or 0) > 0:
                     remaining = remove_pending_by_fingerprint(queue, pending)
                     sync_pending_state(state, remaining)
@@ -1643,6 +1718,7 @@ class AutoReplyRunner:
                         remaining_queue=len(remaining),
                         queue_contacts=queued_contacts(remaining),
                         confirmation="late",
+                        match_mode=draft_match_mode,
                     )
                     return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
                 return self._cancel_pending(state, "reply_already_present", pending)
@@ -1778,30 +1854,115 @@ class AutoReplyRunner:
             if not current_inbound:
                 return self._cancel_pending(state, "empty_inbound_recheck", pending)
 
+            pending_inbound = str(pending.get("inbound_text", ""))
+            pending_time = str(pending.get("message_time", ""))
             if inbound_variant_equivalent(
-                str(pending.get("inbound_text", "")),
+                pending_inbound,
                 current_inbound,
-                pending_time=str(pending.get("message_time", "")),
+                pending_time=pending_time,
                 current_time=current_time,
             ):
-                current_inbound = str(pending.get("inbound_text", "")) or current_inbound
-                current_time = str(pending.get("message_time", "")) or current_time
+                current_inbound = pending_inbound or current_inbound
+                current_time = pending_time or current_time
 
             current_fingerprint = fingerprint(contact, current_inbound, current_time)
             if current_fingerprint != pending.get("inbound_fingerprint"):
+                similarity_threshold = float(config.get("pending_change_similarity_threshold", 0.9) or 0.9)
+                debounce_frames = max(1, int(float(config.get("pending_change_debounce_frames", 3) or 3)))
+                min_votes = max(1, int(float(config.get("pending_change_min_votes", 2) or 2)))
+
+                expanded_samples: list[dict[str, Any]] = list(samples)
+                if len(expanded_samples) < debounce_frames:
+                    for _ in range(debounce_frames - len(expanded_samples)):
+                        try:
+                            voted_probe = self.ui.probe(select_chat=contact, sleep_after_click=vote_interval)
+                        except Exception as exc:
+                            self.append_event(
+                                "pending_change_vote_probe_failed",
+                                contact=contact,
+                                error=str(exc),
+                            )
+                            break
+                        if voted_probe.get("status") != "ok" or not voted_probe.get("selectionConfirmed"):
+                            continue
+                        expanded_samples.append(_read_recheck_snapshot(voted_probe))
+
+                changed_candidates: list[str] = []
+                equivalent_votes = 0
+                similarity_suppressed_votes = 0
+                max_similarity = 0.0
+                for item in expanded_samples:
+                    sample_inbound = str(item.get("inbound") or "")
+                    if not sample_inbound:
+                        continue
+                    if inbound_variant_equivalent(
+                        pending_inbound,
+                        sample_inbound,
+                        pending_time=pending_time,
+                        current_time=current_time,
+                    ):
+                        equivalent_votes += 1
+                        continue
+                    similarity = _message_similarity_score(pending_inbound, sample_inbound)
+                    max_similarity = max(max_similarity, similarity)
+                    if similarity >= similarity_threshold:
+                        similarity_suppressed_votes += 1
+                        continue
+                    changed_candidates.append(sample_inbound)
+
+                changed_vote_count = len(changed_candidates)
+                stable_changed_votes = 0
+                stable_changed_inbound = ""
+                if changed_candidates:
+                    changed_norms = [normalize_text(value) for value in changed_candidates if normalize_text(value)]
+                    if changed_norms:
+                        stable_norm, stable_changed_votes = Counter(changed_norms).most_common(1)[0]
+                        stable_raws = [value for value in changed_candidates if normalize_text(value) == stable_norm]
+                        if stable_raws:
+                            stable_changed_inbound = max(stable_raws, key=len)
+
+                change_reliable = changed_vote_count >= min_votes and stable_changed_votes >= min_votes
+                if not change_reliable:
+                    self.append_event(
+                        "pending_message_change_suppressed",
+                        contact=contact,
+                        previous_inbound=pending_inbound,
+                        current_inbound=current_inbound,
+                        frames=len(expanded_samples),
+                        min_votes=min_votes,
+                        changed_votes=changed_vote_count,
+                        stable_changed_votes=stable_changed_votes,
+                        equivalent_votes=equivalent_votes,
+                        similarity_suppressed_votes=similarity_suppressed_votes,
+                        similarity_threshold=similarity_threshold,
+                        max_similarity=round(max_similarity, 4),
+                        queue_length=len(queue),
+                        queue_contacts=queued_contacts(queue),
+                    )
+                    current_inbound = pending_inbound or current_inbound
+                    current_time = pending_time or current_time
+                    current_fingerprint = str(pending.get("inbound_fingerprint", "")) or fingerprint(
+                        contact, current_inbound, current_time
+                    )
+                else:
+                    if stable_changed_inbound:
+                        current_inbound = stable_changed_inbound
+                    current_fingerprint = fingerprint(contact, current_inbound, current_time)
+
+            if current_fingerprint != pending.get("inbound_fingerprint"):
                 refresh_delay_seconds = float(config.get("pending_refresh_delay_seconds", 180))
-                pending_inbound = str(pending.get("inbound_text", ""))
                 self.append_event(
                     "pending_message_changed_recheck",
                     contact=contact,
                     previous_inbound=pending_inbound,
                     current_inbound=current_inbound,
-                    pending_time=str(pending.get("message_time", "")),
+                    pending_time=pending_time,
                     current_time=current_time,
                     previous_fingerprint=str(pending.get("inbound_fingerprint", "")),
                     current_fingerprint=current_fingerprint,
                     truncation_like=truncation_like_change(pending_inbound, current_inbound),
                     delay_seconds=refresh_delay_seconds,
+                    frames=len(expanded_samples),
                     queue_length=len(queue),
                     queue_contacts=queued_contacts(queue),
                 )
@@ -1858,7 +2019,8 @@ class AutoReplyRunner:
             confirmed = self.ui.probe(select_chat=contact, sleep_after_click=0.4)
             confirmed_panel = confirmed.get("chatPanel", {}) or {}
             confirmed_outbound = latest_committed_outbound(confirmed_panel)
-            if normalize_text(confirmed_outbound) == normalize_text(draft_text) and confirmed_outbound:
+            confirmed_match_mode = _draft_match_mode(draft_text, confirmed_outbound)
+            if confirmed_match_mode and confirmed_outbound:
                 remaining = remove_pending_by_fingerprint(queue, pending)
                 sync_pending_state(state, remaining)
                 self.append_event(
@@ -1868,6 +2030,7 @@ class AutoReplyRunner:
                     remaining_queue=len(remaining),
                     queue_contacts=queued_contacts(remaining),
                     confirmation="immediate",
+                    match_mode=confirmed_match_mode,
                 )
                 return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
 

@@ -184,7 +184,8 @@ When triggered:
 ### Pending Queue Model
 
 - Queue is FIFO.
-- Due time: `send_delay_seconds` (default `300` seconds).
+- Due time: `send_delay_seconds` (default `180` seconds).
+- Message-change debounce: `pending_change_debounce_frames` (default `3`) + `pending_change_min_votes` (default `2`) with similarity guard `pending_change_similarity_threshold` (default `0.9`).
 - Stale cleanup: `pending_stale_ttl_seconds` (default `86400` seconds).
 - Queue state is persisted under runtime state.
 
@@ -214,10 +215,13 @@ A pending item is cancelled when any of the following is detected:
 The system includes protections against OCR jitter and UI ambiguity:
 
 - Row red-dot detection uses constrained ROI + morphology thresholding.
+- Row red-dot detection is resolution/HDR adaptive (dynamic scan window + strict/relaxed color passes).
+- Row unread now requires numeric badge evidence near avatar (red badge + white digit strokes), not just red pixels.
 - Bubble role helper distinguishes inbound/outbound by visual structure.
 - Inbound text is normalized and fingerprinted.
 - Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
 - Empty panel path triggers reselect attempt before cancel.
+- Dock badge OCR uses dynamic upscaling + adaptive threshold offset for display-scale changes.
 
 Recent hardening included input-box probe sentinel behavior:
 

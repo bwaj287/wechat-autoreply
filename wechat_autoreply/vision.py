@@ -405,7 +405,7 @@ def _badge_roi_bounds(width: int, height: int) -> tuple[int, int, int, int]:
 
 def _prepare_badge_ocr_variants(path: Path) -> list[Path]:
     try:
-        from PIL import Image, ImageFilter, ImageOps
+        from PIL import Image, ImageFilter, ImageOps, ImageStat
     except Exception:
         return []
 
@@ -416,12 +416,19 @@ def _prepare_badge_ocr_variants(path: Path) -> list[Path]:
         return []
 
     roi = source.crop((x0, y0, x1, y1))
+    # Dynamic upscale: smaller ROI under high-DPI / scaled layouts needs stronger enlargement.
+    roi_min_side = max(1, min(roi.width, roi.height))
+    dynamic_upscale = 4 if roi_min_side < 22 else 3 if roi_min_side < 40 else 2
     upscaled = roi.resize(
-        (max(2, roi.width * OCR_UPSCALE_FACTOR), max(2, roi.height * OCR_UPSCALE_FACTOR)),
+        (max(2, roi.width * dynamic_upscale), max(2, roi.height * dynamic_upscale)),
         resample=Image.Resampling.BICUBIC,
     )
     grayscale = ImageOps.grayscale(upscaled)
 
+    # Dynamic threshold offset based on contrast; lower contrast needs smaller offset.
+    stat = ImageStat.Stat(grayscale)
+    stddev = float(stat.stddev[0] if stat.stddev else 0.0)
+    dynamic_offset = int(round(max(4.0, min(12.0, ADAPTIVE_THRESHOLD_OFFSET - (stddev / 10.0)))))
     local_mean = grayscale.filter(ImageFilter.BoxBlur(2))
     src_px = grayscale.load()
     mean_px = local_mean.load()
@@ -431,7 +438,7 @@ def _prepare_badge_ocr_variants(path: Path) -> list[Path]:
     total_pixels = max(1, grayscale.width * grayscale.height)
     for y in range(grayscale.height):
         for x in range(grayscale.width):
-            if int(src_px[x, y]) >= int(mean_px[x, y]) + ADAPTIVE_THRESHOLD_OFFSET:
+            if int(src_px[x, y]) >= int(mean_px[x, y]) + dynamic_offset:
                 bw_px[x, y] = 0
                 black_pixels += 1
             else:
