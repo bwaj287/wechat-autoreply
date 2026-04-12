@@ -132,7 +132,10 @@ Supported commands:
 - `on` -> enable auto-reply runner.
 - `off` -> disable claim/send execution.
 - `status` -> show switch + recent trace lines.
+- `runner` -> show runner/host process health.
+- `runner-start` -> start runner immediately if offline.
 - `queue` -> show pending queue.
+- `since` -> show how many auto replies were sent since the last `since` check.
 - `diagnose` -> detailed diagnostics and recent events.
 - `reset` -> clear runtime state and restart cleanly.
 - `restart` -> same behavior as reset.
@@ -144,7 +147,10 @@ Examples:
 
 ```bash
 ./wechat_env/bin/python gateway_control.py status
+./wechat_env/bin/python gateway_control.py runner
+./wechat_env/bin/python gateway_control.py runner-start
 ./wechat_env/bin/python gateway_control.py queue
+./wechat_env/bin/python gateway_control.py since
 ./wechat_env/bin/python gateway_control.py diagnose
 ./wechat_env/bin/python gateway_control.py style-set "Natural, short, conversational, no sentence-final periods"
 ```
@@ -177,7 +183,7 @@ When triggered:
 1. Open WeChat.
 2. Scan list rows for unread red-dot candidates.
 3. For each unread row:
-   - Whitelist contact: open chat, extract inbound, draft reply, enqueue pending.
+   - Whitelist contact: open chat, extract inbound + recent context, draft reply, enqueue pending.
    - Non-whitelist contact: open row to clear unread only.
 4. Hide WeChat and restore previous front app.
 
@@ -243,6 +249,7 @@ Primary runtime keys in `runtime/config.json`:
 - `pending_stale_ttl_seconds`: stale pending GC TTL.
 - `allowed_contacts`: whitelist contacts.
 - `ollama_url`, `ollama_model`: local LLM endpoint/model.
+- `reply_context_messages`: number of recent chat lines provided to LLM context window.
 - `reply_style_instructions`: reply tone instructions.
 - `emoji_pack_zip_path`: emoji pack zip path.
 - `reply_emoji_enabled`, `reply_emoji_min_count`, `reply_emoji_max_count`: emoji policy.

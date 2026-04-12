@@ -63,7 +63,13 @@ class FakeLLM:
         self.reply = reply
         self.calls: list[tuple[str, str]] = []
 
-    def generate_reply(self, contact: str, inbound_text: str) -> str:
+    def generate_reply(
+        self,
+        contact: str,
+        inbound_text: str,
+        conversation_context: list[dict[str, str]] | None = None,
+        screenshot_path: str | None = None,
+    ) -> str:
         self.calls.append((contact, inbound_text))
         return self.reply
 
@@ -73,7 +79,13 @@ class MappingLLM:
         self.mapping = mapping
         self.calls: list[tuple[str, str]] = []
 
-    def generate_reply(self, contact: str, inbound_text: str) -> str:
+    def generate_reply(
+        self,
+        contact: str,
+        inbound_text: str,
+        conversation_context: list[dict[str, str]] | None = None,
+        screenshot_path: str | None = None,
+    ) -> str:
         self.calls.append((contact, inbound_text))
         return self.mapping[contact]
 
@@ -83,7 +95,13 @@ class PairMappingLLM:
         self.mapping = mapping
         self.calls: list[tuple[str, str]] = []
 
-    def generate_reply(self, contact: str, inbound_text: str) -> str:
+    def generate_reply(
+        self,
+        contact: str,
+        inbound_text: str,
+        conversation_context: list[dict[str, str]] | None = None,
+        screenshot_path: str | None = None,
+    ) -> str:
         self.calls.append((contact, inbound_text))
         return self.mapping[(contact, inbound_text)]
 
@@ -99,9 +117,26 @@ class FakeUI:
     def hide_wechat(self):
         self.calls.append("hide")
 
-    def probe(self, select_chat=None, sleep_after_click=1.0):
+    def probe(self, select_chat=None, sleep_after_click=1.0, select_chat_click=None):
         self.calls.append(("probe", select_chat))
-        return copy.deepcopy(self.probes.pop(0))
+        result = copy.deepcopy(self.probes.pop(0))
+        visible_chats = list(result.get("visibleChats") or [])
+        for chat in visible_chats:
+            if not isinstance(chat, dict):
+                continue
+            if not bool(chat.get("unread")):
+                chat.setdefault("redPixelCount", 0)
+                chat.setdefault("digitPixelCount", 0)
+                chat.setdefault("numericBadge", False)
+                continue
+            # Older tests only set unread=True. The runtime now requires an
+            # explicit numeric badge signal, so synthesize a minimal badge for
+            # legacy fixtures unless the test already provided one.
+            chat.setdefault("redPixelCount", 120)
+            chat.setdefault("digitPixelCount", 10)
+            chat.setdefault("numericBadge", True)
+        result["visibleChats"] = visible_chats
+        return result
 
     def focus_input_box(self, probe):
         self.calls.append("focus_input")

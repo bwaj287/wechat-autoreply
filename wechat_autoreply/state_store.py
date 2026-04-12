@@ -26,6 +26,7 @@ def default_state() -> dict[str, Any]:
         "last_capture_cleanup_at": 0.0,
         "last_roster_sweep_at": 0.0,
         "last_seen_inbound": {},
+        "badge_streaks": {},
         "pending_queue": [],
         "pending": None,
     }

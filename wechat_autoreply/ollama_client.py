@@ -118,6 +118,31 @@ def _append_code_with_budget(base_text: str, code: str, max_chars: int) -> str:
     return f"{trimmed} {code}".strip()
 
 
+def _clean_context_line(text: str, max_chars: int = 180) -> str:
+    value = " ".join(str(text or "").strip().split())
+    if not value:
+        return ""
+    return value[:max_chars].strip()
+
+
+def _format_context_block(conversation_context: list[dict[str, str]] | None) -> str:
+    if not conversation_context:
+        return ""
+    lines: list[str] = []
+    for item in conversation_context:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        text = _clean_context_line(str(item.get("text", "")))
+        if not text:
+            continue
+        speaker = "Me" if role in {"self", "me", "outbound", "assistant"} else "Them"
+        lines.append(f"{speaker}: {text}")
+    if not lines:
+        return ""
+    return "Recent chat context (oldest to latest):\n" + "\n".join(lines[-8:]) + "\n\n"
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -127,8 +152,8 @@ class OllamaClient:
         style_instructions: str = "",
         emoji_pack_zip_path: str = "",
         emoji_enabled: bool = True,
-        emoji_min_count: int = 1,
-        emoji_max_count: int = 2,
+        emoji_min_count: int = 0,
+        emoji_max_count: int = 1,
     ) -> None:
         self.url = url
         self.model = model
@@ -140,14 +165,23 @@ class OllamaClient:
         self.emoji_names = load_wechat_emoji_names(str(emoji_pack_zip_path or "").strip())
         self.emoji_codes = build_wechat_emoji_codes(self.emoji_names)
 
-    def generate_reply(self, contact: str, inbound_text: str) -> str:
+    def generate_reply(
+        self,
+        contact: str,
+        inbound_text: str,
+        conversation_context: list[dict[str, str]] | None = None,
+        screenshot_path: str | None = None,
+    ) -> str:
+        del screenshot_path
         num_predict = max(12, min(48, self.max_reply_chars // 2))
         style_block = f"{self.style_instructions}\n" if self.style_instructions else ""
         emoji_prompt_block = ""
+        context_block = _format_context_block(conversation_context)
         if self.emoji_enabled and self.emoji_codes:
             sampled = " ".join(self.emoji_codes[:20])
             emoji_prompt_block = (
-                "Use 1-2 WeChat emoji codes in square brackets when natural.\n"
+                "Use at most 1 WeChat emoji code in square brackets, and only when it feels natural.\n"
+                "Most replies should have no emoji.\n"
                 f"Use only codes from this list: {sampled}\n"
                 "Do not invent new emoji codes.\n"
             )
@@ -163,7 +197,8 @@ class OllamaClient:
             "Do not end the reply with a period.\n"
             f"Stay under {self.max_reply_chars} characters.\n\n"
             f"Contact: {contact}\n"
-            f"Incoming message: {inbound_text}\n\n"
+            f"{context_block}"
+            f"Latest incoming message: {inbound_text}\n\n"
             "Reply:"
         )
         response = requests.post(
@@ -187,17 +222,17 @@ class OllamaClient:
         text = _normalize_reply_text(text)
         if not text:
             raise RuntimeError("ollama returned an empty reply")
-        if self.emoji_enabled and self.emoji_codes and not _contains_emoji(text):
+        if self.emoji_enabled and self.emoji_codes and not _contains_emoji(text) and self.emoji_min_count > 0:
             available_codes = {
                 code[1:-1]: code
                 for code in self.emoji_codes
                 if len(code) >= 3 and code.startswith("[") and code.endswith("]")
             }
             preferred_names = _preferred_emoji_names(inbound_text)
-            count = max(1, self.emoji_min_count)
-            if self.emoji_max_count > count and len(text) <= 24:
+            count = max(0, self.emoji_min_count)
+            if self.emoji_max_count > count and len(text) <= 24 and count > 0:
                 count += 1
-            count = min(count, max(1, self.emoji_max_count))
+            count = min(count, max(0, self.emoji_max_count))
             for code in _stable_pick_codes(contact, inbound_text, available_codes, preferred_names, count):
                 text = _append_code_with_budget(text, code, self.max_reply_chars)
         text = _normalize_reply_text(text[: self.max_reply_chars].strip())
