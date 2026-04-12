@@ -5,6 +5,12 @@ This repository contains a local macOS WeChat auto-reply agent built with UI aut
 It does not use any official WeChat API.  
 All behaviors are executed by visual detection, window control, keyboard simulation, and a local LLM.
 
+This branch also includes the current image-aware reply path:
+
+- plain text messages still use the normal OCR + context flow
+- image / sticker / photo-like messages can be routed through `brother` (the local multimodal gateway)
+- visual debug crops are preserved under `runtime/captures/` for later inspection
+
 ## Why This Project Exists
 
 The main goal is reliable delayed auto-reply with strong guardrails:
@@ -50,12 +56,18 @@ tools/
   wechat_row_badges.swift    # Red unread-dot detection in list rows
   wechat_bubble_roles.swift  # Inbound vs outbound bubble role helper
 wechat_autoreply/
+  erge_client.py             # Brother multimodal client (image-aware reply path)
   orchestrator.py            # Core state machine
   wechat_ui.py               # WeChat probing, OCR extraction, UI actions
   vision.py                  # Menu signal detection (icon + digit context)
   idle.py                    # System idle detection via Quartz
   state_store.py             # Runtime state persistence
   config_store.py            # Config read/write and toggles
+erge_gateway/
+  server.py                  # OpenAI-compatible Brother gateway
+  router.py                  # Attachment / vision / logic routing
+  clients/                   # Vision + logic backend clients
+  preprocess/                # PDF / DOCX / XLSX ingest helpers
 runtime/
   config.json                # Runtime config
   state.json                 # Runtime state snapshot
@@ -118,6 +130,61 @@ Dry-run one-shot (no real paste/send):
 ```bash
 ./wechat_env/bin/python apps/runner/cli.py --once --dry-run --json
 ```
+
+## Brother Image-Aware Reply Path
+
+The current image-aware path is designed to be additive and low-risk:
+
+- text messages stay on the normal OCR-first flow
+- image-like messages can use the `brother` gateway when enabled and healthy
+- if `brother` is unhealthy, the system falls back to the local small model
+
+Current default routing:
+
+- `brother` health endpoint: `http://127.0.0.1:4010/health`
+- `brother` chat endpoint: `http://127.0.0.1:4010/v1/chat/completions`
+- model alias: `brother`
+
+### How Image Routing Works
+
+When a reply generation call includes a WeChat screenshot:
+
+1. The runner chooses a preferred chat screenshot from the current probe.
+2. `wechat_autoreply/erge_client.py` builds a visual focus image.
+3. If the inbound looks like a photo / picture / sticker placeholder:
+   - it crops toward the newest incoming media area
+   - attempts to isolate the likely media block
+   - upscales the crop before sending it to `brother`
+4. If the inbound is normal text:
+   - it still crops away the left roster sidebar
+   - keeps only the right chat panel as supporting evidence
+
+This is intentionally conservative:
+
+- normal text should not accidentally fall into the image path
+- image routing is an enhancement, not a replacement for text handling
+
+### Debug Images Saved To `runtime/captures`
+
+The system preserves generated debug crops so we can inspect what `brother` actually saw.
+
+Common file patterns:
+
+- `*-chat-focus-*.png`
+  - right chat panel only
+- `*-vision-focus-*.png`
+  - generic image-oriented focus crop
+- `*-vision-media-focus-*.png`
+  - media block isolated and upscaled for image-heavy replies
+
+These captures are useful for debugging:
+
+- image message not understood
+- wrong reply grounded in the wrong part of the UI
+- text vs image routing mistakes
+- OCR jitter around mixed image + caption messages
+
+Cleanup keeps only recent captures; older artifacts are pruned by the capture cleanup flow.
 
 ## Gateway Command Reference
 
@@ -187,6 +254,12 @@ When triggered:
    - Non-whitelist contact: open row to clear unread only.
 4. Hide WeChat and restore previous front app.
 
+For image-like inbound messages:
+
+- the claim step may preserve placeholder text such as `表情包` or `[Photo]`
+- if a richer screenshot path is available, reply generation can use visual evidence through `brother`
+- this means image message handling currently depends on both OCR text and the saved chat screenshot
+
 ### Pending Queue Model
 
 - Queue is FIFO.
@@ -228,6 +301,15 @@ The system includes protections against OCR jitter and UI ambiguity:
 - Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
 - Empty panel path triggers reselect attempt before cancel.
 - Dock badge OCR uses dynamic upscaling + adaptive threshold offset for display-scale changes.
+- Pending recheck now suppresses some short tail-fragment regressions (for example when a long sentence is re-read as only the last few characters).
+
+Image-path specific reliability notes:
+
+- WeChat roster screenshots are cropped to remove the left contact list before multimodal analysis.
+- Photo / sticker-like messages can trigger a media-focused crop instead of sending the full UI image.
+- Media-focused crops are upscaled before being sent to `brother`.
+- The current system is better at "image classification + coarse semantic grounding" than exact OCR from inside images.
+- If image meaning is unclear, the model should answer conservatively rather than hallucinate details.
 
 Recent hardening included input-box probe sentinel behavior:
 
@@ -253,6 +335,12 @@ Primary runtime keys in `runtime/config.json`:
 - `reply_style_instructions`: reply tone instructions.
 - `emoji_pack_zip_path`: emoji pack zip path.
 - `reply_emoji_enabled`, `reply_emoji_min_count`, `reply_emoji_max_count`: emoji policy.
+- `erge_enabled`: enable multimodal brother routing.
+- `erge_model`: model alias used by the brother gateway.
+- `erge_gateway_url`: multimodal generation endpoint.
+- `erge_health_url`: health check endpoint for brother availability.
+- `erge_health_timeout_seconds`, `erge_health_cache_seconds`: brother health probing controls.
+- `erge_request_timeout_seconds`: brother request timeout.
 
 ## Runtime Files and Meanings
 
