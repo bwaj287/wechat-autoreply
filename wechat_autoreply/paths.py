@@ -3,6 +3,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 CAPTURE_DIR = RUNTIME_DIR / "captures"
+DEBUG_DIR = RUNTIME_DIR / "debug"
 LOG_DIR = RUNTIME_DIR / "logs"
 TOOLS_DIR = PROJECT_ROOT / "tools"
 
@@ -22,5 +23,5 @@ BUBBLE_ROLE_HELPER = TOOLS_DIR / "wechat_bubble_roles.swift"
 
 
 def ensure_runtime_dirs() -> None:
-    for path in (RUNTIME_DIR, CAPTURE_DIR, LOG_DIR, STATE_PATH.parent, WHITELIST_PATH.parent, SWITCH_PATH.parent):
+    for path in (RUNTIME_DIR, CAPTURE_DIR, DEBUG_DIR, LOG_DIR, STATE_PATH.parent, WHITELIST_PATH.parent, SWITCH_PATH.parent):
         path.mkdir(parents=True, exist_ok=True)

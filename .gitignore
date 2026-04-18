@@ -4,6 +4,7 @@ __pycache__/
 
 wechat_env/
 runtime/
+.playwright-cli/
 
 discord-*.png
 桌面截图我看看

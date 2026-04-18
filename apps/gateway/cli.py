@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
@@ -22,13 +24,18 @@ TRACE_TYPES = {
     "auto_sent",
     "pending_cancelled",
     "runner_error",
+    "claim_opened_no_new_message",
 }
 
 SUPPORTED_COMMANDS = [
     "on",
     "off",
     "status",
+    "runner",
+    "runner-start",
     "queue",
+    "since",
+    "sent-since",
     "diagnose",
     "reset",
     "restart",
@@ -39,6 +46,20 @@ SUPPORTED_COMMANDS = [
     "help",
     "/help",
 ]
+
+RUNNER_PATTERNS = (
+    str(PROJECT_ROOT / "main.py"),
+    str(PROJECT_ROOT / "apps" / "runner" / "cli.py"),
+)
+
+HOST_PATTERNS = (
+    "wechat-autoreply-v1-terminal-host.sh",
+    "ensure-wechat-autoreply-v1-host.sh",
+)
+
+LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v1"
+LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v1.plist")
+HOST_ENSURE_SCRIPT = Path("/Users/shawnwang/.openclaw/workspace/scripts/ensure-wechat-autoreply-v1-host.sh")
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +89,16 @@ def _format_ts(raw: str) -> str:
         return datetime.fromisoformat(raw).strftime("%H:%M:%S")
     except Exception:
         return raw
+
+
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    try:
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
 
 
 def _format_trace(event: dict[str, Any]) -> str:
@@ -100,6 +131,14 @@ def _format_trace(event: dict[str, Any]) -> str:
     if event_type == "runner_error":
         reason = _shorten(str(event.get("error") or "unknown error"))
         return f"{prefix} 运行报错：{reason}"
+    if event_type == "claim_opened_no_new_message":
+        signal = str(event.get("signal") or "")
+        non_whitelist_cleared = bool(event.get("non_whitelist_cleared"))
+        rows = list(event.get("visible_unread_rows") or [])
+        row_preview = _shorten(" | ".join(str(item) for item in rows), 60) if rows else "-"
+        if non_whitelist_cleared:
+            return f"{prefix} 打开微信后无白名单新消息（已清非白名单红点，signal={signal or '-'}, rows={row_preview}）"
+        return f"{prefix} 打开微信后无可认领新消息（signal={signal or '-'}, rows={row_preview}）"
     return ""
 
 
@@ -143,6 +182,28 @@ def _recent_events(limit: int = 20) -> list[dict[str, Any]]:
     return events
 
 
+def _recent_open_without_new_message_lines(limit: int = 3) -> list[str]:
+    if not EVENTS_PATH.exists():
+        return []
+    lines: list[str] = []
+    raw_lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    for raw in reversed(raw_lines):
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if str(event.get("type") or "") != "claim_opened_no_new_message":
+            continue
+        formatted = _format_trace(event)
+        if not formatted:
+            continue
+        lines.append(formatted)
+        if len(lines) >= limit:
+            break
+    lines.reverse()
+    return lines
+
+
 def _format_epoch(raw: Any) -> str:
     try:
         value = float(raw or 0.0)
@@ -173,14 +234,129 @@ def _format_event_compact(event: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _pgrep_lines(pattern: str) -> list[str]:
+    result = subprocess.run(["pgrep", "-fl", pattern], check=False, capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        return []
+    lines: list[str] = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "pgrep -fl" in line:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _collect_process_lines(patterns: tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for pattern in patterns:
+        for line in _pgrep_lines(pattern):
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+    return lines
+
+
+def _extract_pids(lines: list[str]) -> list[str]:
+    pids: list[str] = []
+    for line in lines:
+        pid = line.split(" ", 1)[0].strip()
+        if pid.isdigit():
+            pids.append(pid)
+    return pids
+
+
+def _launch_agent_loaded() -> bool:
+    if not LAUNCH_AGENT_PLIST.exists():
+        return False
+    uid = str(os.getuid())
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{LAUNCH_AGENT_LABEL}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _runner_snapshot() -> dict[str, Any]:
+    runner_lines = _collect_process_lines(RUNNER_PATTERNS)
+    host_lines = _collect_process_lines(HOST_PATTERNS)
+    return {
+        "runner_online": bool(runner_lines),
+        "runner_pids": _extract_pids(runner_lines),
+        "host_online": bool(host_lines),
+        "host_pids": _extract_pids(host_lines),
+        "launch_agent_loaded": _launch_agent_loaded(),
+    }
+
+
+def _runner_brief(snapshot: dict[str, Any]) -> str:
+    if snapshot["runner_online"]:
+        pids = ",".join(snapshot["runner_pids"]) if snapshot["runner_pids"] else "?"
+        return f"Runner：在线（pid {pids}）"
+    if snapshot["host_online"]:
+        pids = ",".join(snapshot["host_pids"]) if snapshot["host_pids"] else "?"
+        return f"Runner：离线（Host 在线 pid {pids}）"
+    return "Runner：离线"
+
+
+def ensure_runner_started() -> tuple[dict[str, Any], list[str]]:
+    actions: list[str] = []
+    uid = str(os.getuid())
+    launch_target = f"gui/{uid}/{LAUNCH_AGENT_LABEL}"
+    if LAUNCH_AGENT_PLIST.exists():
+        boot = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCH_AGENT_PLIST)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        actions.append("launchctl_bootstrap_ok" if boot.returncode == 0 else f"launchctl_bootstrap_rc{boot.returncode}")
+        kick = subprocess.run(
+            ["launchctl", "kickstart", "-k", launch_target],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        actions.append("launchctl_kickstart_ok" if kick.returncode == 0 else f"launchctl_kickstart_rc{kick.returncode}")
+    else:
+        actions.append("launch_plist_missing")
+
+    interim = _runner_snapshot()
+    if not interim["runner_online"]:
+        if HOST_ENSURE_SCRIPT.exists():
+            host = subprocess.run(
+                ["/bin/zsh", str(HOST_ENSURE_SCRIPT)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            actions.append("host_ensure_ok" if host.returncode == 0 else f"host_ensure_rc{host.returncode}")
+        else:
+            actions.append("host_ensure_missing")
+
+    time.sleep(1.0)
+    return _runner_snapshot(), actions
+
+
 def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     pending_queue = _pending_queue(state)
     pending_count = len(pending_queue)
     base = status_line(config, pending_count)
     traces = recent_trace_lines()
-    if not traces:
-        return base
-    return "\n".join([base, "最近记录：", *traces])
+    no_new_lines = _recent_open_without_new_message_lines(limit=3)
+    runner = _runner_snapshot()
+    lines = [base, _runner_brief(runner)]
+    if traces:
+        lines.extend(["最近记录：", *traces])
+    if no_new_lines:
+        lines.extend(["最近空开窗记录：", *no_new_lines])
+    return "\n".join(lines)
 
 
 def _pending_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -215,8 +391,14 @@ def queue_output(config: dict[str, Any], state: dict[str, Any]) -> str:
 
 def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     queue = _pending_queue(state)
+    runner = _runner_snapshot()
     lines: list[str] = [status_line(config, len(queue)), "诊断信息："]
     lines.append(f"- enabled: {bool(config.get('enabled'))}")
+    lines.append(f"- runner_online: {runner['runner_online']}")
+    lines.append(f"- runner_pids: {','.join(runner['runner_pids']) if runner['runner_pids'] else '-'}")
+    lines.append(f"- host_online: {runner['host_online']}")
+    lines.append(f"- host_pids: {','.join(runner['host_pids']) if runner['host_pids'] else '-'}")
+    lines.append(f"- launch_agent_loaded: {runner['launch_agent_loaded']}")
     lines.append(f"- queue_length: {len(queue)}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
     lines.append(f"- last_error: {state.get('last_error') or '-'}")
@@ -243,11 +425,99 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def sent_since_output(config: dict[str, Any], state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    queue = _pending_queue(state)
+    now_iso = utc_now_iso()
+    now_dt = _parse_iso_datetime(now_iso)
+    baseline_iso = str(state.get("last_since_check_at") or state.get("last_sent_since_check_at") or "").strip()
+    baseline_dt = _parse_iso_datetime(baseline_iso)
+
+    if not baseline_dt or not now_dt:
+        state["last_since_check_at"] = now_iso
+        save_state(state)
+        lines = [
+            status_line(config, len(queue)),
+            f"since 基线已创建：{_format_epoch(now_dt.timestamp() if now_dt else 0)}",
+            "从现在开始统计，下次执行 since 会告诉你这段时间自动发了多少条",
+        ]
+        return "\n".join(lines), state
+
+    auto_sent_events: list[dict[str, Any]] = []
+    if EVENTS_PATH.exists():
+        for raw in EVENTS_PATH.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if str(event.get("type") or "") != "auto_sent":
+                continue
+            event_dt = _parse_iso_datetime(event.get("ts"))
+            if not event_dt or event_dt <= baseline_dt or event_dt > now_dt:
+                continue
+            auto_sent_events.append(event)
+
+    state["last_since_check_at"] = now_iso
+    save_state(state)
+
+    lines = [
+        status_line(config, len(queue)),
+        f"自上次 since 查询以来自动发送 {len(auto_sent_events)} 条",
+        f"统计区间：{_format_epoch(baseline_dt.timestamp())} -> {_format_epoch(now_dt.timestamp())}",
+    ]
+    if auto_sent_events:
+        lines.append("发送记录：")
+        for index, event in enumerate(auto_sent_events, 1):
+            contact = str(event.get("contact") or "?").strip()
+            draft = _shorten(str(event.get("draft_text") or ""), 42) or "-"
+            lines.append(f"{index}. [{_format_ts(str(event.get('ts') or ''))}] {contact}：{draft}")
+    return "\n".join(lines), state
+
+
 def style_show_output(config: dict[str, Any]) -> str:
     style = str(config.get("reply_style_instructions") or "").strip()
     if not style:
         style = "（空）"
     return "\n".join(["微信自动回复语气规则：", style])
+
+
+def runner_output(config: dict[str, Any], state: dict[str, Any]) -> str:
+    queue = _pending_queue(state)
+    snapshot = _runner_snapshot()
+    lines = [status_line(config, len(queue)), "Runner 状态："]
+    lines.append(f"- runner_online: {snapshot['runner_online']}")
+    lines.append(f"- runner_pids: {','.join(snapshot['runner_pids']) if snapshot['runner_pids'] else '-'}")
+    lines.append(f"- host_online: {snapshot['host_online']}")
+    lines.append(f"- host_pids: {','.join(snapshot['host_pids']) if snapshot['host_pids'] else '-'}")
+    lines.append(f"- launch_agent_loaded: {snapshot['launch_agent_loaded']}")
+    lines.append(f"- enabled_switch: {bool(config.get('enabled'))}")
+    lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
+    if not snapshot["runner_online"]:
+        lines.append("建议：执行 on 或 restart 以拉起 runner")
+    return "\n".join(lines)
+
+
+def runner_start_output(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    actions: list[str],
+) -> str:
+    queue = _pending_queue(state)
+    lines = [status_line(config, len(queue)), "Runner 拉起结果："]
+    if before["runner_online"]:
+        lines.append("- before: already_online")
+        lines.append("- action: skipped")
+    else:
+        lines.append("- before: offline")
+        lines.append(f"- action: {', '.join(actions) if actions else 'none'}")
+    lines.append(f"- runner_online: {after['runner_online']}")
+    lines.append(f"- runner_pids: {','.join(after['runner_pids']) if after['runner_pids'] else '-'}")
+    lines.append(f"- host_online: {after['host_online']}")
+    lines.append(f"- launch_agent_loaded: {after['launch_agent_loaded']}")
+    if not after["runner_online"]:
+        lines.append("建议：执行 restart；若仍失败，检查 launchd/Terminal 权限")
+    return "\n".join(lines)
 
 
 def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
@@ -259,7 +529,10 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- on：开启自动回复",
         "- off：关闭自动回复",
         "- status：查看开关状态 + 最近关键记录",
+        "- runner：查看 runner/host 进程状态",
+        "- runner-start：拉起 runner（离线时）",
         "- queue：查看待发送队列",
+        "- since：查看自上次 since 查询以来自动发送了多少条",
         "- diagnose：查看详细诊断与最近事件",
         "- reset：清空 runtime state 并重启（等价 restart）",
         "- restart：清空 runtime state 并重启",
@@ -274,6 +547,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "",
         "示例：",
         "- ./wechat_env/bin/python gateway_control.py queue",
+        "- ./wechat_env/bin/python gateway_control.py since",
         "- ./wechat_env/bin/python gateway_control.py command",
         '- ./wechat_env/bin/python gateway_control.py style-set "自然、简短、口语化，不要句号"',
     ]
@@ -337,6 +611,25 @@ def main() -> int:
         state = load_state()
     elif command in {"reset", "restart"}:
         config, state = reset_runtime_state(command)
+    elif command == "runner-start":
+        config = load_config()
+        if not bool(config.get("enabled")):
+            config["enabled"] = True
+            save_config(config)
+        state = load_state()
+        before = _runner_snapshot()
+        if before["runner_online"]:
+            after = before
+            actions: list[str] = []
+        else:
+            after, actions = ensure_runner_started()
+        append_event(
+            "gateway_runner_start",
+            before_runner_online=bool(before["runner_online"]),
+            after_runner_online=bool(after["runner_online"]),
+            actions=actions,
+            enabled=bool(config.get("enabled")),
+        )
     elif command == "style-set":
         config = load_config()
         config["reply_style_instructions"] = " ".join(args.style_text).strip()
@@ -344,13 +637,20 @@ def main() -> int:
         state = load_state()
     else:
         config = load_config()
-        if command not in {"style-show", "command"}:
+        if command not in {"style-show", "command", "runner"}:
             save_config(config)
         state = load_state()
     if command == "status":
         print(status_output(config, state))
+    elif command == "runner":
+        print(runner_output(config, state))
+    elif command == "runner-start":
+        print(runner_start_output(config, state, before, after, actions))
     elif command == "queue":
         print(queue_output(config, state))
+    elif command in {"since", "sent-since"}:
+        output, state = sent_since_output(config, state)
+        print(output)
     elif command == "diagnose":
         print(diagnose_output(config, state))
     elif command == "style-show":

@@ -9,8 +9,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageOps
+
+from .config_store import load_config, save_config
 from .ocr import ocr_image
-from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, ROW_BADGE_HELPER, WECHAT_APP
+from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, WECHAT_APP
 from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
 
 IGNORE_TEXTS = {
@@ -36,6 +39,15 @@ EMOJI_CHAR_RE = re.compile(
 NON_TEXT_HINT_RE = re.compile(r"(表情|emoji|sticker|贴纸|动画表情|动画|emoticon)", re.IGNORECASE)
 BRACKETED_HINT_RE = re.compile(r"^[\[\(（【<〈《].{1,12}[\]\)）】>〉》]$")
 SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
+MESSAGE_BANNER_RE = re.compile(
+    r"(?i)(?:^|\b)\d+\s*new\s*message(?:s)?\b|(?:^|\b)new\s*message(?:s)?\b"
+)
+MIN_ROSTER_WINDOW_WIDTH = 720
+MIN_ROSTER_WINDOW_HEIGHT = 620
+TARGET_ROSTER_WINDOW_X = 96
+TARGET_ROSTER_WINDOW_Y = 84
+TARGET_ROSTER_WINDOW_WIDTH = 980
+TARGET_ROSTER_WINDOW_HEIGHT = 820
 
 
 def normalize_text(text: str) -> str:
@@ -47,10 +59,40 @@ def normalize_name_for_match(text: str) -> str:
     return value.translate(str.maketrans({"0": "o"}))
 
 
+def _canonical_name_key(text: str) -> str:
+    value = normalize_name_for_match(text)
+    if not value:
+        return ""
+    value = value.replace("…", "").replace("...", "")
+    value = re.sub(
+        r"(?i)\b(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"mon|tue|wed|thu|fri|sat|sun)\b.*$|(?:今天|昨天|前天).*$",
+        "",
+        value,
+    ).strip()
+    value = re.sub(r"\b\d{1,2}:\d{2}\b$", "", value).strip()
+    value = re.sub(r"\(\s*\d+\s*\)\s*$", "", value).strip()
+    value = re.sub(r"^[^0-9a-z\u4e00-\u9fff]+|[^0-9a-z\u4e00-\u9fff]+$", "", value).strip()
+    return " ".join(value.split())
+
+
+def _looks_truncated_name(text: str) -> bool:
+    value = str(text or "")
+    return "..." in value or "…" in value
+
+
 def names_match(a: str, b: str) -> bool:
-    an = normalize_name_for_match(a)
-    bn = normalize_name_for_match(b)
-    return bool(an and bn and (an == bn or an in bn or bn in an))
+    an = _canonical_name_key(a)
+    bn = _canonical_name_key(b)
+    if not an or not bn:
+        return False
+    if an == bn:
+        return True
+    # Only allow prefix fallback when OCR truncation is visible.
+    if _looks_truncated_name(a) or _looks_truncated_name(b):
+        shorter, longer = (an, bn) if len(an) <= len(bn) else (bn, an)
+        return len(shorter) >= 2 and longer.startswith(shorter)
+    return False
 
 
 def has_text_signal(text: str) -> bool:
@@ -79,6 +121,23 @@ def has_meaningful_text(text: str) -> bool:
 
 def has_signal_text(text: str) -> bool:
     return has_meaningful_text(text)
+
+
+def _looks_like_message_banner_text(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    normalized = normalize_text(value)
+    return bool(MESSAGE_BANNER_RE.search(normalized))
+
+
+def _sanitize_chat_title_text(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    if _looks_like_message_banner_text(value):
+        return ""
+    return value
 
 
 def _click_dock_item(name: str) -> bool:
@@ -133,6 +192,41 @@ def restore_frontmost_app(app_name: str) -> None:
     run(["osascript", "-e", f'tell application "{_escape_applescript_string(target)}" to activate'], timeout=30)
 
 
+def _process_visible(name: str) -> bool | None:
+    target = str(name or "").strip()
+    if not target:
+        return None
+    script = f'''
+tell application "System Events"
+  if exists process "{_escape_applescript_string(target)}" then
+    return visible of process "{_escape_applescript_string(target)}"
+  end if
+end tell
+return "missing"
+'''
+    try:
+        out = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
+    except Exception:
+        return None
+    if out == "true":
+        return True
+    if out == "false":
+        return False
+    return None
+
+
+def _any_wechat_visible() -> bool:
+    seen = False
+    for name in DOCK_WECHAT_NAMES:
+        visible = _process_visible(name)
+        if visible is None:
+            continue
+        seen = True
+        if visible:
+            return True
+    return False
+
+
 def hide_wechat() -> None:
     scripts = [
         """
@@ -154,6 +248,14 @@ end tell
 return "missing"
 """,
         """
+tell application "WeChat" to hide
+return "hidden"
+""",
+        """
+tell application "Weixin" to hide
+return "hidden"
+""",
+        """
 tell application "System Events"
   keystroke "h" using {command down}
 end tell
@@ -163,8 +265,9 @@ return "hidden"
     errors: list[str] = []
     for script in scripts:
         try:
-            result = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
-            if result in {"hidden", "missing", ""}:
+            run(["osascript", "-e", script], timeout=30)
+            time.sleep(0.12)
+            if not _any_wechat_visible():
                 return
         except Exception as exc:  # pragma: no cover - exercised only on macOS host
             errors.append(str(exc))
@@ -227,6 +330,133 @@ def choose_roster_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
     if not candidates:
         raise RuntimeError(f"no roster window found: {windows!r}")
     return max(candidates, key=lambda item: item["width"] * item["height"])
+
+
+def _sanitize_window_bounds(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    try:
+        x = int(value.get("x", 0) or 0)
+        y = int(value.get("y", 0) or 0)
+        width = int(value.get("width", 0) or 0)
+        height = int(value.get("height", 0) or 0)
+    except Exception:
+        return {}
+    if width < 200 or height < 200:
+        return {}
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _preferred_roster_window_bounds() -> dict[str, int]:
+    try:
+        config = load_config()
+    except Exception:
+        return {}
+    return _sanitize_window_bounds(config.get("preferred_roster_window_bounds", {}))
+
+
+def _remember_roster_window_bounds(info: dict[str, Any]) -> None:
+    if int(info.get("width", 0) or 0) < MIN_ROSTER_WINDOW_WIDTH:
+        return
+    if int(info.get("height", 0) or 0) < MIN_ROSTER_WINDOW_HEIGHT:
+        return
+    current = _sanitize_window_bounds(info)
+    if not current:
+        return
+    try:
+        config = load_config()
+    except Exception:
+        return
+    previous = _sanitize_window_bounds(config.get("preferred_roster_window_bounds", {}))
+    if previous == current:
+        return
+    config["preferred_roster_window_bounds"] = current
+    try:
+        save_config(config)
+    except Exception:
+        return
+
+
+def _focus_window(info: dict[str, Any]) -> None:
+    width = int(info.get("width", 0) or 0)
+    height = int(info.get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return
+    # Click near the title bar so the intended main window becomes frontmost.
+    x = int(info["x"] + min(max(72, int(width * 0.28)), max(80, width - 40)))
+    y = int(info["y"] + min(18, max(10, int(height * 0.05))))
+    click_coords(x, y)
+    time.sleep(0.2)
+
+
+def _resize_frontmost_wechat_window(
+    *,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> None:
+    preferred = _preferred_roster_window_bounds()
+    x = int(preferred.get("x", TARGET_ROSTER_WINDOW_X) if x is None else x)
+    y = int(preferred.get("y", TARGET_ROSTER_WINDOW_Y) if y is None else y)
+    width = int(preferred.get("width", TARGET_ROSTER_WINDOW_WIDTH) if width is None else width)
+    height = int(preferred.get("height", TARGET_ROSTER_WINDOW_HEIGHT) if height is None else height)
+    scripts = [
+        f'''
+tell application "System Events"
+  if exists process "WeChat" then
+    tell process "WeChat"
+      if exists front window then
+        set position of front window to {{{x}, {y}}}
+        set size of front window to {{{width}, {height}}}
+        return "ok"
+      end if
+    end tell
+  end if
+end tell
+return "missing"
+''',
+        f'''
+tell application "System Events"
+  if exists process "Weixin" then
+    tell process "Weixin"
+      if exists front window then
+        set position of front window to {{{x}, {y}}}
+        set size of front window to {{{width}, {height}}}
+        return "ok"
+      end if
+    end tell
+  end if
+end tell
+return "missing"
+''',
+    ]
+    errors: list[str] = []
+    for script in scripts:
+        try:
+            result = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
+            if result in {"ok", "missing", ""}:
+                time.sleep(0.35)
+                return
+        except Exception as exc:  # pragma: no cover - exercised only on macOS host
+            errors.append(str(exc))
+    if errors:
+        raise RuntimeError(" ; ".join(errors))
+
+
+def ensure_main_roster_window() -> dict[str, Any]:
+    windows = list_wechat_windows()
+    roster = choose_roster_window(windows)
+    _focus_window(roster)
+    if roster["width"] >= MIN_ROSTER_WINDOW_WIDTH and roster["height"] >= MIN_ROSTER_WINDOW_HEIGHT:
+        _remember_roster_window_bounds(roster)
+        return roster
+    _resize_frontmost_wechat_window()
+    windows = list_wechat_windows()
+    roster = choose_roster_window(windows)
+    _focus_window(roster)
+    _remember_roster_window_bounds(roster)
+    return roster
 
 
 def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -335,26 +565,107 @@ def _roster_band_profiles(window_info: dict[str, Any]) -> list[tuple[float, floa
     return [primary, fallback]
 
 
-def _prepare_ocr_items(image_path: Path) -> list[dict[str, Any]]:
+def _build_roster_ocr_variants(image_path: Path) -> list[Path]:
+    variants: list[Path] = []
+    with Image.open(image_path) as source:
+        rgb = source.convert("RGB")
+        upscaled = rgb.resize(
+            (max(2, rgb.width * 2), max(2, rgb.height * 2)),
+            resample=Image.Resampling.BICUBIC,
+        )
+        grayscale = ImageOps.grayscale(upscaled)
+        contrast = ImageOps.autocontrast(grayscale, cutoff=2)
+        inverted = ImageOps.invert(contrast)
+        for image in (contrast, inverted):
+            with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as handle:
+                path = Path(handle.name)
+            image.save(path, format="PNG")
+            variants.append(path)
+    return variants
+
+
+def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
-    for item in ocr_image(image_path):
-        text = (item.get("text") or "").strip()
-        if not text:
-            continue
-        bbox = item.get("bbox") or {}
-        x = float(bbox.get("x", 0.0))
-        y = float(bbox.get("y", 0.0))
-        w = float(bbox.get("w", 0.0))
-        h = float(bbox.get("h", 0.0))
+    temp_variants: list[Path] = []
+    source_images: list[Path] = [image_path]
+    if panel_hint == "roster":
+        try:
+            temp_variants = _build_roster_ocr_variants(image_path)
+            source_images.extend(temp_variants)
+        except Exception:
+            temp_variants = []
+    def _find_bbox_match(x: float, top: float, w: float, h: float) -> dict[str, Any] | None:
+        for existing in prepared:
+            eb = existing.get("bbox", {})
+            if (
+                abs(float(eb.get("x", 0.0)) - x) <= 0.022
+                and abs(float(eb.get("top", 0.0)) - top) <= 0.022
+                and abs(float(eb.get("w", 0.0)) - w) <= 0.035
+                and abs(float(eb.get("h", 0.0)) - h) <= 0.035
+            ):
+                return existing
+        return None
+
+    def _record_item(text: str, x: float, y: float, w: float, h: float, confidence: float) -> None:
         top = 1.0 - (y + h)
         prepared.append(
             {
                 "text": text,
-                "confidence": float(item.get("confidence", 0.0)),
+                "confidence": confidence,
                 "bbox": {"x": x, "y": y, "w": w, "h": h, "top": top, "left": x},
                 "center": {"x": x + w / 2.0, "y": top + h / 2.0},
             }
         )
+
+    try:
+        # Base OCR pass: keep all valid observations.
+        for item in ocr_image(image_path):
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            bbox = item.get("bbox") or {}
+            x = float(bbox.get("x", 0.0))
+            y = float(bbox.get("y", 0.0))
+            w = float(bbox.get("w", 0.0))
+            h = float(bbox.get("h", 0.0))
+            confidence = float(item.get("confidence", 0.0))
+            _record_item(text, x, y, w, h, confidence)
+
+        # Enhanced roster OCR pass:
+        # only update existing boxes, never add brand-new boxes.
+        # This avoids false rows introduced by aggressive enhancement.
+        for source in source_images[1:]:
+            for item in ocr_image(source):
+                text = (item.get("text") or "").strip()
+                if not text:
+                    continue
+                bbox = item.get("bbox") or {}
+                x = float(bbox.get("x", 0.0))
+                y = float(bbox.get("y", 0.0))
+                w = float(bbox.get("w", 0.0))
+                h = float(bbox.get("h", 0.0))
+                top = 1.0 - (y + h)
+                confidence = float(item.get("confidence", 0.0))
+                duplicate = _find_bbox_match(x, top, w, h)
+                if duplicate is None:
+                    continue
+                existing_conf = float(duplicate.get("confidence", 0.0) or 0.0)
+                existing_text = str(duplicate.get("text", "") or "").strip()
+                if confidence > existing_conf + 0.04 or (
+                    len(normalize_text(text)) > len(normalize_text(existing_text))
+                    and confidence >= existing_conf - 0.02
+                ):
+                    duplicate.update(
+                        {
+                            "text": text,
+                            "confidence": confidence,
+                            "bbox": {"x": x, "y": y, "w": w, "h": h, "top": top, "left": x},
+                            "center": {"x": x + w / 2.0, "y": top + h / 2.0},
+                        }
+                    )
+    finally:
+        for path in temp_variants:
+            path.unlink(missing_ok=True)
     _annotate_bubble_roles(prepared, image_path)
     return prepared
 
@@ -442,6 +753,24 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
             if cleaned:
                 prev = cleaned[-1]
                 gap = float(chat.get("ocrTop", 0.0)) - float(prev.get("ocrTop", 0.0))
+                left_gap = abs(float(chat.get("ocrLeft", 0.0) or 0.0) - float(prev.get("ocrLeft", 0.0) or 0.0))
+                split_line_gap = max(0.06, min(0.09, near_dup_gap * 1.55))
+                # OCR may split one chat row into two stacked lines (name + preview line).
+                # Merge them back so unread badge attaches to the real contact row.
+                if (
+                    gap <= split_line_gap
+                    and left_gap <= 0.03
+                    and not str(chat.get("time") or "").strip()
+                    and not str(chat.get("preview") or "").strip()
+                ):
+                    extra_preview = str(chat.get("name") or "").strip()
+                    if extra_preview:
+                        prev_preview = str(prev.get("preview") or "").strip()
+                        if not prev_preview:
+                            prev["preview"] = extra_preview
+                        elif normalize_text(prev_preview) != normalize_text(extra_preview):
+                            prev["preview"] = _join_texts([prev_preview, extra_preview])
+                    continue
                 if gap < near_dup_gap:
                     prev_score = int(bool(prev.get("time"))) + int(bool(prev.get("preview")))
                     cur_score = int(bool(chat.get("time"))) + int(bool(chat.get("preview")))
@@ -476,7 +805,12 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
     return []
 
 
-def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> list[dict[str, Any]]:
+def annotate_unread_chats(
+    chats: list[dict[str, Any]],
+    roster_path: Path,
+    *,
+    fallback_target_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
     if not chats:
         return chats
     rows: list[dict[str, Any]] = []
@@ -502,26 +836,207 @@ def annotate_unread_chats(chats: list[dict[str, Any]], roster_path: Path) -> lis
                 "nameLeft": float(chat.get("ocrLeft", 0.15) or 0.15),
             }
         )
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
-        json.dump(rows, handle, ensure_ascii=False)
-        tmp_path = Path(handle.name)
     try:
-        payload = json.loads(
-            run(["swift", str(ROW_BADGE_HELPER), str(roster_path), str(tmp_path)], timeout=120).stdout
-        )
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    marks = {item["index"]: item for item in payload.get("rows", [])}
-    for index, chat in enumerate(chats):
-        mark = marks.get(index, {})
-        chat["redPixelCount"] = int(mark.get("redPixelCount", 0))
-        chat["digitPixelCount"] = int(mark.get("digitPixelCount", 0))
-        chat["numericBadge"] = bool(mark.get("numericBadge", False))
-        chat["unread"] = bool(mark.get("unread", False))
+        with Image.open(roster_path) as roster_image:
+            rgb = roster_image.convert("RGB")
+            for index, chat in enumerate(chats):
+                direct = _fallback_row_badge_detection(rgb, rows[index])
+                if not direct:
+                    chat["redPixelCount"] = 0
+                    chat["digitPixelCount"] = 0
+                    chat["numericBadge"] = False
+                    chat["unread"] = False
+                    continue
+                chat["redPixelCount"] = int(direct.get("redPixelCount", 0))
+                chat["digitPixelCount"] = int(direct.get("digitPixelCount", 0))
+                chat["numericBadge"] = bool(direct.get("numericBadge", False))
+                chat["unread"] = bool(direct.get("unread", False))
+    except Exception:
+        for chat in chats:
+            chat["redPixelCount"] = 0
+            chat["digitPixelCount"] = 0
+            chat["numericBadge"] = False
+            chat["unread"] = False
     return chats
 
 
+def _is_red_badge_pixel(rgb: tuple[int, int, int]) -> bool:
+    r, g, b = rgb
+    max_v = max(r, g, b)
+    min_v = min(r, g, b)
+    if max_v <= 92:
+        return False
+    saturation = (max_v - min_v) / max_v if max_v else 0.0
+    return saturation > 0.20 and r > g + 28 and r > b + 28
+
+
+def _is_white_digit_pixel(rgb: tuple[int, int, int]) -> bool:
+    r, g, b = rgb
+    max_v = max(r, g, b)
+    min_v = min(r, g, b)
+    luminance = (r + g + b) / 3.0
+    saturation = (max_v - min_v) / max_v if max_v else 0.0
+    return luminance > 205 and saturation < 0.34
+
+
+def _count_light_pixels(image: Image.Image, threshold: int) -> int:
+    pixels = image.load()
+    width, height = image.size
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if int(pixels[x, y]) >= threshold:
+                count += 1
+    return count
+
+
+def _count_dark_pixels(image: Image.Image, threshold: int) -> int:
+    pixels = image.load()
+    width, height = image.size
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if int(pixels[x, y]) <= threshold:
+                count += 1
+    return count
+
+
+def _enhanced_digit_equivalent(crop: Image.Image) -> int:
+    grayscale = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=2)
+    inverted = ImageOps.invert(grayscale)
+    scale = 8
+    gray_up = grayscale.resize((grayscale.width * scale, grayscale.height * scale), Image.Resampling.BICUBIC)
+    inverted_up = inverted.resize((inverted.width * scale, inverted.height * scale), Image.Resampling.BICUBIC)
+    # Use a high threshold so we only keep the brightest digit strokes after
+    # enhancement. Red-heavy avatars produce much larger bright regions here and
+    # will be rejected by the upper bound in the caller.
+    light_equivalent = _count_light_pixels(gray_up, 220) // (scale * scale)
+    dark_equivalent = _count_dark_pixels(inverted_up, 35) // (scale * scale)
+    return min(light_equivalent, dark_equivalent)
+
+
+def _connected_components(mask: list[list[bool]]) -> list[dict[str, int]]:
+    if not mask or not mask[0]:
+        return []
+    height = len(mask)
+    width = len(mask[0])
+    visited = [[False] * width for _ in range(height)]
+    components: list[dict[str, int]] = []
+    for y in range(height):
+        for x in range(width):
+            if visited[y][x] or not mask[y][x]:
+                continue
+            stack = [(x, y)]
+            visited[y][x] = True
+            count = 0
+            min_x = max_x = x
+            min_y = max_y = y
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nx = cx + dx
+                    ny = cy + dy
+                    if 0 <= nx < width and 0 <= ny < height and not visited[ny][nx] and mask[ny][nx]:
+                        visited[ny][nx] = True
+                        stack.append((nx, ny))
+            components.append(
+                {
+                    "count": count,
+                    "minX": min_x,
+                    "maxX": max_x,
+                    "minY": min_y,
+                    "maxY": max_y,
+                    "width": max_x - min_x + 1,
+                    "height": max_y - min_y + 1,
+                }
+            )
+    return components
+
+
+def _fallback_row_badge_detection(image: Image.Image, row: dict[str, Any]) -> dict[str, Any] | None:
+    width, height = image.size
+    row_top = float(row.get("rowTop", 0.0) or 0.0)
+    row_bottom = float(row.get("rowBottom", 0.0) or 0.0)
+    name_left = float(row.get("nameLeft", 0.15) or 0.15)
+    row_span = max(0.02, row_bottom - row_top)
+    # Tight badge window: right beside the contact name, only across the upper
+    # portion of the row. This avoids merging the badge with red-heavy avatars.
+    scan_pad_left = max(0.018, min(0.022, row_span * 0.16))
+    scan_pad_right = max(0.018, min(0.024, row_span * 0.18))
+    x0 = max(0, int(round((name_left - scan_pad_left) * width)))
+    x1 = min(width, int(round((name_left + scan_pad_right) * width)))
+    y0 = max(0, int(round(max(0.0, row_top - 0.012) * height)))
+    y1 = min(height, int(round(min(1.0, row_top + max(0.085, min(0.135, row_span * 0.78))) * height)))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    region_h = max(1, y1 - y0)
+    mask: list[list[bool]] = []
+    for py in range(y0, y1):
+        row_mask: list[bool] = []
+        for px in range(x0, x1):
+            row_mask.append(_is_red_badge_pixel(image.getpixel((px, py))))
+        mask.append(row_mask)
+    best: dict[str, int] | None = None
+    for component in _connected_components(mask):
+        comp_w = int(component["width"])
+        comp_h = int(component["height"])
+        count = int(component["count"])
+        if count < 20 or count > 320:
+            continue
+        if comp_w < 9 or comp_w > 20 or comp_h < 9 or comp_h > 28:
+            continue
+        fill_ratio = count / max(1, comp_w * comp_h)
+        aspect = comp_w / max(1, comp_h)
+        center_y = ((component["minY"] + component["maxY"]) / 2.0) / region_h
+        if fill_ratio < 0.16 or fill_ratio > 0.86:
+            continue
+        if aspect < 0.45 or aspect > 1.70:
+            continue
+        if center_y < 0.08 or center_y > 0.92:
+            continue
+        if best is None or count > int(best["count"]):
+            best = component
+    if best is None:
+        return None
+    pad_x = max(1, int(best["width"] * 0.16))
+    pad_y = max(1, int(best["height"] * 0.16))
+    ix0 = x0 + int(best["minX"]) + pad_x
+    ix1 = x0 + int(best["maxX"]) - pad_x + 1
+    iy0 = y0 + int(best["minY"]) + pad_y
+    iy1 = y0 + int(best["maxY"]) - pad_y + 1
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    digit_pixels = 0
+    for py in range(iy0, iy1):
+        for px in range(ix0, ix1):
+            if _is_white_digit_pixel(image.getpixel((px, py))):
+                digit_pixels += 1
+    if digit_pixels < 10:
+        crop = image.crop((ix0, iy0, ix1, iy1))
+        enhanced_equivalent = _enhanced_digit_equivalent(crop)
+        if digit_pixels >= 8 and 3 <= enhanced_equivalent <= 10:
+            digit_pixels = max(digit_pixels, enhanced_equivalent)
+        else:
+            return None
+    return {
+        "redPixelCount": int(best["count"]),
+        "digitPixelCount": int(digit_pixels),
+        "numericBadge": True,
+        "unread": True,
+    }
+
+
 def find_chat(chats: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
+    target_key = _canonical_name_key(target)
+    if target_key:
+        for chat in chats:
+            if _canonical_name_key(str(chat.get("name", ""))) == target_key:
+                return chat
     for chat in chats:
         if names_match(chat["name"], target):
             return chat
@@ -543,17 +1058,21 @@ def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
         left = obs["bbox"]["left"]
         top = obs["bbox"]["top"]
         width = obs["bbox"]["w"]
-        if left < 0.38 or top > 0.12 or width < 0.04:
+        # Only trust the actual chat-title strip at the upper-left of the right panel.
+        # This excludes the green "new message(s)" banner on the upper-right.
+        if left < 0.33 or left > 0.62 or top > 0.09 or width < 0.02:
             continue
         if _is_time(text):
             continue
         if normalize_text(text) in ignored:
             continue
+        if _looks_like_message_banner_text(text):
+            continue
         candidates.append(obs)
     if not candidates:
         return ""
     candidates.sort(key=lambda item: (item["bbox"]["top"], -item["bbox"]["w"]))
-    return candidates[0]["text"]
+    return _sanitize_chat_title_text(candidates[0]["text"])
 
 
 def _pick_chat_window_title(obs_list: list[dict[str, Any]]) -> str:
@@ -564,17 +1083,19 @@ def _pick_chat_window_title(obs_list: list[dict[str, Any]]) -> str:
         left = obs["bbox"]["left"]
         top = obs["bbox"]["top"]
         width = obs["bbox"]["w"]
-        if top > 0.15 or left > 0.30 or width < 0.04:
+        if top > 0.12 or left < 0.03 or left > 0.42 or width < 0.02:
             continue
         if _is_time(text):
             continue
         if normalize_text(text) in ignored:
             continue
+        if _looks_like_message_banner_text(text):
+            continue
         candidates.append(obs)
     if not candidates:
         return ""
     candidates.sort(key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))
-    return candidates[0]["text"]
+    return _sanitize_chat_title_text(candidates[0]["text"])
 
 
 def _join_texts(parts: list[str]) -> str:
@@ -592,6 +1113,8 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "bbox": {"top": item["top"], "left": item["left"], "w": item["width"]},
             "center": {"y": item["top"] + 0.01},
             "confidence": float(item.get("confidence", 0.0) or 0.0),
+            "greenPixels": int(item.get("greenPixels", 0) or 0),
+            "grayPixels": int(item.get("grayPixels", 0) or 0),
         }
         for item in items
     ]
@@ -612,6 +1135,8 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ),
                     4,
                 ),
+                "greenPixels": int(sum(int(item.get("greenPixels", 0) or 0) for item in row_items)),
+                "grayPixels": int(sum(int(item.get("grayPixels", 0) or 0) for item in row_items)),
             }
         )
     collapsed.sort(key=lambda item: item["top"])
@@ -694,6 +1219,8 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
             "width": round(width, 4),
             "confidence": round(float(obs.get("confidence", 0.0) or 0.0), 4),
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
+            "greenPixels": int(obs.get("greenPixels", 0) or 0),
+            "grayPixels": int(obs.get("grayPixels", 0) or 0),
         }
         bubble_role = _resolve_chat_bubble_role(
             bubble_role=str(obs.get("bubbleRole", "unknown")),
@@ -749,6 +1276,8 @@ def _extract_chat_window_panel(obs_list: list[dict[str, Any]], selected_title: s
             "width": round(width, 4),
             "confidence": round(float(obs.get("confidence", 0.0) or 0.0), 4),
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
+            "greenPixels": int(obs.get("greenPixels", 0) or 0),
+            "grayPixels": int(obs.get("grayPixels", 0) or 0),
         }
         bubble_role = _resolve_chat_bubble_role(
             bubble_role=str(obs.get("bubbleRole", "unknown")),
@@ -788,21 +1317,33 @@ def _panel_has_content(panel: dict[str, Any]) -> bool:
     )
 
 
-def probe(select_chat: str | None = None, sleep_after_click: float = 1.0) -> dict[str, Any]:
+def probe(
+    select_chat: str | None = None,
+    sleep_after_click: float = 1.0,
+    select_chat_click: dict[str, Any] | None = None,
+    badge_rescue_targets: list[str] | None = None,
+) -> dict[str, Any]:
     activate_wechat()
-    windows = list_wechat_windows()
-    roster_info = choose_roster_window(windows)
+    roster_info = ensure_main_roster_window()
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     roster_path = CAPTURE_DIR / f"wechat-roster-{timestamp}.png"
     capture_window(roster_path, roster_info)
-    roster_obs = _prepare_ocr_items(roster_path)
-    chats = annotate_unread_chats(extract_visible_chats(roster_obs, roster_info), roster_path)
+    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    chats = annotate_unread_chats(
+        extract_visible_chats(roster_obs, roster_info),
+        roster_path,
+        fallback_target_names=badge_rescue_targets,
+    )
 
     selected_requested = select_chat or ""
     selected_chat = None
     if select_chat:
         match = find_chat(chats, select_chat)
-        if not match:
+        click_hint = select_chat_click if isinstance(select_chat_click, dict) else {}
+        click_x = int(click_hint.get("x", 0) or 0)
+        click_y = int(click_hint.get("y", 0) or 0)
+        use_click_hint = click_x > 0 and click_y > 0
+        if not match and not use_click_hint:
             return {
                 "status": "chat_not_visible",
                 "target": select_chat,
@@ -810,14 +1351,21 @@ def probe(select_chat: str | None = None, sleep_after_click: float = 1.0) -> dic
                 "screenshot": str(roster_path),
                 "visibleChats": chats,
             }
-        click_coords(match["click"]["x"], match["click"]["y"])
+        if use_click_hint:
+            click_coords(click_x, click_y)
+            selected_chat = select_chat
+        else:
+            click_coords(match["click"]["x"], match["click"]["y"])
+            selected_chat = match["name"]
         time.sleep(max(sleep_after_click, 0.2))
-        windows = list_wechat_windows()
-        roster_info = choose_roster_window(windows)
+        roster_info = ensure_main_roster_window()
         capture_window(roster_path, roster_info)
-        roster_obs = _prepare_ocr_items(roster_path)
-        chats = annotate_unread_chats(extract_visible_chats(roster_obs, roster_info), roster_path)
-        selected_chat = match["name"]
+        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+        chats = annotate_unread_chats(
+            extract_visible_chats(roster_obs, roster_info),
+            roster_path,
+            fallback_target_names=badge_rescue_targets,
+        )
 
     windows = list_wechat_windows()
     chat_window = choose_chat_window(windows)
@@ -839,7 +1387,11 @@ def probe(select_chat: str | None = None, sleep_after_click: float = 1.0) -> dic
         chat_path = None
         panel = _extract_chat_panel(roster_obs, selected_title=fallback_title)
 
-    active_chat = (chat_window or {}).get("title") or panel.get("title") or ""
+    active_chat = (
+        _sanitize_chat_title_text((chat_window or {}).get("title"))
+        or _sanitize_chat_title_text(panel.get("title"))
+        or ""
+    )
     return {
         "status": "ok",
         "window": roster_info,
