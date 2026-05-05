@@ -1,0 +1,2 @@
+"""Gateway control entrypoint package."""
+

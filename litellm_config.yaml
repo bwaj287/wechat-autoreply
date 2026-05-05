@@ -1,0 +1,31 @@
+model_list:
+  - model_name: smart-qwen-5080
+    litellm_params:
+      model: ollama/qwen3.5:9b-q8_0
+      api_base: http://192.168.10.2:11434
+      reasoning_effort: none
+      request_timeout: 10
+
+  - model_name: smart-qwen-local
+    litellm_params:
+      model: ollama/qwen3.5:9b
+      api_base: http://127.0.0.1:11434
+      reasoning_effort: none
+      request_timeout: 20
+
+  - model_name: smart-qwen-cloud
+    litellm_params:
+      model: openai/qwen3.5-plus
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/QWEN_API_KEY
+      request_timeout: 30
+
+router_settings:
+  routing_strategy: simple-shuffle
+  set_verbose: true
+  num_retries: 0
+  max_fallbacks: 2
+  fallbacks:
+    - {"smart-qwen": ["smart-qwen-local", "smart-qwen-cloud"]}
+  model_group_alias:
+    smart-qwen: smart-qwen-5080

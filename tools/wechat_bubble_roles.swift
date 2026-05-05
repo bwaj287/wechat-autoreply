@@ -66,8 +66,10 @@ func bubbleRect(for item: ItemSpec) -> (x0: Int, x1: Int, y0: Int, y1: Int) {
     let py = Int(item.y * Double(height))
     let pw = Int(item.w * Double(width))
     let ph = Int(item.h * Double(height))
-    let padX = Swift.max(Int(Double(pw) * 0.32), 18)
-    let padY = Swift.max(Int(Double(ph) * 0.60), 10)
+    let minPadX = Swift.max(8, Int(Double(width) * 0.012))
+    let minPadY = Swift.max(6, Int(Double(height) * 0.010))
+    let padX = Swift.max(Int(Double(pw) * 0.32), minPadX)
+    let padY = Swift.max(Int(Double(ph) * 0.60), minPadY)
     let x0 = clamp(px - padX, min: 0, max: width - 1)
     let x1 = clamp(px + pw + padX, min: x0 + 1, max: width)
     let y0 = clamp(py - padY, min: 0, max: height - 1)
@@ -102,6 +104,9 @@ var roles: [ItemRole] = []
 for item in items {
     let region = bubbleRect(for: item)
     let area = Swift.max(1, (region.x1 - region.x0) * (region.y1 - region.y0))
+    let itemWidth = Swift.max(1, Int(item.w * Double(width)))
+    let itemHeight = Swift.max(1, Int(item.h * Double(height)))
+    let itemArea = Swift.max(1, itemWidth * itemHeight)
     var greenPixels = 0
     var grayPixels = 0
 
@@ -118,10 +123,12 @@ for item in items {
 
     let greenRatio = Double(greenPixels) / Double(area)
     let grayRatio = Double(grayPixels) / Double(area)
+    let minGreenPixels = Swift.max(24, Int(Double(itemArea) * 0.10), Int(Double(area) * 0.018))
+    let minGrayPixels = Swift.max(42, Int(Double(itemArea) * 0.16), Int(Double(area) * 0.030))
     let role: String
-    if greenPixels >= 60 && greenRatio >= 0.06 {
+    if greenPixels >= minGreenPixels && greenRatio >= 0.045 {
         role = "outbound"
-    } else if grayPixels >= 140 && grayRatio >= 0.12 {
+    } else if grayPixels >= minGrayPixels && grayRatio >= 0.075 {
         role = "inbound"
     } else {
         role = "unknown"
