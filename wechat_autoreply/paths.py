@@ -10,6 +10,7 @@ TOOLS_DIR = PROJECT_ROOT / "tools"
 CONFIG_PATH = RUNTIME_DIR / "config.json"
 EVENTS_PATH = RUNTIME_DIR / "events.jsonl"
 CONTACT_MEMORY_PATH = RUNTIME_DIR / "contact_memory.json"
+CONTACT_MEMORY_SEED_PATH = PROJECT_ROOT / "wechat_autoreply" / "contact_memory_seed.json"
 LOCK_PATH = RUNTIME_DIR / "runner.lock"
 WHITELIST_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-whitelist.txt")
 SWITCH_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-auto-reply-switch.txt")

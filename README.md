@@ -56,6 +56,7 @@ tools/
   wechat_row_badges.swift    # Red unread-dot detection in list rows
   wechat_bubble_roles.swift  # Inbound vs outbound bubble role helper
 wechat_autoreply/
+  contact_memory_seed.json   # Versioned default long-term profiles tracked in git
   erge_client.py             # Brother multimodal client (image-aware reply path)
   orchestrator.py            # Core state machine
   wechat_ui.py               # WeChat probing, OCR extraction, UI actions
@@ -242,6 +243,7 @@ The current reply stack now has three separate layers:
 
 2. Long-term contact profile
    - Stored per contact in `runtime/contact_memory.json`
+   - Seeded from `wechat_autoreply/contact_memory_seed.json`
    - Intended for stable traits:
      - relationship
      - preferred tone
@@ -328,6 +330,7 @@ The intended use is:
 - write a safe default once
 - lock it
 - let the system only evolve the short-term summary
+- keep the baseline versioned in git via `wechat_autoreply/contact_memory_seed.json`
 
 Example patterns:
 

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .paths import CONTACT_MEMORY_PATH, ensure_runtime_dirs
+from .paths import CONTACT_MEMORY_PATH, CONTACT_MEMORY_SEED_PATH, ensure_runtime_dirs
 
 _SHORT_NOISE_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\\-_/|]{1,6}$")
 
@@ -78,6 +78,21 @@ def _default_contact_entry() -> dict[str, Any]:
     }
 
 
+def _load_seed_contacts() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(CONTACT_MEMORY_SEED_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    contacts = raw.get("contacts") if isinstance(raw, dict) else {}
+    seeded: dict[str, dict[str, Any]] = {}
+    for key, value in (contacts if isinstance(contacts, dict) else {}).items():
+        entry = _default_contact_entry()
+        if isinstance(value, dict):
+            entry.update(value)
+        seeded[str(key)] = entry
+    return seeded
+
+
 def load_contact_memory_store() -> dict[str, Any]:
     ensure_runtime_dirs()
     if not CONTACT_MEMORY_PATH.exists():
@@ -98,6 +113,16 @@ def load_contact_memory_store() -> dict[str, Any]:
         if isinstance(value, dict):
             entry.update(value)
         normalized_contacts[str(key)] = entry
+    for key, value in _load_seed_contacts().items():
+        if key not in normalized_contacts:
+            normalized_contacts[key] = value
+            continue
+        existing = dict(normalized_contacts[key] or {})
+        if not str(existing.get("profile") or "").strip() and str(value.get("profile") or "").strip():
+            existing["profile"] = str(value.get("profile") or "").strip()
+        if "profile_locked" not in existing:
+            existing["profile_locked"] = bool(value.get("profile_locked"))
+        normalized_contacts[key] = existing
     merged["contacts"] = normalized_contacts
     if merged != raw:
         _atomic_write(CONTACT_MEMORY_PATH, merged)

@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "contacts": {
+    "测试白名单": {
+      "profile": "测试联系人，用于验证链路。回复保持简短、正常、可预测，少玩梗，方便观察系统行为。",
+      "profile_locked": true
+    },
+    "家人": {
+      "profile": "家人语气，关心一点，稳一点，别嘴贫，别太冷，也别太像客服。",
+      "profile_locked": true
+    },
+    "客户A": {
+      "profile": "稍微礼貌一点，表达清楚，简洁直接，不油，不太随意，不开过头玩笑。",
+      "profile_locked": true
+    },
+    "shawn": {
+      "profile": "自测联系人，正常口语化即可，别太夸张，别故意演风格。",
+      "profile_locked": true
+    },
+    "May": {
+      "profile": "熟人朋友，口语化，可以轻微调侃，常聊日常和游戏，别太油，别回得太僵。",
+      "profile_locked": true
+    },
+    "Darren": {
+      "profile": "哥们语气，直接一点，可以轻微嘴贫，常聊游戏和日常，少解释，别太文绉绉。",
+      "profile_locked": true
+    },
+    "Barrys": {
+      "profile": "熟人朋友，松弛一点，可以玩笑和吐槽，常聊游戏、音乐、日常，别太正式。",
+      "profile_locked": true
+    },
+    "1ock": {
+      "profile": "妹妹语气，亲近自然一点，可以轻微逗一下，但别油，别太凶，带点照顾感。",
+      "profile_locked": true
+    },
+    "可乐": {
+      "profile": "朋友语气，轻松自然，可以稍微给点情绪价值，但别浮夸，别太像营业。",
+      "profile_locked": true
+    },
+    "Ted Liu": {
+      "profile": "朋友语气，正常一点，别太敷衍，能接梗但别太欠，保持自然。",
+      "profile_locked": true
+    },
+    "王哥": {
+      "profile": "父亲语气，尊重一点，稳一点，多关心，别嘴贫，别轻浮，别太网络梗。",
+      "profile_locked": true
+    },
+    "刘若愚": {
+      "profile": "正常熟人语气，平和一点，别太跳脱，别太装，也别太冷。",
+      "profile_locked": true
+    },
+    "Eden": {
+      "profile": "熟人朋友，偏 tech / 电脑 / 模型话题，直接一点，少废话，别太客套。",
+      "profile_locked": true
+    },
+    "一条正直的咸鱼": {
+      "profile": "正常朋友语气，先稳一点，别太熟过头，可以轻微调侃，但先保守自然。",
+      "profile_locked": true
+    }
+  }
+}
