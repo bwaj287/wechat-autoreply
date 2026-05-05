@@ -143,6 +143,21 @@ def _format_context_block(conversation_context: list[dict[str, str]] | None) -> 
     return "Recent chat context (oldest to latest):\n" + "\n".join(lines[-8:]) + "\n\n"
 
 
+def _format_contact_memory_block(contact_memory: dict[str, Any] | None) -> str:
+    if not isinstance(contact_memory, dict):
+        return ""
+    profile = _clean_context_line(str(contact_memory.get("profile", "")), max_chars=160)
+    recent_summary = _clean_context_line(str(contact_memory.get("recent_summary", "")), max_chars=320)
+    lines: list[str] = []
+    if profile:
+        lines.append(f"Contact profile: {profile}")
+    if recent_summary:
+        lines.append(f"Longer-term memory with this contact: {recent_summary}")
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n\n"
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -170,6 +185,7 @@ class OllamaClient:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
     ) -> str:
         del screenshot_path
@@ -177,6 +193,7 @@ class OllamaClient:
         style_block = f"{self.style_instructions}\n" if self.style_instructions else ""
         emoji_prompt_block = ""
         context_block = _format_context_block(conversation_context)
+        memory_block = _format_contact_memory_block(contact_memory)
         if self.emoji_enabled and self.emoji_codes:
             sampled = " ".join(self.emoji_codes[:20])
             emoji_prompt_block = (
@@ -197,6 +214,7 @@ class OllamaClient:
             "Do not end the reply with a period.\n"
             f"Stay under {self.max_reply_chars} characters.\n\n"
             f"Contact: {contact}\n"
+            f"{memory_block}"
             f"{context_block}"
             f"Latest incoming message: {inbound_text}\n\n"
             "Reply:"

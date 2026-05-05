@@ -9,6 +9,7 @@ TOOLS_DIR = PROJECT_ROOT / "tools"
 
 CONFIG_PATH = RUNTIME_DIR / "config.json"
 EVENTS_PATH = RUNTIME_DIR / "events.jsonl"
+CONTACT_MEMORY_PATH = RUNTIME_DIR / "contact_memory.json"
 LOCK_PATH = RUNTIME_DIR / "runner.lock"
 WHITELIST_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-whitelist.txt")
 SWITCH_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-auto-reply-switch.txt")
@@ -23,5 +24,13 @@ BUBBLE_ROLE_HELPER = TOOLS_DIR / "wechat_bubble_roles.swift"
 
 
 def ensure_runtime_dirs() -> None:
-    for path in (RUNTIME_DIR, CAPTURE_DIR, DEBUG_DIR, LOG_DIR, STATE_PATH.parent, WHITELIST_PATH.parent, SWITCH_PATH.parent):
+    for path in (
+        RUNTIME_DIR,
+        CAPTURE_DIR,
+        DEBUG_DIR,
+        LOG_DIR,
+        STATE_PATH.parent,
+        WHITELIST_PATH.parent,
+        SWITCH_PATH.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .capture_cleanup import cleanup_runtime_artifacts_older_than
+from .contact_memory import get_contact_memory, remember_contact_memory
 from .config_store import load_config
 from .erge_client import ErgeClient
 from .event_log import append_event
@@ -1281,6 +1282,43 @@ class AutoReplyRunner:
         self._internal_ui_grace_until = 0.0
         self._internal_ui_idle_floor = 0.0
 
+    def _contact_memory_enabled(self, config: dict[str, Any]) -> bool:
+        return bool(config.get("contact_memory_enabled", True))
+
+    def _load_contact_memory(self, config: dict[str, Any], contact: str) -> dict[str, Any]:
+        if not self._contact_memory_enabled(config):
+            return {}
+        return get_contact_memory(contact)
+
+    def _remember_contact_memory(
+        self,
+        config: dict[str, Any],
+        contact: str,
+        *,
+        context_messages: list[dict[str, str]] | None = None,
+        inbound_text: str = "",
+        outbound_text: str = "",
+        source: str,
+    ) -> dict[str, Any]:
+        if not self._contact_memory_enabled(config):
+            return {}
+        memory = remember_contact_memory(
+            contact,
+            context_messages=context_messages,
+            inbound_text=inbound_text,
+            outbound_text=outbound_text,
+            max_events=int(config.get("contact_memory_max_events", 18) or 18),
+            retention_days=int(config.get("contact_memory_retention_days", 14) or 14),
+        )
+        self.append_event(
+            "contact_memory_updated",
+            contact=contact,
+            source=source,
+            recent_summary=str(memory.get("recent_summary") or ""),
+            event_count=len(list(memory.get("recent_events") or [])),
+        )
+        return memory
+
     def _menu_unread_signal(self) -> str:
         if hasattr(self.vision, "unread_signal"):
             try:
@@ -2098,10 +2136,12 @@ class AutoReplyRunner:
                         self.append_event("claim_skipped", reason="already_queued", contact=contact)
                         continue
 
+                    contact_memory = self._load_contact_memory(config, contact)
                     draft_text = llm.generate_reply(
                         contact,
                         inbound_text,
                         conversation_context=context_messages,
+                        contact_memory=contact_memory,
                         screenshot_path=_preferred_chat_screenshot(selected),
                     )
                     pending = {
@@ -2132,6 +2172,13 @@ class AutoReplyRunner:
                         context_turns=len(context_messages),
                         queue_length=len(queue),
                         queue_contacts=queued_contacts(queue),
+                    )
+                    self._remember_contact_memory(
+                        config,
+                        contact,
+                        context_messages=context_messages,
+                        inbound_text=inbound_text,
+                        source="draft_saved",
                     )
 
             process_candidates(candidates)
@@ -2240,10 +2287,12 @@ class AutoReplyRunner:
                 inbound_text,
                 max_messages=int(config.get("reply_context_messages", 8)),
             )
+        contact_memory = self._load_contact_memory(config, contact)
         draft_text = client.generate_reply(
             contact,
             inbound_text,
             conversation_context=context_messages,
+            contact_memory=contact_memory,
             screenshot_path=_preferred_chat_screenshot(selected),
         )
         delay_seconds = float(
@@ -2281,6 +2330,13 @@ class AutoReplyRunner:
             context_turns=len(context_messages or []),
             queue_length=len(queue),
             queue_contacts=queued_contacts(queue),
+        )
+        self._remember_contact_memory(
+            config,
+            contact,
+            context_messages=context_messages,
+            inbound_text=inbound_text,
+            source="pending_refreshed",
         )
         return updated
 
@@ -2594,6 +2650,15 @@ class AutoReplyRunner:
                 if int(pending.get("send_attempts", 0) or 0) > 0:
                     remaining = remove_pending_by_fingerprint(queue, pending)
                     sync_pending_state(state, remaining)
+                    final_outbound = str(current_outbound or draft_text or "").strip()
+                    self._remember_contact_memory(
+                        config,
+                        contact,
+                        context_messages=list(pending.get("chat_context") or []),
+                        inbound_text=str(pending.get("inbound_text") or ""),
+                        outbound_text=final_outbound,
+                        source="auto_sent_late",
+                    )
                     self.append_event(
                         "auto_sent",
                         contact=contact,
@@ -2934,6 +2999,15 @@ class AutoReplyRunner:
             if confirmed_match_mode and confirmed_outbound:
                 remaining = remove_pending_by_fingerprint(queue, pending)
                 sync_pending_state(state, remaining)
+                final_outbound = str(confirmed_outbound or draft_text or "").strip()
+                self._remember_contact_memory(
+                    config,
+                    contact,
+                    context_messages=list(pending.get("chat_context") or []),
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    outbound_text=final_outbound,
+                    source="auto_sent_immediate",
+                )
                 self.append_event(
                     "auto_sent",
                     contact=contact,

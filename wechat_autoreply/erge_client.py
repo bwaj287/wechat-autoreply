@@ -14,6 +14,7 @@ from .ollama_client import (
     OllamaClient,
     _append_code_with_budget,
     _contains_emoji,
+    _format_contact_memory_block,
     _format_context_block,
     _normalize_reply_text,
     _preferred_emoji_names,
@@ -74,6 +75,7 @@ class ErgeClient:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict[str, Any] | None = None,
     ) -> str:
         style_block = (
             f"{self.fallback_client.style_instructions}\n"
@@ -82,6 +84,7 @@ class ErgeClient:
         )
         emoji_prompt_block = ""
         context_block = _format_context_block(conversation_context)
+        memory_block = _format_contact_memory_block(contact_memory)
         if self.fallback_client.emoji_enabled and self.fallback_client.emoji_codes:
             sampled = " ".join(self.fallback_client.emoji_codes[:20])
             emoji_prompt_block = (
@@ -112,6 +115,7 @@ class ErgeClient:
             "Do not end the reply with a period.\n"
             f"Stay under {self.fallback_client.max_reply_chars} characters.\n\n"
             f"Contact: {contact}\n"
+            f"{memory_block}"
             f"{context_block}"
             f"Latest incoming message: {inbound_text}\n\n"
             "Reply with the final WeChat message only."
@@ -360,15 +364,21 @@ class ErgeClient:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
     ) -> str:
         if not self._erge_healthy():
             self.last_backend = "local_small"
             if not self.last_reason:
                 self.last_reason = "erge_unhealthy"
-            return self.fallback_client.generate_reply(contact, inbound_text, conversation_context)
+            return self.fallback_client.generate_reply(
+                contact,
+                inbound_text,
+                conversation_context,
+                contact_memory=contact_memory,
+            )
 
-        prompt = self._build_prompt(contact, inbound_text, conversation_context)
+        prompt = self._build_prompt(contact, inbound_text, conversation_context, contact_memory)
         user_content: str | list[dict[str, Any]]
         screenshot = Path(str(screenshot_path or "").strip())
         visual_path = self._build_visual_focus_image(screenshot, inbound_text)
@@ -407,4 +417,9 @@ class ErgeClient:
         except Exception as exc:
             self.last_backend = "local_small"
             self.last_reason = f"erge_request_error:{exc}"
-            return self.fallback_client.generate_reply(contact, inbound_text, conversation_context)
+            return self.fallback_client.generate_reply(
+                contact,
+                inbound_text,
+                conversation_context,
+                contact_memory=contact_memory,
+            )
