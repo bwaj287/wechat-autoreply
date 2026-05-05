@@ -228,6 +228,7 @@ Examples:
 ./wechat_env/bin/python gateway_control.py style-set "Natural, short, conversational, no sentence-final periods"
 ./wechat_env/bin/python gateway_control.py memory-show May
 ./wechat_env/bin/python gateway_control.py memory-set May "Close friend, casual tone, can tease lightly, avoid sounding oily"
+./wechat_env/bin/python gateway_control.py memory-set "一条正直的咸鱼" "Normal friend tone, stay natural, do not oversell familiarity"
 ```
 
 ## Per-Contact Memory Model
@@ -316,6 +317,42 @@ If a profile feels good and you do not want it accidentally changed later:
 
 ```bash
 ./wechat_env/bin/python gateway_control.py memory-lock May
+```
+
+### Default Long-Term Profiles
+
+This branch also supports seeding a baseline long-term profile for each whitelist contact.
+
+The intended use is:
+
+- write a safe default once
+- lock it
+- let the system only evolve the short-term summary
+
+Example patterns:
+
+- family -> warmer, steadier, less teasing
+- customer / work contact -> clearer and slightly more polite
+- close friends -> more casual, more playful, more shorthand
+- sibling -> natural and close, but not greasy or overly dramatic
+
+This gives the model a stable relationship frame without letting OCR accidents rewrite identity-level facts.
+
+### Notes About Contacts With Spaces
+
+For local CLI usage, quote contact names with spaces:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-show "Ted Liu"
+./wechat_env/bin/python gateway_control.py memory-set "一条正直的咸鱼" "Normal friend tone, stay natural, lightly playful"
+```
+
+For OpenClaw chat commands, either quote the contact name or use the `::` separator:
+
+```text
+memory-show "Ted Liu"
+memory-set "一条正直的咸鱼" Normal friend tone, stay natural, lightly playful
+memory-set 一条正直的咸鱼 :: Normal friend tone, stay natural, lightly playful
 ```
 
 ## Core Runtime Logic
