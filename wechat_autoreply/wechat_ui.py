@@ -42,6 +42,9 @@ SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
 MESSAGE_BANNER_RE = re.compile(
     r"(?i)(?:^|\b)\d+\s*new\s*message(?:s)?\b|(?:^|\b)new\s*message(?:s)?\b"
 )
+SYSTEM_CALL_PREVIEW_RE = re.compile(
+    r"(?i)^(?:video\s*call|voice\s*call|call\s*not\s*answered|already\s*answered\s*elsewhere|call\s*canceled\s*by\s*caller)$"
+)
 MIN_ROSTER_WINDOW_WIDTH = 720
 MIN_ROSTER_WINDOW_HEIGHT = 620
 TARGET_ROSTER_WINDOW_X = 96
@@ -138,6 +141,13 @@ def _sanitize_chat_title_text(text: str) -> str:
     if _looks_like_message_banner_text(value):
         return ""
     return value
+
+
+def _looks_like_system_call_preview(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return bool(SYSTEM_CALL_PREVIEW_RE.fullmatch(value))
 
 
 def _click_dock_item(name: str) -> bool:
@@ -728,6 +738,16 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
                     preview_item = item
             if not name_item:
                 continue
+            if (
+                preview_item
+                and _looks_like_system_call_preview(name_item["text"])
+                and not _looks_like_system_call_preview(preview_item["text"])
+            ):
+                # OCR occasionally orders the call-status preview above the real
+                # contact name, which makes rows like `1ock / Video Call` look
+                # like the contact itself is named "Video Call". Prefer the
+                # non-call text as the contact label in that case.
+                name_item, preview_item = preview_item, name_item
             if len(name_item["text"]) <= 1 and not re.search(r"[A-Za-z\u4e00-\u9fff]", name_item["text"]):
                 continue
             gx, gy = _global_coords(window_info, name_item)
@@ -1334,38 +1354,46 @@ def probe(
         roster_path,
         fallback_target_names=badge_rescue_targets,
     )
+    preselected_title = _pick_selected_title(roster_obs)
 
     selected_requested = select_chat or ""
     selected_chat = None
     if select_chat:
-        match = find_chat(chats, select_chat)
-        click_hint = select_chat_click if isinstance(select_chat_click, dict) else {}
-        click_x = int(click_hint.get("x", 0) or 0)
-        click_y = int(click_hint.get("y", 0) or 0)
-        use_click_hint = click_x > 0 and click_y > 0
-        if not match and not use_click_hint:
-            return {
-                "status": "chat_not_visible",
-                "target": select_chat,
-                "window": roster_info,
-                "screenshot": str(roster_path),
-                "visibleChats": chats,
-            }
-        if use_click_hint:
-            click_coords(click_x, click_y)
-            selected_chat = select_chat
+        # Re-clicking the already-active roster row can intermittently open
+        # WeChat's contact context menu instead of simply reselecting the chat.
+        # If the right-panel title already matches the requested contact, trust
+        # the current selection and skip the extra row click.
+        if preselected_title and names_match(preselected_title, select_chat):
+            selected_chat = preselected_title
         else:
-            click_coords(match["click"]["x"], match["click"]["y"])
-            selected_chat = match["name"]
-        time.sleep(max(sleep_after_click, 0.2))
-        roster_info = ensure_main_roster_window()
-        capture_window(roster_path, roster_info)
-        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
-        chats = annotate_unread_chats(
-            extract_visible_chats(roster_obs, roster_info),
-            roster_path,
-            fallback_target_names=badge_rescue_targets,
-        )
+            match = find_chat(chats, select_chat)
+            click_hint = select_chat_click if isinstance(select_chat_click, dict) else {}
+            click_x = int(click_hint.get("x", 0) or 0)
+            click_y = int(click_hint.get("y", 0) or 0)
+            use_click_hint = click_x > 0 and click_y > 0
+            if not match and not use_click_hint:
+                return {
+                    "status": "chat_not_visible",
+                    "target": select_chat,
+                    "window": roster_info,
+                    "screenshot": str(roster_path),
+                    "visibleChats": chats,
+                }
+            if use_click_hint:
+                click_coords(click_x, click_y)
+                selected_chat = select_chat
+            else:
+                click_coords(match["click"]["x"], match["click"]["y"])
+                selected_chat = match["name"]
+            time.sleep(max(sleep_after_click, 0.2))
+            roster_info = ensure_main_roster_window()
+            capture_window(roster_path, roster_info)
+            roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+            chats = annotate_unread_chats(
+                extract_visible_chats(roster_obs, roster_info),
+                roster_path,
+                fallback_target_names=badge_rescue_targets,
+            )
 
     windows = list_wechat_windows()
     chat_window = choose_chat_window(windows)

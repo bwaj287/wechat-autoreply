@@ -71,6 +71,7 @@ erge_gateway/
 runtime/
   config.json                # Runtime config
   state.json                 # Runtime state snapshot
+  contact_memory.json        # Per-contact long-term profile + short-term compressed memory
   events.jsonl               # Append-only event timeline
   captures/                  # Debug captures
 ```
@@ -208,6 +209,11 @@ Supported commands:
 - `restart` -> same behavior as reset.
 - `style-show` -> show current reply style instructions.
 - `style-set "<text>"` -> update style instructions.
+- `memory-show <contact>` -> inspect that contact's long-term profile + short-term memory.
+- `memory-set <contact> "<profile>"` -> manually set that contact's long-term profile.
+- `memory-clear <contact>` -> clear short-term memory drift while keeping the profile.
+- `memory-lock <contact>` -> lock that contact's long-term profile.
+- `memory-unlock <contact>` -> unlock that contact's long-term profile.
 - `command` or `/command` -> show command help.
 
 Examples:
@@ -220,6 +226,96 @@ Examples:
 ./wechat_env/bin/python gateway_control.py since
 ./wechat_env/bin/python gateway_control.py diagnose
 ./wechat_env/bin/python gateway_control.py style-set "Natural, short, conversational, no sentence-final periods"
+./wechat_env/bin/python gateway_control.py memory-show May
+./wechat_env/bin/python gateway_control.py memory-set May "Close friend, casual tone, can tease lightly, avoid sounding oily"
+```
+
+## Per-Contact Memory Model
+
+The current reply stack now has three separate layers:
+
+1. Global style rules
+   - Stored in `runtime/config.json`
+   - Controls how Shawn generally sounds on WeChat
+   - Updated with `style-set`
+
+2. Long-term contact profile
+   - Stored per contact in `runtime/contact_memory.json`
+   - Intended for stable traits:
+     - relationship
+     - preferred tone
+     - common topics
+     - boundaries / things to avoid
+   - Updated manually with `memory-set`
+
+3. Short-term compressed memory
+   - Also stored per contact in `runtime/contact_memory.json`
+   - Automatically refreshed from recent valid chats and successful replies
+   - Used to preserve continuity without stuffing the full history into prompt context
+
+### Why the Memory Is Split This Way
+
+This separation is deliberate.
+
+We do **not** want:
+
+- OCR mistakes to become permanent facts
+- one accidental conversation to define a person's long-term profile
+- the system to "self-train" into a distorted persona over time
+
+So the rule is:
+
+- automatic logic may update **short-term compressed memory**
+- automatic logic may **not** rewrite the **long-term profile**
+
+Long-term profile is treated as a human-owned control surface.
+
+### Drift Safeguards
+
+To reduce memory drift:
+
+- long-term profile is manual-first
+- short-term memory has retention limits and event caps
+- repeated duplicate fragments are de-duplicated
+- obvious OCR noise is filtered before memory write
+- `memory-clear <contact>` lets you wipe short-term drift without deleting the stable profile
+- `memory-lock <contact>` lets you freeze the profile deliberately
+
+### What Gets Injected Into Reply Generation
+
+Before generating a draft, the prompt now contains:
+
+- global style instructions
+- `Contact profile: ...`
+- `Longer-term memory with this contact: ...`
+- recent chat context
+- latest inbound message
+
+This applies to:
+
+- local small-model generation
+- `brother` / multimodal generation
+
+### Recommended Workflow
+
+Use automatic short-term memory for continuity, and only manually author long-term profile when needed.
+
+Examples:
+
+- `May`: "Close friend, casual tone, can tease lightly, avoid sounding too eager"
+- `Darren`: "Bro tone, direct, no long explanations"
+- `Ted Liu`: "Friendly but normal, do not sound dismissive"
+
+If a reply starts feeling "off" because of recent OCR or transient context, do:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-clear May
+```
+
+If a profile feels good and you do not want it accidentally changed later:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-lock May
 ```
 
 ## Core Runtime Logic

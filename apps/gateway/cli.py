@@ -11,6 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from wechat_autoreply.contact_memory import (
+    clear_contact_recent_memory,
+    get_contact_memory,
+    set_contact_profile,
+    set_contact_profile_lock,
+)
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
 from wechat_autoreply.event_log import append_event
 from wechat_autoreply.paths import EVENTS_PATH, PROJECT_ROOT
@@ -41,6 +47,11 @@ SUPPORTED_COMMANDS = [
     "restart",
     "style-show",
     "style-set",
+    "memory-show",
+    "memory-set",
+    "memory-clear",
+    "memory-lock",
+    "memory-unlock",
     "command",
     "/command",
     "help",
@@ -68,10 +79,26 @@ def parse_args() -> argparse.Namespace:
         "command",
         choices=SUPPORTED_COMMANDS,
     )
-    parser.add_argument("style_text", nargs=argparse.REMAINDER)
+    parser.add_argument("command_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.command != "style-set" and args.style_text:
-        parser.error("only style-set accepts style text")
+    raw_args = list(args.command_args or [])
+    style_like = {"style-set"}
+    contact_arg_only = {"memory-show", "memory-clear", "memory-lock", "memory-unlock"}
+    profile_arg_commands = {"memory-set"}
+    if args.command in style_like:
+        if not " ".join(raw_args).strip():
+            parser.error('style-set requires style text, e.g. style-set "Natural, short, no period"')
+    elif args.command in contact_arg_only:
+        if len(raw_args) != 1 or not str(raw_args[0]).strip():
+            parser.error(f"{args.command} requires exactly one contact name")
+    elif args.command in profile_arg_commands:
+        if len(raw_args) < 2 or not str(raw_args[0]).strip() or not " ".join(raw_args[1:]).strip():
+            parser.error('memory-set requires contact name and profile text, e.g. memory-set May "Friends, casual, can tease"')
+    elif raw_args:
+        parser.error("this command does not accept extra arguments")
+    args.style_text = raw_args
+    args.contact_name = str(raw_args[0]).strip() if raw_args else ""
+    args.profile_text = " ".join(raw_args[1:]).strip() if len(raw_args) >= 2 else ""
     if args.command == "style-set" and not " ".join(args.style_text).strip():
         parser.error('style-set requires style text, e.g. style-set "Natural, short, no period"')
     return args
@@ -480,6 +507,25 @@ def style_show_output(config: dict[str, Any]) -> str:
     return "\n".join(["微信自动回复语气规则：", style])
 
 
+def memory_show_output(config: dict[str, Any], state: dict[str, Any], contact: str) -> str:
+    memory = get_contact_memory(contact)
+    queue = _pending_queue(state)
+    profile = str(memory.get("profile") or "").strip() or "（空）"
+    recent_summary = str(memory.get("recent_summary") or "").strip() or "（空）"
+    locked = "是" if bool(memory.get("profile_locked")) else "否"
+    updated_at = str(memory.get("updated_at") or "").strip() or "-"
+    profile_updated_at = str(memory.get("profile_updated_at") or "").strip() or "-"
+    recent_events = list(memory.get("recent_events") or [])
+    lines = [status_line(config, len(queue)), f"联系人记忆：{memory.get('contact') or contact}"]
+    lines.append(f"- 长期画像已锁定：{locked}")
+    lines.append(f"- 长期画像：{profile}")
+    lines.append(f"- 短期摘要：{recent_summary}")
+    lines.append(f"- recent_events：{len(recent_events)}")
+    lines.append(f"- updated_at：{updated_at}")
+    lines.append(f"- profile_updated_at：{profile_updated_at}")
+    return "\n".join(lines)
+
+
 def runner_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     queue = _pending_queue(state)
     snapshot = _runner_snapshot()
@@ -541,6 +587,13 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- style-show：查看当前语气规则",
         '- style-set "<规则>"：更新语气规则',
         "",
+        "联系人记忆：",
+        "- memory-show <联系人>：查看该联系人的长期画像 + 短期摘要",
+        '- memory-set <联系人> "<画像>"：手动设置该联系人的长期画像',
+        "- memory-clear <联系人>：清空该联系人的短期摘要与最近事件（保留长期画像）",
+        "- memory-lock <联系人>：锁定长期画像，防止后续误改",
+        "- memory-unlock <联系人>：解锁长期画像",
+        "",
         "帮助：",
         "- command：显示本帮助",
         "- /command：显示本帮助（聊天里更顺手）",
@@ -550,6 +603,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- ./wechat_env/bin/python gateway_control.py since",
         "- ./wechat_env/bin/python gateway_control.py command",
         '- ./wechat_env/bin/python gateway_control.py style-set "自然、简短、口语化，不要句号"',
+        '- ./wechat_env/bin/python gateway_control.py memory-set May "朋友，口语一点，可以轻微调侃，别太油"',
     ]
     return "\n".join(lines)
 
@@ -635,9 +689,29 @@ def main() -> int:
         config["reply_style_instructions"] = " ".join(args.style_text).strip()
         save_config(config)
         state = load_state()
+    elif command == "memory-set":
+        config = load_config()
+        memory = set_contact_profile(args.contact_name, args.profile_text)
+        append_event("gateway_memory_profile_set", contact=memory.get("contact"), profile=memory.get("profile"))
+        state = load_state()
+    elif command == "memory-clear":
+        config = load_config()
+        memory = clear_contact_recent_memory(args.contact_name)
+        append_event("gateway_memory_recent_cleared", contact=memory.get("contact"))
+        state = load_state()
+    elif command == "memory-lock":
+        config = load_config()
+        memory = set_contact_profile_lock(args.contact_name, True)
+        append_event("gateway_memory_profile_locked", contact=memory.get("contact"))
+        state = load_state()
+    elif command == "memory-unlock":
+        config = load_config()
+        memory = set_contact_profile_lock(args.contact_name, False)
+        append_event("gateway_memory_profile_unlocked", contact=memory.get("contact"))
+        state = load_state()
     else:
         config = load_config()
-        if command not in {"style-show", "command", "runner"}:
+        if command not in {"style-show", "memory-show", "command", "runner"}:
             save_config(config)
         state = load_state()
     if command == "status":
@@ -658,6 +732,20 @@ def main() -> int:
     elif command == "style-set":
         print("微信自动回复：语气规则已更新")
         print(style_show_output(config))
+    elif command == "memory-show":
+        print(memory_show_output(config, state, args.contact_name))
+    elif command == "memory-set":
+        print(f"微信自动回复：已更新 {memory.get('contact') or args.contact_name} 的长期画像")
+        print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
+    elif command == "memory-clear":
+        print(f"微信自动回复：已清空 {memory.get('contact') or args.contact_name} 的短期记忆")
+        print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
+    elif command == "memory-lock":
+        print(f"微信自动回复：已锁定 {memory.get('contact') or args.contact_name} 的长期画像")
+        print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
+    elif command == "memory-unlock":
+        print(f"微信自动回复：已解锁 {memory.get('contact') or args.contact_name} 的长期画像")
+        print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
     elif command in {"reset", "restart"}:
         print("微信自动回复：已重置并重启（待发送 0）")
     elif command == "command":
