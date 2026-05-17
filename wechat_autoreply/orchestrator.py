@@ -37,6 +37,7 @@ CONTACT_DAY_SUFFIX_RE = re.compile(
 )
 CONTACT_TIME_SUFFIX_RE = re.compile(r"\b\d{1,2}:\d{2}\b$")
 CONTACT_TRAILING_COUNT_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
+QUOTED_REPLY_CARD_RE = re.compile(r"^\s*([^:：\n]{1,40})\s*[:：]\s*(.+)$")
 STALE_SYSTEM_INBOUND_RE = re.compile(
     r"(?i)\b("
     r"already answered elsewhere|"
@@ -105,6 +106,22 @@ def _meaningful_inbound_items(panel: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+def _meaningful_outbound_items(panel: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in list(panel.get("outbound") or []):
+        text = str(item.get("text") or "").strip()
+        if not wechat_ui.has_meaningful_text(text) or is_history_marker(text):
+            continue
+        if _is_likely_ocr_noise_line(text):
+            continue
+        enriched = copy.deepcopy(item) if isinstance(item, dict) else {}
+        enriched["text"] = text
+        enriched["top"] = float(item.get("top", 0.0) or 0.0)
+        items.append(enriched)
+    items.sort(key=lambda item: float(item.get("top", 0.0) or 0.0))
+    return items
+
+
 def _tail_cluster(items: list[dict[str, Any]], max_gap: float = 0.14) -> list[dict[str, Any]]:
     if not items:
         return []
@@ -141,6 +158,207 @@ def _clean_multiline_latest_inbound(latest_inbound: str, preview: str) -> str:
     if len(lines) == 1:
         return lines[0]
     return lines[-1]
+
+
+def _strip_quote_sender_prefix(text: str) -> tuple[str, str]:
+    value = str(text or "").strip()
+    if not value:
+        return "", ""
+    match = QUOTED_REPLY_CARD_RE.match(value)
+    if not match:
+        return "", value
+    return str(match.group(1) or "").strip(), str(match.group(2) or "").strip()
+
+
+def _find_outbound_quote_match(panel: dict[str, Any], text: str) -> dict[str, str]:
+    value = str(text or "").strip()
+    if not value:
+        return {}
+    quoted_sender, stripped = _strip_quote_sender_prefix(value)
+    outbound_items = _meaningful_outbound_items(panel)
+    if not outbound_items:
+        return {}
+    candidates = [value]
+    if stripped and normalize_text(stripped) != normalize_text(value):
+        candidates.insert(0, stripped)
+    for candidate in candidates:
+        candidate_norm = normalize_text(candidate)
+        if not candidate_norm:
+            continue
+        for outbound in reversed(outbound_items):
+            outbound_text = str(outbound.get("text") or "").strip()
+            if not outbound_text:
+                continue
+            if (
+                candidate_norm == normalize_text(outbound_text)
+                or _messages_overlap(candidate, outbound_text)
+                or _message_similarity_score(candidate, outbound_text) >= 0.84
+            ):
+                return {
+                    "text": outbound_text,
+                    "role": "self",
+                    "sender": quoted_sender,
+                }
+    return {}
+
+
+def _extract_quote_payload(
+    panel: dict[str, Any],
+    rows: list[dict[str, Any]],
+    preview: str = "",
+) -> dict[str, str]:
+    if len(rows) < 2:
+        return {}
+    quote_index = None
+    quote_match: dict[str, str] = {}
+    for idx, item in enumerate(rows[1:], start=1):
+        quote_match = _find_outbound_quote_match(panel, str(item.get("text") or "").strip())
+        if quote_match:
+            quote_index = idx
+            break
+    if quote_index is None or not quote_match:
+        return {}
+    main_lines = _sanitize_inbound_lines(
+        [str(item.get("text", "")).strip() for item in rows[:quote_index] if item.get("text")],
+        preview,
+    )
+    main_text = "\n".join(main_lines) if main_lines else ""
+    if not main_text:
+        return {}
+    return {
+        "text": main_text,
+        "quoted_text": str(quote_match.get("text") or "").strip(),
+        "quoted_role": str(quote_match.get("role") or "").strip() or "unknown",
+        "quoted_sender": str(quote_match.get("sender") or "").strip(),
+    }
+
+
+def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -> dict[str, str]:
+    preview = str(fallback_preview or "").strip()
+    latest_outbound = str(panel.get("latestOutbound") or "").strip()
+    preview_is_outbound = _text_matches_outbound(preview, latest_outbound)
+    payload = {
+        "text": "",
+        "quoted_text": "",
+        "quoted_role": "",
+        "quoted_sender": "",
+    }
+    inbound_items = _meaningful_inbound_items(panel)
+    raw_inbound_items = [
+        copy.deepcopy(item)
+        for item in list(panel.get("inbound") or [])
+        if str(item.get("text") or "").strip() and not is_history_marker(str(item.get("text") or "").strip())
+    ]
+    if inbound_items:
+        latest_outbound_top = max(
+            (
+                float(item.get("top", 0.0) or 0.0)
+                for item in list(panel.get("outbound") or [])
+                if str(item.get("text") or "").strip()
+            ),
+            default=None,
+        )
+        if latest_outbound_top is not None:
+            recent_rows = _tail_cluster(
+                [
+                    item
+                    for item in inbound_items
+                    if float(item.get("top", 0.0) or 0.0) > latest_outbound_top + 0.01
+                ]
+            )
+            if recent_rows:
+                quote_payload = _extract_quote_payload(panel, recent_rows, preview)
+                if quote_payload.get("text"):
+                    return quote_payload
+                lines = [
+                    str(item.get("text", "")).strip()
+                    for item in recent_rows
+                    if item.get("text")
+                ]
+                lines = _sanitize_inbound_lines(lines, preview)
+                if lines:
+                    payload["text"] = "\n".join(lines)
+                    return payload
+                short_recovery = _recover_short_inbound_text(
+                    *[str(item.get("text", "")).strip() for item in recent_rows],
+                    preview,
+                )
+                if short_recovery:
+                    payload["text"] = short_recovery
+                    return payload
+            raw_recent_rows = _tail_cluster(
+                [
+                    item
+                    for item in raw_inbound_items
+                    if float(item.get("top", 0.0) or 0.0) > latest_outbound_top + 0.01
+                ]
+            )
+            if raw_recent_rows:
+                short_recovery = _recover_short_inbound_text(
+                    *[str(item.get("text", "")).strip() for item in raw_recent_rows],
+                    preview,
+                )
+                if short_recovery:
+                    payload["text"] = short_recovery
+                    return payload
+        tail_rows = _tail_cluster(inbound_items)
+        if tail_rows:
+            quote_payload = _extract_quote_payload(panel, tail_rows[-3:], preview)
+            if quote_payload.get("text"):
+                return quote_payload
+            lines = [
+                str(item.get("text", "")).strip()
+                for item in tail_rows[-3:]
+                if item.get("text")
+            ]
+            lines = _sanitize_inbound_lines(lines, preview)
+            if lines:
+                payload["text"] = "\n".join(lines)
+                return payload
+            short_recovery = _recover_short_inbound_text(
+                *[str(item.get("text", "")).strip() for item in tail_rows[-3:]],
+                preview,
+            )
+            if short_recovery:
+                payload["text"] = short_recovery
+                return payload
+    raw_tail_rows = _tail_cluster(raw_inbound_items)
+    if raw_tail_rows:
+        short_recovery = _recover_short_inbound_text(
+            *[str(item.get("text", "")).strip() for item in raw_tail_rows[-3:]],
+            preview,
+        )
+        if short_recovery:
+            payload["text"] = short_recovery
+            return payload
+    latest_inbound = str(panel.get("latestInbound") or "").strip()
+    if is_history_marker(latest_inbound):
+        latest_inbound = ""
+    cleaned_latest_inbound = _clean_multiline_latest_inbound(latest_inbound, preview)
+    if cleaned_latest_inbound:
+        latest_inbound = cleaned_latest_inbound
+    elif _is_likely_ocr_noise_line(latest_inbound):
+        latest_inbound = ""
+    if is_history_marker(preview):
+        preview = ""
+        preview_is_outbound = False
+    if preview_is_outbound:
+        preview = ""
+    if wechat_ui.is_nontext_message(preview):
+        payload["text"] = preview
+        return payload
+    short_recovery = _recover_short_inbound_text(latest_inbound, preview)
+    if short_recovery:
+        payload["text"] = short_recovery
+        return payload
+    if wechat_ui.has_meaningful_text(latest_inbound):
+        payload["text"] = latest_inbound
+        return payload
+    if wechat_ui.has_meaningful_text(preview):
+        payload["text"] = preview
+        return payload
+    payload["text"] = latest_inbound or preview
+    return payload
 
 
 def _text_matches_outbound(preview: str, latest_outbound: str) -> bool:
@@ -452,8 +670,11 @@ def _outbound_item_right_aligned(item: dict[str, Any] | None) -> bool:
     left = float(item.get("left", 0.0) or 0.0)
     width = float(item.get("width", 0.0) or 0.0)
     right = left + width
+    message_kind = str(item.get("messageKind", "text") or "text").strip().lower()
     green_pixels = int(item.get("greenPixels", 0) or 0)
     gray_pixels = int(item.get("grayPixels", 0) or 0)
+    if message_kind == "media":
+        return bool(left >= 0.58 or (left + width / 2.0) >= 0.68 or right >= 0.88)
     # Bubble color is the most direct signal in WeChat: green means self/outbound.
     if green_pixels >= 32 and green_pixels >= gray_pixels:
         return True
@@ -470,8 +691,12 @@ def _inbound_item_gray_confirmed(item: dict[str, Any] | None) -> bool:
     left = float(item.get("left", 0.0) or 0.0)
     width = float(item.get("width", 0.0) or 0.0)
     right = left + width
+    center = left + width / 2.0
+    message_kind = str(item.get("messageKind", "text") or "text").strip().lower()
     green_pixels = int(item.get("greenPixels", 0) or 0)
     gray_pixels = int(item.get("grayPixels", 0) or 0)
+    if message_kind == "media":
+        return bool(left <= 0.50 and center <= 0.56 and right <= 0.86)
     if gray_pixels >= 24 and gray_pixels >= max(green_pixels + 6, int(green_pixels * 1.15)):
         return True
     return bool(
@@ -515,108 +740,7 @@ def _manual_reply_signal_is_reliable(
 
 
 def choose_inbound_text(panel: dict[str, Any], fallback_preview: str = "") -> str:
-    preview = str(fallback_preview or "").strip()
-    latest_outbound = str(panel.get("latestOutbound") or "").strip()
-    preview_is_outbound = _text_matches_outbound(preview, latest_outbound)
-    inbound_items = _meaningful_inbound_items(panel)
-    raw_inbound_items = [
-        copy.deepcopy(item)
-        for item in list(panel.get("inbound") or [])
-        if str(item.get("text") or "").strip() and not is_history_marker(str(item.get("text") or "").strip())
-    ]
-    if inbound_items:
-        latest_outbound_top = max(
-            (
-                float(item.get("top", 0.0) or 0.0)
-                for item in list(panel.get("outbound") or [])
-                if str(item.get("text") or "").strip()
-            ),
-            default=None,
-        )
-        if latest_outbound_top is not None:
-            recent_rows = _tail_cluster(
-                [
-                    item
-                    for item in inbound_items
-                    if float(item.get("top", 0.0) or 0.0) > latest_outbound_top + 0.01
-                ]
-            )
-            if recent_rows:
-                lines = [
-                    str(item.get("text", "")).strip()
-                    for item in recent_rows
-                    if item.get("text")
-                ]
-                lines = _sanitize_inbound_lines(lines, preview)
-                if lines:
-                    return "\n".join(lines)
-                short_recovery = _recover_short_inbound_text(
-                    *[str(item.get("text", "")).strip() for item in recent_rows],
-                    preview,
-                )
-                if short_recovery:
-                    return short_recovery
-            raw_recent_rows = _tail_cluster(
-                [
-                    item
-                    for item in raw_inbound_items
-                    if float(item.get("top", 0.0) or 0.0) > latest_outbound_top + 0.01
-                ]
-            )
-            if raw_recent_rows:
-                short_recovery = _recover_short_inbound_text(
-                    *[str(item.get("text", "")).strip() for item in raw_recent_rows],
-                    preview,
-                )
-                if short_recovery:
-                    return short_recovery
-        tail_rows = _tail_cluster(inbound_items)
-        if tail_rows:
-            lines = [
-                str(item.get("text", "")).strip()
-                for item in tail_rows[-3:]
-                if item.get("text")
-            ]
-            lines = _sanitize_inbound_lines(lines, preview)
-            if lines:
-                return "\n".join(lines)
-            short_recovery = _recover_short_inbound_text(
-                *[str(item.get("text", "")).strip() for item in tail_rows[-3:]],
-                preview,
-            )
-            if short_recovery:
-                return short_recovery
-    raw_tail_rows = _tail_cluster(raw_inbound_items)
-    if raw_tail_rows:
-        short_recovery = _recover_short_inbound_text(
-            *[str(item.get("text", "")).strip() for item in raw_tail_rows[-3:]],
-            preview,
-        )
-        if short_recovery:
-            return short_recovery
-    latest_inbound = str(panel.get("latestInbound") or "").strip()
-    if is_history_marker(latest_inbound):
-        latest_inbound = ""
-    cleaned_latest_inbound = _clean_multiline_latest_inbound(latest_inbound, preview)
-    if cleaned_latest_inbound:
-        latest_inbound = cleaned_latest_inbound
-    elif _is_likely_ocr_noise_line(latest_inbound):
-        latest_inbound = ""
-    if is_history_marker(preview):
-        preview = ""
-        preview_is_outbound = False
-    if preview_is_outbound:
-        preview = ""
-    if wechat_ui.is_nontext_message(preview):
-        return preview
-    short_recovery = _recover_short_inbound_text(latest_inbound, preview)
-    if short_recovery:
-        return short_recovery
-    if wechat_ui.has_meaningful_text(latest_inbound):
-        return latest_inbound
-    if wechat_ui.has_meaningful_text(preview):
-        return preview
-    return latest_inbound or preview
+    return str(extract_inbound_payload(panel, fallback_preview).get("text") or "").strip()
 
 
 def _is_context_text_candidate(text: str) -> bool:
@@ -632,11 +756,33 @@ def _is_context_text_candidate(text: str) -> bool:
     return True
 
 
+def _matches_quoted_message(text: str, quoted_message: dict[str, str] | None) -> bool:
+    if not isinstance(quoted_message, dict):
+        return False
+    value = str(text or "").strip()
+    quoted_text = str(quoted_message.get("quoted_text") or "").strip()
+    if not value or not quoted_text:
+        return False
+    _, stripped = _strip_quote_sender_prefix(value)
+    candidates = [value]
+    if stripped and normalize_text(stripped) != normalize_text(value):
+        candidates.insert(0, stripped)
+    for candidate in candidates:
+        if (
+            normalize_text(candidate) == normalize_text(quoted_text)
+            or _messages_overlap(candidate, quoted_text)
+            or _message_similarity_score(candidate, quoted_text) >= 0.88
+        ):
+            return True
+    return False
+
+
 def build_reply_context(
     panel: dict[str, Any],
     inbound_text: str,
     *,
     max_messages: int = 8,
+    quoted_message: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     limit = max(0, int(max_messages))
     if limit <= 0:
@@ -649,6 +795,8 @@ def build_reply_context(
             continue
         text = str(item.get("text") or "").strip()
         if not _is_context_text_candidate(text):
+            continue
+        if _matches_quoted_message(text, quoted_message):
             continue
         timeline.append(
             {
@@ -1962,11 +2110,18 @@ class AutoReplyRunner:
                             else:
                                 self.append_event("claim_skipped", reason="latest_message_outbound", contact=contact)
                                 continue
+                    inbound_payload = {
+                        "text": inbound_text,
+                        "quoted_text": "",
+                        "quoted_role": "",
+                        "quoted_sender": "",
+                    }
                     if not inbound_text:
-                        inbound_text = choose_inbound_text(
+                        inbound_payload = extract_inbound_payload(
                             panel,
                             str(candidate.get("preview") or "") if allow_preview_fallback else "",
                         )
+                        inbound_text = str(inbound_payload.get("text") or "").strip()
                     empty_inbound_debug: dict[str, Any] = {}
                     if not inbound_text:
                         if candidate_source == "active_chat_fallback" and not panel_has_claim_signal(panel):
@@ -1990,10 +2145,11 @@ class AutoReplyRunner:
                             allow_retry_preview_fallback = (
                                 candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
                             )
-                            inbound_text = choose_inbound_text(
+                            inbound_payload = extract_inbound_payload(
                                 panel,
                                 str(live_visible.get("preview") or "") if allow_retry_preview_fallback else "",
                             )
+                            inbound_text = str(inbound_payload.get("text") or "").strip()
                             self.append_event(
                                 "claim_empty_inbound_reselect",
                                 contact=contact,
@@ -2089,11 +2245,21 @@ class AutoReplyRunner:
                                 contact=contact,
                             )
                             continue
+                    if str(inbound_payload.get("quoted_text") or "").strip():
+                        self.append_event(
+                            "claim_quote_detected",
+                            contact=contact,
+                            inbound_text=inbound_text,
+                            quoted_text=str(inbound_payload.get("quoted_text") or "").strip(),
+                            quoted_role=str(inbound_payload.get("quoted_role") or "").strip(),
+                            quoted_sender=str(inbound_payload.get("quoted_sender") or "").strip(),
+                        )
 
                     context_messages = build_reply_context(
                         panel,
                         inbound_text,
                         max_messages=int(config.get("reply_context_messages", 8)),
+                        quoted_message=inbound_payload,
                     )
                     message_time = str(candidate.get("time") or "")
                     inbound_fingerprint = fingerprint(contact, inbound_text, message_time)
@@ -2124,6 +2290,7 @@ class AutoReplyRunner:
                             message_time=message_time,
                             llm=llm,
                             context_messages=context_messages,
+                            inbound_payload=inbound_payload,
                         )
                         queue_fingerprints.discard(str(existing.get("inbound_fingerprint", "")))
                         queue_fingerprints.add(str(updated.get("inbound_fingerprint", "")))
@@ -2143,10 +2310,14 @@ class AutoReplyRunner:
                         conversation_context=context_messages,
                         contact_memory=contact_memory,
                         screenshot_path=_preferred_chat_screenshot(selected),
+                        quoted_message=inbound_payload,
                     )
                     pending = {
                         "contact": contact,
                         "inbound_text": inbound_text,
+                        "quoted_text": str(inbound_payload.get("quoted_text") or "").strip(),
+                        "quoted_role": str(inbound_payload.get("quoted_role") or "").strip(),
+                        "quoted_sender": str(inbound_payload.get("quoted_sender") or "").strip(),
                         "message_time": message_time,
                         "inbound_fingerprint": inbound_fingerprint,
                         "draft_text": draft_text,
@@ -2276,6 +2447,7 @@ class AutoReplyRunner:
         llm: Any | None = None,
         refresh_delay_seconds: float | None = None,
         context_messages: list[dict[str, str]] | None = None,
+        inbound_payload: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         existing = queue[pending_index]
         contact = str(existing.get("contact", "")).strip()
@@ -2286,6 +2458,7 @@ class AutoReplyRunner:
                 panel,
                 inbound_text,
                 max_messages=int(config.get("reply_context_messages", 8)),
+                quoted_message=inbound_payload,
             )
         contact_memory = self._load_contact_memory(config, contact)
         draft_text = client.generate_reply(
@@ -2294,6 +2467,7 @@ class AutoReplyRunner:
             conversation_context=context_messages,
             contact_memory=contact_memory,
             screenshot_path=_preferred_chat_screenshot(selected),
+            quoted_message=inbound_payload,
         )
         delay_seconds = float(
             refresh_delay_seconds
@@ -2304,6 +2478,9 @@ class AutoReplyRunner:
         updated.update(
             {
                 "inbound_text": inbound_text,
+                "quoted_text": str((inbound_payload or {}).get("quoted_text") or "").strip(),
+                "quoted_role": str((inbound_payload or {}).get("quoted_role") or "").strip(),
+                "quoted_sender": str((inbound_payload or {}).get("quoted_sender") or "").strip(),
                 "message_time": message_time,
                 "inbound_fingerprint": fingerprint(contact, inbound_text, message_time),
                 "draft_text": draft_text,
@@ -2324,6 +2501,8 @@ class AutoReplyRunner:
             contact=contact,
             previous_inbound=str(existing.get("inbound_text", "")),
             inbound_text=inbound_text,
+            quoted_text=str((inbound_payload or {}).get("quoted_text") or "").strip(),
+            quoted_role=str((inbound_payload or {}).get("quoted_role") or "").strip(),
             draft_text=draft_text,
             due_at=updated["due_at"],
             idle_seconds=round(idle_seconds, 2),
@@ -2475,7 +2654,8 @@ class AutoReplyRunner:
                 visible_preview = str(visible_value.get("preview") or "").strip()
                 if wechat_ui.is_nontext_message(visible_preview):
                     preview_value = visible_preview
-                raw_inbound_value = choose_inbound_text(panel_value, preview_value)
+                inbound_payload_value = extract_inbound_payload(panel_value, preview_value)
+                raw_inbound_value = str(inbound_payload_value.get("text") or "").strip()
                 inbound_value = raw_inbound_value
                 outbound_item_value = latest_committed_outbound_item(panel_value)
                 outbound_value = latest_committed_outbound(panel_value)
@@ -2493,6 +2673,7 @@ class AutoReplyRunner:
                     "panel": panel_value,
                     "raw_inbound": raw_inbound_value,
                     "inbound": inbound_value,
+                    "inbound_payload": inbound_payload_value,
                     "outbound_item": outbound_item_value,
                     "outbound": outbound_value,
                     "outbound_top": outbound_top_value,
@@ -2506,6 +2687,7 @@ class AutoReplyRunner:
             panel = snapshot["panel"]
             raw_current_inbound = str(snapshot["raw_inbound"] or "")
             current_inbound = str(snapshot["inbound"] or "")
+            current_inbound_payload = snapshot["inbound_payload"] if isinstance(snapshot.get("inbound_payload"), dict) else {}
             current_outbound_item = snapshot["outbound_item"] if isinstance(snapshot["outbound_item"], dict) else None
             current_outbound = str(snapshot["outbound"] or "")
             current_outbound_top = snapshot["outbound_top"]
@@ -2546,6 +2728,7 @@ class AutoReplyRunner:
                     panel = snapshot["panel"]
                     raw_current_inbound = str(snapshot["raw_inbound"] or "")
                     current_inbound = str(snapshot["inbound"] or "")
+                    current_inbound_payload = snapshot["inbound_payload"] if isinstance(snapshot.get("inbound_payload"), dict) else {}
                     current_outbound_item = (
                         snapshot["outbound_item"] if isinstance(snapshot["outbound_item"], dict) else None
                     )
@@ -2927,6 +3110,7 @@ class AutoReplyRunner:
                     reason="message_changed",
                     message_time=current_time,
                     refresh_delay_seconds=refresh_delay_seconds,
+                    inbound_payload=current_inbound_payload,
                 )
                 return {
                     "status": "pending_refreshed",

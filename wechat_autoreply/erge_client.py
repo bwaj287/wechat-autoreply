@@ -16,6 +16,7 @@ from .ollama_client import (
     _contains_emoji,
     _format_contact_memory_block,
     _format_context_block,
+    _format_quoted_message_block,
     _normalize_reply_text,
     _preferred_emoji_names,
     _same_language_hint,
@@ -76,6 +77,7 @@ class ErgeClient:
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
         contact_memory: dict[str, Any] | None = None,
+        quoted_message: dict[str, Any] | None = None,
     ) -> str:
         style_block = (
             f"{self.fallback_client.style_instructions}\n"
@@ -85,6 +87,7 @@ class ErgeClient:
         emoji_prompt_block = ""
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
+        quoted_block = _format_quoted_message_block(quoted_message)
         if self.fallback_client.emoji_enabled and self.fallback_client.emoji_codes:
             sampled = " ".join(self.fallback_client.emoji_codes[:20])
             emoji_prompt_block = (
@@ -108,6 +111,7 @@ class ErgeClient:
             f"{emoji_prompt_block}"
             f"{screenshot_hint}"
             "Focus on the latest incoming message and recent context.\n"
+            "If the latest message is replying to a quoted earlier line, respond mainly to the new reply and use the quote only as context.\n"
             "Keep it colloquial and human.\n"
             "Do not explain yourself.\n"
             "Do not use bullet points.\n"
@@ -117,6 +121,7 @@ class ErgeClient:
             f"Contact: {contact}\n"
             f"{memory_block}"
             f"{context_block}"
+            f"{quoted_block}"
             f"Latest incoming message: {inbound_text}\n\n"
             "Reply with the final WeChat message only."
         )
@@ -366,6 +371,7 @@ class ErgeClient:
         conversation_context: list[dict[str, str]] | None = None,
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
+        quoted_message: dict[str, Any] | None = None,
     ) -> str:
         if not self._erge_healthy():
             self.last_backend = "local_small"
@@ -376,9 +382,16 @@ class ErgeClient:
                 inbound_text,
                 conversation_context,
                 contact_memory=contact_memory,
+                quoted_message=quoted_message,
             )
 
-        prompt = self._build_prompt(contact, inbound_text, conversation_context, contact_memory)
+        prompt = self._build_prompt(
+            contact,
+            inbound_text,
+            conversation_context,
+            contact_memory,
+            quoted_message=quoted_message,
+        )
         user_content: str | list[dict[str, Any]]
         screenshot = Path(str(screenshot_path or "").strip())
         visual_path = self._build_visual_focus_image(screenshot, inbound_text)
@@ -422,4 +435,5 @@ class ErgeClient:
                 inbound_text,
                 conversation_context,
                 contact_memory=contact_memory,
+                quoted_message=quoted_message,
             )

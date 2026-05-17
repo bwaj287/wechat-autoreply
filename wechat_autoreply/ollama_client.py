@@ -158,6 +158,22 @@ def _format_contact_memory_block(contact_memory: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _format_quoted_message_block(quoted_message: dict[str, Any] | None) -> str:
+    if not isinstance(quoted_message, dict):
+        return ""
+    quoted_text = _clean_context_line(str(quoted_message.get("quoted_text", "")), max_chars=220)
+    if not quoted_text:
+        return ""
+    role = str(quoted_message.get("quoted_role", "")).strip().lower()
+    if role == "self":
+        label = "Quoted earlier message from you"
+    elif role == "contact":
+        label = "Quoted earlier message from them"
+    else:
+        label = "Quoted earlier message in this chat"
+    return f"{label}: {quoted_text}\n\n"
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -187,6 +203,7 @@ class OllamaClient:
         conversation_context: list[dict[str, str]] | None = None,
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
+        quoted_message: dict[str, Any] | None = None,
     ) -> str:
         del screenshot_path
         num_predict = max(12, min(48, self.max_reply_chars // 2))
@@ -194,6 +211,7 @@ class OllamaClient:
         emoji_prompt_block = ""
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
+        quoted_block = _format_quoted_message_block(quoted_message)
         if self.emoji_enabled and self.emoji_codes:
             sampled = " ".join(self.emoji_codes[:20])
             emoji_prompt_block = (
@@ -208,6 +226,7 @@ class OllamaClient:
             f"{style_block}"
             f"{emoji_prompt_block}"
             "Keep it colloquial and human.\n"
+            "If the latest message is replying to a quoted earlier line, respond mainly to the new reply and use the quote only as context.\n"
             "Do not explain yourself.\n"
             "Do not use bullet points.\n"
             "Do not use quotes around the reply.\n"
@@ -216,6 +235,7 @@ class OllamaClient:
             f"Contact: {contact}\n"
             f"{memory_block}"
             f"{context_block}"
+            f"{quoted_block}"
             f"Latest incoming message: {inbound_text}\n\n"
             "Reply:"
         )

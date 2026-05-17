@@ -138,6 +138,8 @@ def default_config() -> dict[str, Any]:
         "menubar_check_interval_seconds": 15,
         "capture_cleanup_interval_seconds": 3600,
         "capture_retention_days": 2,
+        "chat_panel_vote_frames": 3,
+        "chat_panel_vote_interval_seconds": 0.12,
         "preferred_roster_window_bounds": {},
         "passive_roster_sweep_enabled": False,
         "roster_sweep_interval_seconds": 60,
