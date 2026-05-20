@@ -82,6 +82,20 @@ Compatibility entrypoints:
 - `main.py` -> `apps.runner.cli`
 - `gateway_control.py` -> `apps.gateway.cli`
 
+## Runner Process Model
+
+The auto-reply daemon now runs as a single launchd-managed Python process.
+
+- launchd label: `ai.openclaw.wechat.autoreply.v1`
+- runtime process: `python /Users/shawnwang/Documents/Playground/main.py`
+- there is no longer a separate Terminal host loop that respawns the runner
+
+Notes:
+
+- the launch agent plist under `~/Library/LaunchAgents/` is machine-local and is not versioned in this repository
+- `gateway_control.py runner` reports the actual Python runner state
+- `gateway_control.py runner-start` asks launchd to bootstrap or kickstart the single runner process
+
 ## Prerequisites
 
 - macOS (Apple Silicon supported).
@@ -201,7 +215,7 @@ Supported commands:
 - `on` -> enable auto-reply runner.
 - `off` -> disable claim/send execution.
 - `status` -> show switch + recent trace lines.
-- `runner` -> show runner/host process health.
+- `runner` -> show auto-reply process health.
 - `runner-start` -> start runner immediately if offline.
 - `queue` -> show pending queue.
 - `since` -> show how many auto replies were sent since the last `since` check.
