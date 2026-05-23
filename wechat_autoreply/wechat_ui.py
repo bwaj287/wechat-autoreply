@@ -6,6 +6,7 @@ import re
 import tempfile
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from PIL import Image, ImageOps
 
 from .config_store import load_config, save_config
 from .ocr import ocr_image
-from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, WECHAT_APP
+from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, PEEKABOO, WECHAT_APP
 from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
 
 IGNORE_TEXTS = {
@@ -44,6 +45,10 @@ MESSAGE_BANNER_RE = re.compile(
 )
 SYSTEM_CALL_PREVIEW_RE = re.compile(
     r"(?i)^(?:video\s*call|voice\s*call|call\s*not\s*answered|already\s*answered\s*elsewhere|call\s*canceled\s*by\s*caller)$"
+)
+MEDIA_PLACEHOLDER_RE = re.compile(
+    r"(?i)(?:^\s*[\[\(（【<〈《]?\s*(?:photo|picture|image|pic|sticker|emoji|video|图片|照片|相片|截图|表情包|贴纸|视频)"
+    r"(?:[^\]\)）】>〉》]{0,12})?[\]\)）】>〉》]?\s*$)"
 )
 MIN_ROSTER_WINDOW_WIDTH = 720
 MIN_ROSTER_WINDOW_HEIGHT = 620
@@ -111,6 +116,17 @@ def is_nontext_message(text: str) -> bool:
     if BRACKETED_HINT_RE.fullmatch(value) and not has_text_signal(value):
         return True
     return bool(EMOJI_CHAR_RE.search(value))
+
+
+def is_media_message(text: str) -> bool:
+    value = (text or "").strip()
+    if not value or _looks_like_system_call_preview(value):
+        return False
+    if MEDIA_PLACEHOLDER_RE.search(value):
+        return True
+    if NON_TEXT_HINT_RE.search(value):
+        return True
+    return bool(BRACKETED_HINT_RE.fullmatch(value) and not has_text_signal(value))
 
 
 def has_meaningful_text(text: str) -> bool:
@@ -388,15 +404,30 @@ def _remember_roster_window_bounds(info: dict[str, Any]) -> None:
 
 
 def _focus_window(info: dict[str, Any]) -> None:
-    width = int(info.get("width", 0) or 0)
-    height = int(info.get("height", 0) or 0)
-    if width <= 0 or height <= 0:
+    window_id = int(info.get("window_id", 0) or 0)
+    if window_id <= 0:
         return
-    # Click near the title bar so the intended main window becomes frontmost.
-    x = int(info["x"] + min(max(72, int(width * 0.28)), max(80, width - 40)))
-    y = int(info["y"] + min(18, max(10, int(height * 0.05))))
-    click_coords(x, y)
-    time.sleep(0.2)
+    binary = str(PEEKABOO) if PEEKABOO.exists() else "peekaboo"
+    commands = [
+        [binary, "window", "focus", "--app", WECHAT_APP, "--window-id", str(window_id), "--json"],
+        [binary, "window", "focus", "--app", "Weixin", "--window-id", str(window_id), "--json"],
+    ]
+    errors: list[str] = []
+    for cmd in commands:
+        try:
+            run(cmd, timeout=30)
+            time.sleep(0.2)
+            return
+        except Exception as exc:  # pragma: no cover - exercised only on macOS host
+            errors.append(str(exc))
+    for app_name in (WECHAT_APP, "Weixin"):
+        try:
+            run(["osascript", "-e", f'tell application "{_escape_applescript_string(app_name)}" to activate'], timeout=30)
+            time.sleep(0.2)
+            return
+        except Exception as exc:  # pragma: no cover - exercised only on macOS host
+            errors.append(str(exc))
+    raise RuntimeError(" ; ".join(errors) or "failed to focus WeChat window")
 
 
 def _resize_frontmost_wechat_window(
@@ -1063,11 +1094,20 @@ def find_chat(chats: list[dict[str, Any]], target: str) -> dict[str, Any] | None
     return None
 
 
-def click_coords(x: int, y: int) -> None:
-    run_peekaboo_variants(
-        peekaboo_commands(["click", "--coords", f"{x},{y}", "--app", WECHAT_APP, "--json"]),
-        timeout=60,
-    )
+def click_coords(
+    x: int,
+    y: int,
+    *,
+    window_id: int | None = None,
+    auto_focus: bool = True,
+) -> None:
+    args = ["click", "--coords", f"{x},{y}", "--app", WECHAT_APP]
+    if window_id and int(window_id) > 0:
+        args.extend(["--window-id", str(int(window_id))])
+    if not auto_focus:
+        args.append("--no-auto-focus")
+    args.append("--json")
+    run_peekaboo_variants(peekaboo_commands(args), timeout=60)
 
 
 def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
@@ -1135,6 +1175,7 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "confidence": float(item.get("confidence", 0.0) or 0.0),
             "greenPixels": int(item.get("greenPixels", 0) or 0),
             "grayPixels": int(item.get("grayPixels", 0) or 0),
+            "messageKind": str(item.get("messageKind", "text") or "text"),
         }
         for item in items
     ]
@@ -1157,13 +1198,22 @@ def _collapse_panel_lines(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "greenPixels": int(sum(int(item.get("greenPixels", 0) or 0) for item in row_items)),
                 "grayPixels": int(sum(int(item.get("grayPixels", 0) or 0) for item in row_items)),
+                "messageKind": (
+                    "media"
+                    if any(str(item.get("messageKind", "text") or "text") == "media" for item in row_items)
+                    else "text"
+                ),
             }
         )
     collapsed.sort(key=lambda item: item["top"])
     return collapsed
 
 
-def _resolve_chat_bubble_role(
+def _message_kind_for_chat_text(text: str) -> str:
+    return "media" if is_media_message(text) else "text"
+
+
+def _resolve_text_bubble_role(
     *,
     bubble_role: str,
     left: float,
@@ -1175,41 +1225,87 @@ def _resolve_chat_bubble_role(
     role = str(bubble_role or "unknown").strip().lower()
     right = float(left) + float(width)
 
-    # Right-side bubbles are outbound even when color sampling is noisy in dark mode.
     if panel_kind == "roster":
         force_outbound_left = 0.63
         force_outbound_right = 0.82
         force_inbound_left = 0.50
         force_inbound_right = 0.72
         fallback_outbound_left = 0.58
-        fallback_outbound_right = 0.79
-        fallback_inbound_left = 0.30
+        fallback_outbound_right = 0.78
+        fallback_inbound_right = 0.70
     else:
         force_outbound_left = 0.57
         force_outbound_right = 0.78
         force_inbound_left = 0.43
         force_inbound_right = 0.68
         fallback_outbound_left = 0.52
-        fallback_outbound_right = 0.76
-        fallback_inbound_left = 0.08
+        fallback_outbound_right = 0.75
+        fallback_inbound_right = 0.66
 
     if role == "inbound" and (left >= force_outbound_left or right >= force_outbound_right):
-        role = "outbound"
+        return "unknown"
     elif role == "outbound" and left <= force_inbound_left and right <= force_inbound_right:
-        role = "inbound"
-
-    if role not in {"outbound", "inbound"}:
-        if green_pixels >= 28 and green_pixels >= gray_pixels:
-            return "outbound"
-        if gray_pixels >= 44 and gray_pixels > int(green_pixels * 1.2):
-            return "inbound"
-        if left >= fallback_outbound_left or right >= fallback_outbound_right:
-            return "outbound"
-        if left >= fallback_inbound_left:
-            return "inbound"
         return "unknown"
 
-    return role
+    if role in {"outbound", "inbound"}:
+        return role
+
+    if (
+        green_pixels >= 32
+        and green_pixels >= max(gray_pixels + 6, int(gray_pixels * 1.15))
+        and (left >= fallback_outbound_left or right >= fallback_outbound_right)
+    ):
+        return "outbound"
+    if (
+        gray_pixels >= 48
+        and gray_pixels >= max(green_pixels + 10, int(green_pixels * 1.35))
+        and right <= fallback_inbound_right
+    ):
+        return "inbound"
+    return "unknown"
+
+
+def _resolve_media_bubble_role(*, left: float, width: float, panel_kind: str) -> str:
+    right = float(left) + float(width)
+    center = float(left) + (float(width) / 2.0)
+    if panel_kind == "roster":
+        outbound_left = 0.64
+        outbound_center = 0.72
+        inbound_left = 0.56
+        inbound_center = 0.61
+    else:
+        outbound_left = 0.58
+        outbound_center = 0.68
+        inbound_left = 0.48
+        inbound_center = 0.54
+    if left >= outbound_left or center >= outbound_center:
+        return "outbound"
+    if left <= inbound_left and center <= inbound_center and right <= 0.86:
+        return "inbound"
+    return "unknown"
+
+
+def _resolve_chat_item_role(
+    *,
+    text: str,
+    bubble_role: str,
+    left: float,
+    width: float,
+    green_pixels: int,
+    gray_pixels: int,
+    panel_kind: str,
+) -> str:
+    message_kind = _message_kind_for_chat_text(text)
+    if message_kind == "media":
+        return _resolve_media_bubble_role(left=left, width=width, panel_kind=panel_kind)
+    return _resolve_text_bubble_role(
+        bubble_role=bubble_role,
+        left=left,
+        width=width,
+        green_pixels=green_pixels,
+        gray_pixels=gray_pixels,
+        panel_kind=panel_kind,
+    )
 
 
 def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
@@ -1241,8 +1337,10 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
             "greenPixels": int(obs.get("greenPixels", 0) or 0),
             "grayPixels": int(obs.get("grayPixels", 0) or 0),
+            "messageKind": _message_kind_for_chat_text(text),
         }
-        bubble_role = _resolve_chat_bubble_role(
+        bubble_role = _resolve_chat_item_role(
+            text=text,
             bubble_role=str(obs.get("bubbleRole", "unknown")),
             left=float(left),
             width=float(width),
@@ -1298,8 +1396,10 @@ def _extract_chat_window_panel(obs_list: list[dict[str, Any]], selected_title: s
             "bubbleRole": str(obs.get("bubbleRole", "unknown")),
             "greenPixels": int(obs.get("greenPixels", 0) or 0),
             "grayPixels": int(obs.get("grayPixels", 0) or 0),
+            "messageKind": _message_kind_for_chat_text(text),
         }
-        bubble_role = _resolve_chat_bubble_role(
+        bubble_role = _resolve_chat_item_role(
+            text=text,
             bubble_role=str(obs.get("bubbleRole", "unknown")),
             left=float(left),
             width=float(width),
@@ -1337,6 +1437,117 @@ def _panel_has_content(panel: dict[str, Any]) -> bool:
     )
 
 
+def _panel_vote_settings() -> tuple[int, float]:
+    try:
+        config = load_config()
+    except Exception:
+        return (3, 0.12)
+    frame_count = max(1, min(3, int(config.get("chat_panel_vote_frames", 3) or 3)))
+    interval = max(0.0, min(0.4, float(config.get("chat_panel_vote_interval_seconds", 0.12) or 0.12)))
+    return frame_count, interval
+
+
+def _panel_frame_score(panel: dict[str, Any]) -> float:
+    inbound = len(list(panel.get("inbound") or []))
+    outbound = len(list(panel.get("outbound") or []))
+    misc = len(list(panel.get("misc") or []))
+    return float(inbound * 2 + outbound * 2 + misc)
+
+
+def _vote_panel_text(values: list[str]) -> str:
+    cleaned = [str(value or "").strip() for value in values if str(value or "").strip()]
+    if not cleaned:
+        return ""
+    buckets: dict[str, list[str]] = {}
+    for value in cleaned:
+        buckets.setdefault(normalize_text(value), []).append(value)
+    winner_key, winner_values = max(
+        buckets.items(),
+        key=lambda item: (len(item[1]), max(len(v) for v in item[1]), item[1][-1]),
+    )
+    del winner_key
+    return max(winner_values, key=len)
+
+
+def _vote_panel_side_items(
+    frames: list[dict[str, Any]],
+    side: str,
+    anchor_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not frames:
+        return list(anchor_items or [])
+    counts: Counter[tuple[str, int, int, str]] = Counter()
+    exemplars: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for frame in frames:
+        items = list((frame.get("panel") or {}).get(side) or [])
+        for item in items:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            signature = (
+                normalize_text(text),
+                int(round(float(item.get("top", 0.0) or 0.0) / 0.03)),
+                int(round(float(item.get("left", 0.0) or 0.0) / 0.05)),
+                str(item.get("messageKind", "text") or "text"),
+            )
+            counts[signature] += 1
+            existing = exemplars.get(signature)
+            current_conf = float(item.get("confidence", 0.0) or 0.0)
+            if existing is None or current_conf > float(existing.get("confidence", 0.0) or 0.0) or (
+                current_conf >= float(existing.get("confidence", 0.0) or 0.0) - 0.02
+                and len(text) > len(str(existing.get("text") or ""))
+            ):
+                exemplars[signature] = dict(item)
+    if not counts:
+        return list(anchor_items or [])
+    min_votes = 2 if len(frames) >= 2 else 1
+    kept = [
+        dict(exemplars[key])
+        for key, count in counts.items()
+        if count >= min_votes and key in exemplars
+    ]
+    if not kept:
+        return list(anchor_items or [])
+    kept.sort(key=lambda item: float(item.get("top", 0.0) or 0.0))
+    return kept
+
+
+def _vote_panel_frames(frames: list[dict[str, Any]], fallback_title: str = "") -> dict[str, Any]:
+    if not frames:
+        return {"panel": {}, "title": fallback_title, "path": ""}
+    voted_title = _vote_panel_text([str(frame.get("title") or "") for frame in frames]) or str(fallback_title or "")
+    def _frame_rank(index_frame: tuple[int, dict[str, Any]]) -> tuple[float, int]:
+        index, frame = index_frame
+        panel = frame.get("panel") or {}
+        score = _panel_frame_score(panel)
+        if normalize_text(str(frame.get("title") or "")) == normalize_text(voted_title):
+            score += 1.5
+        if str(panel.get("latestInbound") or "").strip():
+            score += 0.5
+        if str(panel.get("latestOutbound") or "").strip():
+            score += 0.5
+        return (score, -index)
+    anchor = max(enumerate(frames), key=_frame_rank)[1]
+    anchor_panel = dict(anchor.get("panel") or {})
+    inbound = _vote_panel_side_items(frames, "inbound", list(anchor_panel.get("inbound") or []))
+    outbound = _vote_panel_side_items(frames, "outbound", list(anchor_panel.get("outbound") or []))
+    misc = _vote_panel_side_items(frames, "misc", list(anchor_panel.get("misc") or []))
+    panel = {
+        "title": voted_title or str(anchor_panel.get("title") or ""),
+        "latestInbound": inbound[-1].get("text", "") if inbound else "",
+        "latestOutbound": outbound[-1].get("text", "") if outbound else "",
+        "inbound": inbound,
+        "outbound": outbound,
+        "misc": misc,
+    }
+    return {
+        "panel": panel,
+        "title": panel["title"],
+        "path": str(anchor.get("path") or ""),
+        "frameCount": len(frames),
+    }
+
+
 def probe(
     select_chat: str | None = None,
     sleep_after_click: float = 1.0,
@@ -1371,6 +1582,10 @@ def probe(
             click_x = int(click_hint.get("x", 0) or 0)
             click_y = int(click_hint.get("y", 0) or 0)
             use_click_hint = click_x > 0 and click_y > 0
+            # Always prefer a fresh click target from the current roster snapshot.
+            # Stale coordinates from an older probe can drift into the search-row
+            # action area (such as the "+" quick-actions button) after window
+            # focus/resize/list movement.
             if not match and not use_click_hint:
                 return {
                     "status": "chat_not_visible",
@@ -1379,12 +1594,23 @@ def probe(
                     "screenshot": str(roster_path),
                     "visibleChats": chats,
                 }
-            if use_click_hint:
-                click_coords(click_x, click_y)
-                selected_chat = select_chat
-            else:
-                click_coords(match["click"]["x"], match["click"]["y"])
+            current_window_id = int(roster_info.get("window_id", 0) or 0)
+            if match:
+                click_coords(
+                    match["click"]["x"],
+                    match["click"]["y"],
+                    window_id=current_window_id,
+                    auto_focus=False,
+                )
                 selected_chat = match["name"]
+            else:
+                click_coords(
+                    click_x,
+                    click_y,
+                    window_id=current_window_id,
+                    auto_focus=False,
+                )
+                selected_chat = select_chat
             time.sleep(max(sleep_after_click, 0.2))
             roster_info = ensure_main_roster_window()
             capture_window(roster_path, roster_info)
@@ -1398,22 +1624,73 @@ def probe(
     windows = list_wechat_windows()
     chat_window = choose_chat_window(windows)
     fallback_title = selected_chat or _pick_selected_title(roster_obs)
+    panel_vote_frames, panel_vote_interval = _panel_vote_settings()
     if chat_window:
-        chat_path = CAPTURE_DIR / f"wechat-chat-{timestamp}.png"
-        capture_window(chat_path, chat_window)
-        chat_obs = _prepare_ocr_items(chat_path)
-        title = _pick_chat_window_title(chat_obs)
-        panel = _extract_chat_window_panel(chat_obs, selected_title=title)
+        chat_frames: list[dict[str, Any]] = []
+        for index in range(panel_vote_frames):
+            chat_path = CAPTURE_DIR / f"wechat-chat-{timestamp}-{index}.png"
+            capture_window(chat_path, chat_window)
+            chat_obs = _prepare_ocr_items(chat_path)
+            title = _pick_chat_window_title(chat_obs)
+            panel = _extract_chat_window_panel(chat_obs, selected_title=title)
+            chat_frames.append({"panel": panel, "title": title, "path": str(chat_path)})
+            if index + 1 < panel_vote_frames and panel_vote_interval > 0:
+                time.sleep(panel_vote_interval)
+        voted = _vote_panel_frames(chat_frames, fallback_title=fallback_title)
+        voted_path = str(voted.get("path") or chat_frames[-1].get("path") or "").strip()
+        chat_path = Path(voted_path) if voted_path else None
+        panel = voted.get("panel") or {}
         if not _panel_has_content(panel):
             title = fallback_title
-            panel = _extract_chat_panel(roster_obs, selected_title=title)
+            roster_frames: list[dict[str, Any]] = [
+                {
+                    "panel": _extract_chat_panel(roster_obs, selected_title=title),
+                    "title": title,
+                    "path": str(roster_path),
+                }
+            ]
+            for index in range(1, panel_vote_frames):
+                capture_window(roster_path, roster_info)
+                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+                frame_title = _pick_selected_title(roster_obs) or title
+                roster_frames.append(
+                    {
+                        "panel": _extract_chat_panel(roster_obs, selected_title=frame_title),
+                        "title": frame_title,
+                        "path": str(roster_path),
+                    }
+                )
+                if index + 1 < panel_vote_frames and panel_vote_interval > 0:
+                    time.sleep(panel_vote_interval)
+            panel = (_vote_panel_frames(roster_frames, fallback_title=title).get("panel") or {})
             chat_path = roster_path
             # Chat subwindow capture is empty or stale; force downstream typing to use
             # the main roster window input coordinates.
             chat_window = None
     else:
+        roster_frames = [
+            {
+                "panel": _extract_chat_panel(roster_obs, selected_title=fallback_title),
+                "title": fallback_title,
+                "path": str(roster_path),
+            }
+        ]
+        for index in range(1, panel_vote_frames):
+            capture_window(roster_path, roster_info)
+            roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+            frame_title = _pick_selected_title(roster_obs) or fallback_title
+            roster_frames.append(
+                {
+                    "panel": _extract_chat_panel(roster_obs, selected_title=frame_title),
+                    "title": frame_title,
+                    "path": str(roster_path),
+                }
+            )
+            if index + 1 < panel_vote_frames and panel_vote_interval > 0:
+                time.sleep(panel_vote_interval)
+        voted = _vote_panel_frames(roster_frames, fallback_title=fallback_title)
         chat_path = None
-        panel = _extract_chat_panel(roster_obs, selected_title=fallback_title)
+        panel = voted.get("panel") or {}
 
     active_chat = (
         _sanitize_chat_title_text((chat_window or {}).get("title"))

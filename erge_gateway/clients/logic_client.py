@@ -92,6 +92,7 @@ class LogicClient:
     def probe_primary(self) -> LogicHealth:
         if self._is_game_mode_locked():
             return LogicHealth(status="down", latency_ms=None, reason="pc_game_mode")
+        started = time.perf_counter()
         try:
             tags = requests.get(
                 f"{self.settings.health_pc_base_url}/api/tags",
@@ -103,32 +104,10 @@ class LogicClient:
                 return LogicHealth(status="down", latency_ms=None, reason="pc_model_missing")
         except Exception:
             return LogicHealth(status="down", latency_ms=None, reason="pc_unreachable")
-
-        started = time.perf_counter()
-        try:
-            response = requests.post(
-                f"{self.settings.health_pc_base_url}/api/generate",
-                json={
-                    "model": self.settings.health_pc_model,
-                    "prompt": "ping",
-                    "stream": False,
-                    "think": False,
-                    "options": {"num_predict": 8, "temperature": 0},
-                },
-                timeout=self.settings.probe_timeout_seconds,
-            )
-            response.raise_for_status()
-        except requests.Timeout:
-            return LogicHealth(status="down", latency_ms=int((time.perf_counter() - started) * 1000), reason="pc_timeout")
-        except Exception:
-            return LogicHealth(status="down", latency_ms=int((time.perf_counter() - started) * 1000), reason="pc_infer_failed")
-
         latency_ms = int((time.perf_counter() - started) * 1000)
-        if latency_ms > int(self.settings.probe_timeout_seconds * 1000):
-            return LogicHealth(status="down", latency_ms=latency_ms, reason="pc_timeout")
         if latency_ms > int(self.settings.busy_threshold_seconds * 1000):
-            return LogicHealth(status="degraded", latency_ms=latency_ms, reason="pc_slow")
-        return LogicHealth(status="healthy", latency_ms=latency_ms, reason="pc_healthy")
+            return LogicHealth(status="healthy", latency_ms=latency_ms, reason="pc_model_ready_slow")
+        return LogicHealth(status="healthy", latency_ms=latency_ms, reason="pc_model_ready")
 
     def _primary_chat(self, messages: list[dict[str, str]]) -> LogicResult:
         response = requests.post(

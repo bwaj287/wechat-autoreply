@@ -63,14 +63,8 @@ RUNNER_PATTERNS = (
     str(PROJECT_ROOT / "apps" / "runner" / "cli.py"),
 )
 
-HOST_PATTERNS = (
-    "wechat-autoreply-v1-terminal-host.sh",
-    "ensure-wechat-autoreply-v1-host.sh",
-)
-
 LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v1"
 LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v1.plist")
-HOST_ENSURE_SCRIPT = Path("/Users/shawnwang/.openclaw/workspace/scripts/ensure-wechat-autoreply-v1-host.sh")
 
 
 def parse_args() -> argparse.Namespace:
@@ -312,12 +306,9 @@ def _launch_agent_loaded() -> bool:
 
 def _runner_snapshot() -> dict[str, Any]:
     runner_lines = _collect_process_lines(RUNNER_PATTERNS)
-    host_lines = _collect_process_lines(HOST_PATTERNS)
     return {
         "runner_online": bool(runner_lines),
         "runner_pids": _extract_pids(runner_lines),
-        "host_online": bool(host_lines),
-        "host_pids": _extract_pids(host_lines),
         "launch_agent_loaded": _launch_agent_loaded(),
     }
 
@@ -326,9 +317,6 @@ def _runner_brief(snapshot: dict[str, Any]) -> str:
     if snapshot["runner_online"]:
         pids = ",".join(snapshot["runner_pids"]) if snapshot["runner_pids"] else "?"
         return f"Runner：在线（pid {pids}）"
-    if snapshot["host_online"]:
-        pids = ",".join(snapshot["host_pids"]) if snapshot["host_pids"] else "?"
-        return f"Runner：离线（Host 在线 pid {pids}）"
     return "Runner：离线"
 
 
@@ -353,19 +341,6 @@ def ensure_runner_started() -> tuple[dict[str, Any], list[str]]:
         actions.append("launchctl_kickstart_ok" if kick.returncode == 0 else f"launchctl_kickstart_rc{kick.returncode}")
     else:
         actions.append("launch_plist_missing")
-
-    interim = _runner_snapshot()
-    if not interim["runner_online"]:
-        if HOST_ENSURE_SCRIPT.exists():
-            host = subprocess.run(
-                ["/bin/zsh", str(HOST_ENSURE_SCRIPT)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            actions.append("host_ensure_ok" if host.returncode == 0 else f"host_ensure_rc{host.returncode}")
-        else:
-            actions.append("host_ensure_missing")
 
     time.sleep(1.0)
     return _runner_snapshot(), actions
@@ -423,8 +398,6 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     lines.append(f"- enabled: {bool(config.get('enabled'))}")
     lines.append(f"- runner_online: {runner['runner_online']}")
     lines.append(f"- runner_pids: {','.join(runner['runner_pids']) if runner['runner_pids'] else '-'}")
-    lines.append(f"- host_online: {runner['host_online']}")
-    lines.append(f"- host_pids: {','.join(runner['host_pids']) if runner['host_pids'] else '-'}")
     lines.append(f"- launch_agent_loaded: {runner['launch_agent_loaded']}")
     lines.append(f"- queue_length: {len(queue)}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
@@ -532,8 +505,6 @@ def runner_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     lines = [status_line(config, len(queue)), "Runner 状态："]
     lines.append(f"- runner_online: {snapshot['runner_online']}")
     lines.append(f"- runner_pids: {','.join(snapshot['runner_pids']) if snapshot['runner_pids'] else '-'}")
-    lines.append(f"- host_online: {snapshot['host_online']}")
-    lines.append(f"- host_pids: {','.join(snapshot['host_pids']) if snapshot['host_pids'] else '-'}")
     lines.append(f"- launch_agent_loaded: {snapshot['launch_agent_loaded']}")
     lines.append(f"- enabled_switch: {bool(config.get('enabled'))}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
@@ -556,13 +527,12 @@ def runner_start_output(
         lines.append("- action: skipped")
     else:
         lines.append("- before: offline")
-        lines.append(f"- action: {', '.join(actions) if actions else 'none'}")
+    lines.append(f"- action: {', '.join(actions) if actions else 'none'}")
     lines.append(f"- runner_online: {after['runner_online']}")
     lines.append(f"- runner_pids: {','.join(after['runner_pids']) if after['runner_pids'] else '-'}")
-    lines.append(f"- host_online: {after['host_online']}")
     lines.append(f"- launch_agent_loaded: {after['launch_agent_loaded']}")
     if not after["runner_online"]:
-        lines.append("建议：执行 restart；若仍失败，检查 launchd/Terminal 权限")
+        lines.append("建议：执行 restart；若仍失败，检查 launchd 权限")
     return "\n".join(lines)
 
 
@@ -575,7 +545,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- on：开启自动回复",
         "- off：关闭自动回复",
         "- status：查看开关状态 + 最近关键记录",
-        "- runner：查看 runner/host 进程状态",
+        "- runner：查看自动回复进程状态",
         "- runner-start：拉起 runner（离线时）",
         "- queue：查看待发送队列",
         "- since：查看自上次 since 查询以来自动发送了多少条",
