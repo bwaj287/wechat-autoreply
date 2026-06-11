@@ -58,6 +58,24 @@ TARGET_ROSTER_WINDOW_WIDTH = 980
 TARGET_ROSTER_WINDOW_HEIGHT = 820
 
 
+def _load_first_json_object(raw: str) -> dict[str, Any]:
+    text = str(raw or "").lstrip()
+    if not text:
+        raise ValueError("empty JSON output")
+
+    decoder = json.JSONDecoder()
+    payload, cursor = decoder.raw_decode(text)
+    if not isinstance(payload, dict):
+        raise ValueError("expected JSON object output")
+
+    # Peekaboo's bridge can occasionally append a second valid JSON response.
+    # Validate any trailing documents, but use the first command response.
+    while text[cursor:].strip():
+        cursor += len(text[cursor:]) - len(text[cursor:].lstrip())
+        _, cursor = decoder.raw_decode(text, cursor)
+    return payload
+
+
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
@@ -322,7 +340,7 @@ def _write_clipboard_text(text: str) -> None:
 
 
 def list_wechat_windows() -> list[dict[str, Any]]:
-    payload = json.loads(
+    payload = _load_first_json_object(
         run_peekaboo_variants(
             peekaboo_commands(["list", "windows", "--app", WECHAT_APP, "--json"]),
             timeout=120,
@@ -1243,6 +1261,8 @@ def _resolve_text_bubble_role(
         fallback_inbound_right = 0.66
 
     if role == "inbound" and (left >= force_outbound_left or right >= force_outbound_right):
+        if panel_kind != "roster":
+            return "outbound"
         return "unknown"
     elif role == "outbound" and left <= force_inbound_left and right <= force_inbound_right:
         return "unknown"
@@ -1346,7 +1366,7 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
             width=float(width),
             green_pixels=int(obs.get("greenPixels", 0) or 0),
             gray_pixels=int(obs.get("grayPixels", 0) or 0),
-            panel_kind="roster",
+            panel_kind="chat",
         )
         if bubble_role == "outbound":
             outbound_raw.append(bucket)

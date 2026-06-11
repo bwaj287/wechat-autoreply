@@ -57,6 +57,8 @@ MEDIA_PREVIEW_PREFIX_RE = re.compile(
     r"(?:[^\]\)）】>〉》］]{0,12})?[\]\)）】>〉》］]"
 )
 MAX_INTERNAL_UI_SUPPRESSION_SECONDS = 0.45
+RECENT_AUTO_OUTBOUND_LIMIT = 8
+RECENT_AUTO_OUTBOUND_TTL_SECONDS = 6 * 60 * 60
 
 
 def normalize_text(text: str) -> str:
@@ -463,6 +465,8 @@ def _recover_short_inbound_text(*values: str) -> str:
         if re.fullmatch(r"[A-Za-z]", compact):
             return compact
         if compact and len(compact) <= 2:
+            if re.search(r"[\u4e00-\u9fffA-Za-z]", compact):
+                return value
             return "[收到一条超短消息]"
     return ""
 
@@ -702,6 +706,180 @@ def _draft_match_mode(draft_text: str, outbound_text: str) -> str:
     if similarity >= 0.82:
         return "canonical_charbag"
     return ""
+
+
+def _auto_outbound_echo_match_mode(candidate_text: str, reference_text: str) -> str:
+    candidate = str(candidate_text or "").strip()
+    reference = str(reference_text or "").strip()
+    if not candidate or not reference:
+        return ""
+    candidate_canonical = _canonical_reply_text(candidate)
+    reference_canonical = _canonical_reply_text(reference)
+    if not candidate_canonical or not reference_canonical:
+        return ""
+    if candidate_canonical == reference_canonical:
+        return "canonical_exact"
+    if (
+        4 <= len(candidate_canonical) <= 16
+        and len(reference_canonical) > len(candidate_canonical)
+        and reference_canonical.endswith(candidate_canonical)
+    ):
+        return "tail_fragment"
+    if (
+        len(candidate_canonical) >= 6
+        and len(reference_canonical) > len(candidate_canonical)
+        and reference_canonical.startswith(candidate_canonical)
+    ):
+        return "head_fragment"
+    if (
+        min(len(candidate_canonical), len(reference_canonical)) >= 6
+        and (
+            candidate_canonical in reference_canonical
+            or reference_canonical in candidate_canonical
+        )
+    ):
+        return "canonical_substring"
+    if min(len(candidate_canonical), len(reference_canonical)) >= 8:
+        similarity = _message_similarity_score(candidate, reference)
+        if similarity >= 0.88:
+            return "similarity"
+    return ""
+
+
+def _recent_auto_outbound_ttl(config: dict[str, Any]) -> float:
+    try:
+        value = float(config.get("recent_auto_outbound_ttl_seconds", RECENT_AUTO_OUTBOUND_TTL_SECONDS))
+    except Exception:
+        value = RECENT_AUTO_OUTBOUND_TTL_SECONDS
+    return max(0.0, value)
+
+
+def _recent_auto_outbounds_bucket(state: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    bucket = state.get("recent_auto_outbounds")
+    if not isinstance(bucket, dict):
+        bucket = {}
+        state["recent_auto_outbounds"] = bucket
+    return bucket
+
+
+def _prune_recent_auto_outbounds(
+    state: dict[str, Any],
+    *,
+    now: float,
+    ttl_seconds: float,
+    limit: int = RECENT_AUTO_OUTBOUND_LIMIT,
+) -> None:
+    bucket = _recent_auto_outbounds_bucket(state)
+    if ttl_seconds <= 0:
+        bucket.clear()
+        return
+    for contact_key in list(bucket.keys()):
+        raw_entries = bucket.get(contact_key)
+        if not isinstance(raw_entries, list):
+            bucket.pop(contact_key, None)
+            continue
+        kept: list[dict[str, Any]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            text = str(raw_entry.get("text") or "").strip()
+            if not text:
+                continue
+            ts = float(raw_entry.get("ts", 0.0) or 0.0)
+            if ts > 0 and now - ts > ttl_seconds:
+                continue
+            kept.append(
+                {
+                    "text": text,
+                    "ts": ts,
+                    "source": str(raw_entry.get("source") or "").strip(),
+                }
+            )
+        if kept:
+            bucket[contact_key] = kept[-limit:]
+        else:
+            bucket.pop(contact_key, None)
+
+
+def _recent_auto_outbound_entries(
+    state: dict[str, Any],
+    contact: str,
+    *,
+    now: float,
+    ttl_seconds: float,
+) -> list[dict[str, Any]]:
+    _prune_recent_auto_outbounds(state, now=now, ttl_seconds=ttl_seconds)
+    bucket = _recent_auto_outbounds_bucket(state)
+    contact_value = str(contact or "").strip()
+    entries = list(bucket.get(contact_value) or [])
+    if entries:
+        return entries
+    for key, value in bucket.items():
+        if wechat_ui.names_match(str(key), contact_value):
+            return list(value or [])
+    return []
+
+
+def _remember_recent_auto_outbound(
+    state: dict[str, Any],
+    contact: str,
+    text: str,
+    *,
+    now: float,
+    source: str,
+    ttl_seconds: float,
+    limit: int = RECENT_AUTO_OUTBOUND_LIMIT,
+) -> dict[str, Any]:
+    value = str(text or "").strip()
+    contact_value = str(contact or "").strip()
+    if not contact_value or not wechat_ui.has_meaningful_text(value):
+        return {}
+    _prune_recent_auto_outbounds(state, now=now, ttl_seconds=ttl_seconds, limit=limit)
+    bucket = _recent_auto_outbounds_bucket(state)
+    entries = list(bucket.get(contact_value) or [])
+    normalized_value = normalize_text(value)
+    entries = [entry for entry in entries if normalize_text(str(entry.get("text") or "")) != normalized_value]
+    entry = {"text": value, "ts": now, "source": str(source or "").strip()}
+    entries.append(entry)
+    bucket[contact_value] = entries[-limit:]
+    return entry
+
+
+def _match_recent_auto_outbound(
+    state: dict[str, Any],
+    contact: str,
+    text: str,
+    *,
+    now: float,
+    ttl_seconds: float,
+    extra_texts: list[str] | None = None,
+) -> dict[str, Any]:
+    value = str(text or "").strip()
+    if not value:
+        return {}
+    entries = _recent_auto_outbound_entries(state, contact, now=now, ttl_seconds=ttl_seconds)
+    for extra_text in list(extra_texts or []):
+        extra_value = str(extra_text or "").strip()
+        if extra_value:
+            entries.append({"text": extra_value, "ts": now, "source": "current_pending_draft"})
+    seen: set[str] = set()
+    for entry in reversed(entries):
+        reference = str(entry.get("text") or "").strip()
+        key = normalize_text(reference)
+        if not reference or key in seen:
+            continue
+        seen.add(key)
+        match_mode = _auto_outbound_echo_match_mode(value, reference)
+        if not match_mode:
+            continue
+        ts = float(entry.get("ts", 0.0) or 0.0)
+        return {
+            "match_mode": match_mode,
+            "source": str(entry.get("source") or "").strip(),
+            "age_seconds": round(max(0.0, now - ts), 2) if ts else None,
+            "reference_text": reference,
+        }
+    return {}
 
 
 def _line_matches_outbound_contamination(line: str, references: list[str]) -> bool:
@@ -1713,6 +1891,8 @@ class AutoReplyRunner:
         state = self.load_state()
         state["last_run_at"] = utc_now_iso()
         now = float(self.now())
+        recent_outbound_ttl = _recent_auto_outbound_ttl(config)
+        _prune_recent_auto_outbounds(state, now=now, ttl_seconds=recent_outbound_ttl)
         result: dict[str, Any]
 
         try:
@@ -1815,10 +1995,30 @@ class AutoReplyRunner:
                 menu_checked_now = True
             current_menu_signal = str(state.get("last_menu_signal") or "")
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
+            previous_claim_signal = str(state.get("last_claim_menu_signal") or "")
+            menu_signal_rising = False
+            if is_actionable_menu_signal(previous_claim_signal) and actionable_menu_signal:
+                menu_signal_rising = int(current_menu_signal) > int(previous_claim_signal)
+            elif actionable_menu_signal and not previous_claim_signal:
+                menu_signal_rising = True
+            roster_sweep_interval = float(config.get("roster_sweep_interval_seconds", 60) or 60)
+            roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= roster_sweep_interval
+            pending_claim_allowed = bool(
+                not queue
+                or bool(config.get("sweep_while_pending", False))
+                or (queue and now >= float(queue[0].get("due_at", 0.0) or 0.0))
+                or menu_signal_rising
+            )
+            claim_signal_allowed = bool(
+                menu_signal_rising
+                or roster_sweep_due
+                or bool(state.get("claim_retry_pending", False))
+            )
             should_sweep = (
                 idle_seconds >= idle_threshold
+                and pending_claim_allowed
                 and (
-                    (actionable_menu_signal and menu_checked_now)
+                    (actionable_menu_signal and (menu_checked_now or roster_sweep_due) and claim_signal_allowed)
                     or bool(state.get("claim_retry_pending", False))
                 )
             )
@@ -1834,7 +2034,7 @@ class AutoReplyRunner:
                 )
                 queue = sync_pending_state(state)
 
-            if claim_result and claim_result.get("status") in {"draft_saved", "drafts_saved"}:
+            if claim_result and claim_result.get("status") in {"draft_saved", "drafts_saved"} and not had_queue:
                 result = claim_result
             elif queue:
                 result = self._handle_pending(config, state, queue[0], idle_seconds, now)
@@ -2079,6 +2279,21 @@ class AutoReplyRunner:
                 queue_contacts=queued_contacts(queue),
             )
             if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
+                preview_fallback = choose_whitelist_preview_fallback_candidate(
+                    probe_result,
+                    allowed_contacts,
+                    queue=queue,
+                    last_seen_inbound=dict(state.get("last_seen_inbound") or {}),
+                )
+                if preview_fallback:
+                    candidates = [preview_fallback]
+                    self.append_event(
+                        "claim_preview_fallback_candidate",
+                        contact=candidate_contact_name(preview_fallback),
+                        preview_text=str(preview_fallback.get("preview") or ""),
+                        queue_contacts=queued_contacts(queue),
+                    )
+            if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
                 active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
                 if active_fallback:
                     candidates = [active_fallback]
@@ -2131,6 +2346,7 @@ class AutoReplyRunner:
             abort_result: dict[str, Any] | None = None
             queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
             llm = self._build_llm(config)
+            recent_outbound_ttl = _recent_auto_outbound_ttl(config)
 
             def process_candidates(snapshot_candidates: list[dict[str, Any]]) -> None:
                 nonlocal queue
@@ -2161,6 +2377,23 @@ class AutoReplyRunner:
                     candidate_source = str(candidate.get("source") or "")
                     allow_preview_fallback = candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
                     outbound_snapshot = latest_committed_outbound(panel)
+                    preview_recent_match = _match_recent_auto_outbound(
+                        state,
+                        contact,
+                        preview_text,
+                        now=now,
+                        ttl_seconds=recent_outbound_ttl,
+                    )
+                    if preview_recent_match:
+                        self.append_event(
+                            "claim_skipped_recent_self_preview",
+                            contact=contact,
+                            preview_text=preview_text,
+                            match_mode=str(preview_recent_match.get("match_mode") or ""),
+                            source=str(preview_recent_match.get("source") or ""),
+                            age_seconds=preview_recent_match.get("age_seconds"),
+                        )
+                        continue
                     if _text_matches_outbound(preview_text, outbound_snapshot):
                         if existing_index >= 0:
                             pending_existing = queue[existing_index]
@@ -2310,6 +2543,24 @@ class AutoReplyRunner:
                         )
                         continue
                     preview_text = str(candidate.get("preview") or "").strip()
+                    inbound_recent_match = _match_recent_auto_outbound(
+                        state,
+                        contact,
+                        inbound_text,
+                        now=now,
+                        ttl_seconds=recent_outbound_ttl,
+                    )
+                    if inbound_recent_match:
+                        self.append_event(
+                            "claim_skipped_recent_self_echo",
+                            contact=contact,
+                            inbound_text=inbound_text,
+                            preview_text=preview_text,
+                            match_mode=str(inbound_recent_match.get("match_mode") or ""),
+                            source=str(inbound_recent_match.get("source") or ""),
+                            age_seconds=inbound_recent_match.get("age_seconds"),
+                        )
+                        continue
                     if bool(candidate.get("unread")) and is_stale_system_inbound_text(inbound_text):
                         replacement_text = ""
                         if wechat_ui.is_nontext_message(preview_text):
@@ -2729,6 +2980,25 @@ class AutoReplyRunner:
                 return self._cancel_pending(state, "selection_not_confirmed", pending)
 
             draft_text = str(pending.get("draft_text", ""))
+            recent_outbound_ttl = _recent_auto_outbound_ttl(config)
+
+            def _record_recent_auto_outbound(source: str) -> None:
+                entry = _remember_recent_auto_outbound(
+                    state,
+                    contact,
+                    draft_text,
+                    now=now,
+                    source=source,
+                    ttl_seconds=recent_outbound_ttl,
+                )
+                if entry:
+                    self.append_event(
+                        "recent_auto_outbound_recorded",
+                        contact=contact,
+                        source=source,
+                        text=draft_text,
+                    )
+
             # For send-time recheck, trust only the right chat panel content.
             # Left roster previews are truncated and can cause false "message changed".
             current_time = str(pending.get("message_time", "") or "")
@@ -2794,7 +3064,7 @@ class AutoReplyRunner:
                     "outbound_top": outbound_top_value,
                     "inbound_top": inbound_top_value,
                     "latest_outbound": latest_outbound_flag,
-                    "chat_window": bool(selected_value.get("chatWindow")),
+                    "chat_window": bool(selected_value.get("chatWindow") or selected_value.get("selectionConfirmed")),
                     "panel_confidence": panel_tail_confidence(panel_value),
                 }
 
@@ -2995,11 +3265,54 @@ class AutoReplyRunner:
                 latest_outbound=latest_bubble_outbound,
             )
 
+            self_echo_match = _match_recent_auto_outbound(
+                state,
+                contact,
+                current_inbound,
+                now=now,
+                ttl_seconds=recent_outbound_ttl,
+                extra_texts=[draft_text] if send_attempts > 0 else None,
+            )
+            if self_echo_match:
+                if send_attempts > 0:
+                    remaining = remove_pending_by_fingerprint(queue, pending)
+                    sync_pending_state(state, remaining)
+                    _record_recent_auto_outbound("auto_sent_self_echo_late")
+                    self._remember_contact_memory(
+                        config,
+                        contact,
+                        context_messages=list(pending.get("chat_context") or []),
+                        inbound_text=str(pending.get("inbound_text") or ""),
+                        outbound_text=draft_text,
+                        source="auto_sent_self_echo_late",
+                    )
+                    self.append_event(
+                        "auto_sent",
+                        contact=contact,
+                        draft_text=draft_text,
+                        remaining_queue=len(remaining),
+                        queue_contacts=queued_contacts(remaining),
+                        confirmation="late_self_echo",
+                        match_mode=str(self_echo_match.get("match_mode") or ""),
+                        self_echo_inbound=current_inbound,
+                    )
+                    return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
+                return self._cancel_pending(
+                    state,
+                    "current_inbound_matches_recent_auto_outbound",
+                    pending,
+                    current_inbound=current_inbound,
+                    match_mode=str(self_echo_match.get("match_mode") or ""),
+                    source=str(self_echo_match.get("source") or ""),
+                    age_seconds=self_echo_match.get("age_seconds"),
+                )
+
             draft_match_mode = _draft_match_mode(draft_text, current_outbound)
             if draft_match_mode and current_outbound:
                 if int(pending.get("send_attempts", 0) or 0) > 0:
                     remaining = remove_pending_by_fingerprint(queue, pending)
                     sync_pending_state(state, remaining)
+                    _record_recent_auto_outbound("auto_sent_late")
                     final_outbound = str(current_outbound or draft_text or "").strip()
                     self._remember_contact_memory(
                         config,
@@ -3023,10 +3336,13 @@ class AutoReplyRunner:
 
             snapshot_outbound = normalize_text(pending_outbound_snapshot)
             manual_reply_trigger = ""
+            outbound_changed_from_snapshot = bool(
+                current_outbound and normalize_text(current_outbound) != snapshot_outbound
+            )
+            ultra_short_inbound_tail = bool(current_inbound and _is_ultra_short_fragment(current_inbound))
             if (
                 not current_inbound
-                and current_outbound
-                and normalize_text(current_outbound) != snapshot_outbound
+                and outbound_changed_from_snapshot
             ):
                 manual_reply_trigger = "outbound_without_inbound"
             outbound_after_latest_inbound = bool(
@@ -3045,19 +3361,24 @@ class AutoReplyRunner:
                 manual_reply_trigger = "latest_bubble_outbound"
             if (
                 not manual_reply_trigger
-                and current_outbound
-                and normalize_text(current_outbound) != snapshot_outbound
+                and outbound_changed_from_snapshot
                 and manual_reply_has_inbound_evidence
                 and outbound_after_latest_inbound
             ):
                 manual_reply_trigger = "outbound_after_latest_inbound"
+            if (
+                not manual_reply_trigger
+                and outbound_changed_from_snapshot
+                and ultra_short_inbound_tail
+            ):
+                manual_reply_trigger = "outbound_with_ultra_short_inbound_tail"
             if manual_reply_trigger:
                 reliable_signal, blockers = _manual_reply_signal_is_reliable(
                     current_outbound=current_outbound,
-                    current_inbound=current_inbound,
+                    current_inbound="" if ultra_short_inbound_tail else current_inbound,
                     current_outbound_item=current_outbound_item,
                     current_outbound_top=current_outbound_top,
-                    latest_inbound_top=latest_inbound_top,
+                    latest_inbound_top=None if ultra_short_inbound_tail else latest_inbound_top,
                     latest_bubble_outbound=latest_bubble_outbound,
                     has_chat_window=has_chat_window,
                 )
@@ -3380,6 +3701,7 @@ class AutoReplyRunner:
                             phase="retry_after_focus_input",
                         )
                     self._send_message_ui()
+                    _record_recent_auto_outbound("send_attempt_retry")
                     confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
                     confirmation_probe_reason = "retry_resend"
                 else:
@@ -3409,6 +3731,7 @@ class AutoReplyRunner:
                         phase="after_paste",
                     )
                 self._send_message_ui()
+                _record_recent_auto_outbound("send_attempt")
                 confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
             confirmed_panel = confirmed.get("chatPanel", {}) or {}
             confirmed_outbound = latest_committed_outbound(confirmed_panel)
@@ -3416,6 +3739,7 @@ class AutoReplyRunner:
             if confirmed_match_mode and confirmed_outbound:
                 remaining = remove_pending_by_fingerprint(queue, pending)
                 sync_pending_state(state, remaining)
+                _record_recent_auto_outbound("auto_sent_immediate")
                 final_outbound = str(confirmed_outbound or draft_text or "").strip()
                 self._remember_contact_memory(
                     config,
@@ -3433,6 +3757,45 @@ class AutoReplyRunner:
                     queue_contacts=queued_contacts(remaining),
                     confirmation=confirmation_probe_reason,
                     match_mode=confirmed_match_mode,
+                )
+                return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
+
+            confirmed_inbound_item = latest_meaningful_inbound_item(confirmed_panel)
+            confirmed_inbound = str(
+                confirmed_inbound_item.get("text")
+                or confirmed_panel.get("latestInbound")
+                or ""
+            ).strip()
+            confirmed_self_echo_match = _match_recent_auto_outbound(
+                state,
+                contact,
+                confirmed_inbound,
+                now=now,
+                ttl_seconds=recent_outbound_ttl,
+                extra_texts=[draft_text],
+            )
+            if confirmed_self_echo_match:
+                remaining = remove_pending_by_fingerprint(queue, pending)
+                sync_pending_state(state, remaining)
+                _record_recent_auto_outbound("auto_sent_self_echo_immediate")
+                self._remember_contact_memory(
+                    config,
+                    contact,
+                    context_messages=list(pending.get("chat_context") or []),
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    outbound_text=draft_text,
+                    source="auto_sent_self_echo_immediate",
+                )
+                self.append_event(
+                    "auto_sent",
+                    contact=contact,
+                    draft_text=draft_text,
+                    remaining_queue=len(remaining),
+                    queue_contacts=queued_contacts(remaining),
+                    confirmation="self_echo_after_send",
+                    match_mode=str(confirmed_self_echo_match.get("match_mode") or ""),
+                    self_echo_inbound=confirmed_inbound,
+                    current_outbound=confirmed_outbound,
                 )
                 return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
 

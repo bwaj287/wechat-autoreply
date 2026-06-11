@@ -11,6 +11,17 @@ This branch also includes the current image-aware reply path:
 - image / sticker / photo-like messages can be routed through `brother` (the local multimodal gateway)
 - visual debug crops are preserved under `runtime/captures/` for later inspection
 
+## V5 Reliability Highlights
+
+The current V5 iteration adds several protections around missed or duplicate replies:
+
+- The Brother gateway uses PC model `erge:27b` as its primary logic backend and falls back to local `qwen3.5:9b` when the PC is unavailable.
+- New unread signals can still enter claim flow while another reply is pending, without replacing FIFO queue order.
+- Recently auto-sent text is remembered for six hours so truncated roster previews or OCR self-echoes are not treated as new inbound messages.
+- Right-side chat bubbles are treated as outbound when color classification conflicts with their position.
+- Peekaboo window-list output tolerates duplicate concatenated JSON responses instead of aborting the entire unread scan.
+- Very short real messages such as one Chinese character are preserved instead of always becoming a generic placeholder.
+
 ## Why This Project Exists
 
 The main goal is reliable delayed auto-reply with strong guardrails:
@@ -160,6 +171,12 @@ Current default routing:
 - `brother` health endpoint: `http://127.0.0.1:4010/health`
 - `brother` chat endpoint: `http://127.0.0.1:4010/v1/chat/completions`
 - model alias: `brother`
+- PC logic endpoint: `http://192.168.10.2:11434`
+- PC primary logic model: `erge:27b`
+- local fallback logic model: `qwen3.5:9b`
+- local vision model: `qwen3-vl:4b`
+
+The model names and endpoints can be overridden with the `ERGE_*` environment variables in `erge_gateway/config.py`. A healthy gateway does not necessarily mean the PC is reachable; inspect `logic_probe.status` and `logic_probe.reason` from `/health`. If the PC request fails or times out, generation automatically uses the local fallback.
 
 ### How Image Routing Works
 
@@ -404,6 +421,8 @@ When triggered:
    - Non-whitelist contact: open row to clear unread only.
 4. Hide WeChat and restore previous front app.
 
+If a reply is already pending, a newly rising menu signal can still trigger another claim scan. The new draft is appended to the FIFO queue; the existing queue head remains the next item to send.
+
 For image-like inbound messages:
 
 - the claim step may preserve placeholder text such as `表情包` or `[Photo]`
@@ -416,6 +435,7 @@ For image-like inbound messages:
 - Due time: `send_delay_seconds` (default `180` seconds).
 - Message-change debounce: `pending_change_debounce_frames` (default `3`) + `pending_change_min_votes` (default `2`) with similarity guard `pending_change_similarity_threshold` (default `0.9`).
 - Stale cleanup: `pending_stale_ttl_seconds` (default `86400` seconds).
+- Recent auto-outbound memory: `recent_auto_outbound_ttl_seconds` (default `21600` seconds).
 - Queue state is persisted under runtime state.
 
 ### Due-Send Flow (`pending_send_due`)
@@ -447,11 +467,14 @@ The system includes protections against OCR jitter and UI ambiguity:
 - Row red-dot detection is resolution/HDR adaptive (dynamic scan window + strict/relaxed color passes).
 - Row unread now requires numeric badge evidence near avatar (red badge + white digit strokes), not just red pixels.
 - Bubble role helper distinguishes inbound/outbound by visual structure.
+- Right-side position overrides an incorrect inbound color classification in chat-panel extraction.
 - Inbound text is normalized and fingerprinted.
 - Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
 - Empty panel path triggers reselect attempt before cancel.
 - Dock badge OCR uses dynamic upscaling + adaptive threshold offset for display-scale changes.
 - Pending recheck now suppresses some short tail-fragment regressions (for example when a long sentence is re-read as only the last few characters).
+- Peekaboo window enumeration accepts the first complete JSON document when the bridge appends a duplicate response.
+- Recent auto-outbound matching covers exact, head/tail fragment, substring, and high-similarity self-echoes.
 
 Image-path specific reliability notes:
 
@@ -479,6 +502,7 @@ Primary runtime keys in `runtime/config.json`:
 - `send_max_attempts`: retry budget for unconfirmed sends.
 - `menubar_check_interval_seconds`: unread signal sampling interval.
 - `pending_stale_ttl_seconds`: stale pending GC TTL.
+- `recent_auto_outbound_ttl_seconds`: how long sent text is retained for self-echo suppression.
 - `allowed_contacts`: whitelist contacts.
 - `ollama_url`, `ollama_model`: local LLM endpoint/model.
 - `reply_context_messages`: number of recent chat lines provided to LLM context window.
@@ -511,7 +535,11 @@ High-signal events:
 - `menu_bar_checked`
 - `wechat_window_action` (`reason=claim_scan|pending_send_due`)
 - `claim_candidates`
+- `claim_preview_fallback_candidate`
+- `claim_skipped_recent_self_preview`
+- `claim_skipped_recent_self_echo`
 - `draft_saved_locally`
+- `recent_auto_outbound_recorded`
 - `pending_recheck_voted`
 - `pending_message_changed_recheck`
 - `auto_sent`
@@ -552,8 +580,18 @@ Confirm:
 Check:
 
 - Menu signal sampling events (`menu_bar_checked`).
+- Whether `claim_candidates` was followed by `selection_not_confirmed`.
+- Whether a `runner_error` contains `Extra data`; current V5 code tolerates duplicated Peekaboo JSON, so this usually means the runner has not been restarted onto the latest code.
 - macOS permissions (Screen Recording, Accessibility).
 - Current display/scale changes that may impact OCR.
+
+### Brother is healthy but replies use the local model
+
+Check `http://127.0.0.1:4010/health`:
+
+- `logic_probe.status=healthy` means PC `erge:27b` is ready.
+- `logic_probe.reason=pc_unreachable` means replies will use local `qwen3.5:9b`.
+- `logic_probe.reason=pc_model_missing` means the PC is reachable but does not expose the configured primary model tag.
 
 ### Repeated empty scans
 

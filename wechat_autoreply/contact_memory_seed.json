@@ -49,6 +49,10 @@
       "profile": "正常熟人语气，平和一点，别太跳脱，别太装，也别太冷。",
       "profile_locked": true
     },
+    "吴瀚铭": {
+      "profile": "学校同学语气，熟人但别装太熟，正常同学聊天，轻松自然一点，可以简单接话或调侃，但别油、别过度关心。",
+      "profile_locked": true
+    },
     "Eden": {
       "profile": "熟人朋友，偏 tech / 电脑 / 模型话题，直接一点，少废话，别太客套。",
       "profile_locked": true

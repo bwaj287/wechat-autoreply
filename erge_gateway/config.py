@@ -18,13 +18,13 @@ class Settings:
     port: int = int(os.getenv("ERGE_PORT", "4010"))
 
     logic_primary_base_url: str = os.getenv("ERGE_LOGIC_BASE_URL", "http://192.168.10.2:11434")
-    logic_primary_model: str = os.getenv("ERGE_LOGIC_MODEL", "qwen3.5:9b-q8_0")
+    logic_primary_model: str = os.getenv("ERGE_LOGIC_MODEL", "erge:27b")
 
     logic_local_base_url: str = os.getenv("ERGE_LOCAL_LOGIC_BASE_URL", "http://127.0.0.1:11434")
     logic_local_model: str = os.getenv("ERGE_LOCAL_LOGIC_MODEL", "qwen3.5:9b")
 
     health_pc_base_url: str = os.getenv("ERGE_HEALTH_PC_BASE_URL", "http://192.168.10.2:11434")
-    health_pc_model: str = os.getenv("ERGE_HEALTH_PC_MODEL", "qwen3.5:9b-q8_0")
+    health_pc_model: str = os.getenv("ERGE_HEALTH_PC_MODEL", "erge:27b")
     game_mode_url: str = os.getenv("ERGE_GAME_MODE_URL", "http://192.168.10.2:4011/game-mode")
 
     vision_base_url: str = os.getenv("ERGE_VISION_BASE_URL", "http://127.0.0.1:11434")

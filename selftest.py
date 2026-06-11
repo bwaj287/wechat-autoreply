@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -11,7 +12,7 @@ from wechat_autoreply.capture_cleanup import delete_capture_snapshots_older_than
 from wechat_autoreply.config_store import default_config
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat
+from wechat_autoreply.wechat_ui import _extract_chat_panel, _load_first_json_object, find_chat
 
 
 class MemoryStore:
@@ -68,7 +69,9 @@ class FakeLLM:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict | None = None,
         screenshot_path: str | None = None,
+        quoted_message: dict[str, str] | None = None,
     ) -> str:
         self.calls.append((contact, inbound_text))
         return self.reply
@@ -84,7 +87,9 @@ class MappingLLM:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict | None = None,
         screenshot_path: str | None = None,
+        quoted_message: dict[str, str] | None = None,
     ) -> str:
         self.calls.append((contact, inbound_text))
         return self.mapping[contact]
@@ -100,7 +105,9 @@ class PairMappingLLM:
         contact: str,
         inbound_text: str,
         conversation_context: list[dict[str, str]] | None = None,
+        contact_memory: dict | None = None,
         screenshot_path: str | None = None,
+        quoted_message: dict[str, str] | None = None,
     ) -> str:
         self.calls.append((contact, inbound_text))
         return self.mapping[(contact, inbound_text)]
@@ -233,7 +240,20 @@ def run_manual_reply_cancel() -> None:
                 "status": "ok",
                 "selectionConfirmed": True,
                 "activeChat": "王哥",
-                "chatPanel": {"latestInbound": "回到学校了吗", "latestOutbound": "我等会回你"},
+                "chatPanel": {
+                    "latestInbound": "回到学校了吗",
+                    "latestOutbound": "我等会回你",
+                    "inbound": [{"text": "回到学校了吗", "top": 0.42}],
+                    "outbound": [
+                        {
+                            "text": "我等会回你",
+                            "top": 0.68,
+                            "left": 0.72,
+                            "width": 0.18,
+                            "greenPixels": 120,
+                        }
+                    ],
+                },
             },
         ]
     )
@@ -295,7 +315,15 @@ def run_bottom_green_bubble_cancels_pending_path() -> None:
                     "latestInbound": "在吗",
                     "latestOutbound": "昨晚到的",
                     "inbound": [{"text": "在吗", "top": 0.42}],
-                    "outbound": [{"text": "昨晚到的", "top": 0.66}],
+                    "outbound": [
+                        {
+                            "text": "昨晚到的",
+                            "top": 0.66,
+                            "left": 0.72,
+                            "width": 0.18,
+                            "greenPixels": 120,
+                        }
+                    ],
                 },
             },
         ]
@@ -602,6 +630,20 @@ def run_latest_message_refresh_path() -> None:
                 "activeChat": "Barrys",
                 "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
                 "chatPanel": {"latestInbound": "[表情]", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
+                "chatPanel": {"latestInbound": "[表情]", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Barrys",
+                "visibleChats": [{"name": "Barrys", "preview": "[表情]", "time": "12:00", "unread": False}],
+                "chatPanel": {"latestInbound": "[表情]", "latestOutbound": "哈哈，收到你的表情了。"},
             },
             {
                 "status": "ok",
@@ -1033,8 +1075,8 @@ def run_active_whitelist_chat_claim_without_unread_badge_path() -> None:
                     "latestInbound": "晚上打不打守望先锋\n我们有四个人",
                     "latestOutbound": "加了",
                     "inbound": [
-                        {"text": "晚上打不打守望先锋", "top": 0.55},
-                        {"text": "我们有四个人", "top": 0.64},
+                        {"text": "晚上打不打守望先锋", "top": 0.55, "left": 0.42, "width": 0.24, "grayPixels": 120},
+                        {"text": "我们有四个人", "top": 0.64, "left": 0.42, "width": 0.18, "grayPixels": 120},
                     ],
                     "outbound": [{"text": "加了", "top": 0.28}],
                 },
@@ -1048,8 +1090,8 @@ def run_active_whitelist_chat_claim_without_unread_badge_path() -> None:
                     "latestInbound": "晚上打不打守望先锋\n我们有四个人",
                     "latestOutbound": "加了",
                     "inbound": [
-                        {"text": "晚上打不打守望先锋", "top": 0.55},
-                        {"text": "我们有四个人", "top": 0.64},
+                        {"text": "晚上打不打守望先锋", "top": 0.55, "left": 0.42, "width": 0.24, "grayPixels": 120},
+                        {"text": "我们有四个人", "top": 0.64, "left": 0.42, "width": 0.18, "grayPixels": 120},
                     ],
                     "outbound": [{"text": "加了", "top": 0.28}],
                 },
@@ -1125,7 +1167,17 @@ def run_whitelist_preview_fallback_claim_path() -> None:
         [
             {
                 "status": "ok",
-                "visibleChats": [{"name": "May", "preview": "在吗", "time": "20:59", "unread": False}],
+                "visibleChats": [
+                    {
+                        "name": "May",
+                        "preview": "在吗",
+                        "time": "20:59",
+                        "unread": False,
+                        "redPixelCount": 120,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
                 "chatPanel": {},
             },
             {
@@ -1404,6 +1456,76 @@ def run_send_confirmation_retry_path() -> None:
     assert any(event["type"] == "send_unconfirmed_retry_scheduled" for event in store.events)
 
 
+def run_send_confirmation_self_echo_marks_sent_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    draft_text = "这也能整出来？别吓唬我，最近身体咋样，实习安排得还顺利不？"
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "王哥", "preview": "朋友们，问你一个细思极恐的问题", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "王哥",
+                "chatPanel": {"latestInbound": "朋友们，问你一个细思极恐的问题", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "王哥",
+                "chatPanel": {"latestInbound": "朋友们，问你一个细思极恐的问题", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "王哥",
+                "chatPanel": {
+                    "latestInbound": "还顺利不？",
+                    "latestOutbound": "小红书",
+                    "inbound": [{"text": "还顺利不？", "top": 0.72}],
+                    "outbound": [{"text": "小红书", "top": 0.16}],
+                },
+            },
+        ]
+    )
+    clock = {"now": 5_600.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM(draft_text),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "draft_saved", first
+
+    clock["now"] = 5_905.0
+    second = runner.tick()
+    assert second["status"] == "sent", second
+    assert store.state["pending"] is None
+    assert not any(event["type"] == "send_unconfirmed_retry_scheduled" for event in store.events), store.events
+    assert any(
+        event["type"] == "auto_sent"
+        and event.get("confirmation") == "self_echo_after_send"
+        and event.get("match_mode") == "tail_fragment"
+        for event in store.events
+    ), store.events
+
+
 def run_empty_inbound_recheck_cancels_pending_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -1493,6 +1615,7 @@ def run_compose_text_does_not_count_as_sent() -> None:
                 "chatPanel": {
                     "latestInbound": "你最爱的kpop",
                     "latestOutbound": "牛逼",
+                    "inbound": [{"text": "你最爱的kpop", "top": 0.54}],
                     "outbound": [{"text": "牛逼", "top": 0.16}],
                 },
             },
@@ -1503,10 +1626,11 @@ def run_compose_text_does_not_count_as_sent() -> None:
                 "chatPanel": {
                     "latestInbound": "你最爱的kpop",
                     "latestOutbound": "收到！Barrys 的 Kpop 歌单必须收藏，今晚就循环起来，太好听了！",
+                    "inbound": [{"text": "你最爱的kpop", "top": 0.54}],
                     "outbound": [
                         {
                             "text": "收到！Barrys 的 Kpop 歌单必须收藏，今晚就循环起来，太好听了！",
-                            "top": 0.86,
+                            "top": 0.94,
                         }
                     ],
                 },
@@ -1734,6 +1858,111 @@ def run_claim_preview_fallback_on_panel_mismatch_path() -> None:
     ), store.events
 
 
+def run_recent_auto_outbound_preview_is_not_claimed_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    clock = {"now": 13_500.0}
+    recent_text = "这也能整出来？别吓唬我，最近身体咋样，实习安排得还顺利不？"
+    store.state["recent_auto_outbounds"] = {
+        "王哥": [{"text": recent_text, "ts": clock["now"] - 120, "source": "send_attempt"}]
+    }
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [
+                    {"name": "王哥", "preview": "这也能整出来？别吓唬我，最近身…", "time": "16:13", "unread": True}
+                ],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "王哥",
+                "chatPanel": {"latestInbound": "还顺利不？", "latestOutbound": "小红书"},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    llm = FakeLLM("不该生成")
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=llm,
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert llm.calls == []
+    assert any(event["type"] == "claim_skipped_recent_self_preview" for event in store.events), store.events
+
+
+def run_pending_self_echo_tail_cancels_before_refresh_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    clock = {"now": 13_800.0}
+    recent_text = "这也能整出来？别吓唬我，最近身体咋样，实习安排得还顺利不？"
+    pending = {
+        "contact": "王哥",
+        "inbound_text": "这也能整出来？别吓唬我，最近身…",
+        "message_time": "16:13",
+        "inbound_fingerprint": "fp-self-preview",
+        "draft_text": "这哪是整出来，是你那脑洞太大。最近身体咋样，别光在那儿瞎琢磨，好好休息，实习还顺利不？",
+        "created_at": clock["now"] - 305,
+        "due_at": clock["now"] - 1,
+        "outbound_snapshot": "小红书",
+        "active_chat_title": "王哥",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    store.state["recent_auto_outbounds"] = {
+        "王哥": [{"text": recent_text, "ts": clock["now"] - 600, "source": "send_attempt"}]
+    }
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "王哥",
+                "chatPanel": {
+                    "latestInbound": "还顺利不？",
+                    "latestOutbound": "小红书",
+                    "inbound": [{"text": "还顺利不？", "top": 0.72}],
+                    "outbound": [{"text": "小红书", "top": 0.16}],
+                },
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不该刷新"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    result = runner.tick()
+    assert result["status"] == "cancelled", result
+    assert result["reason"] == "current_inbound_matches_recent_auto_outbound", result
+    assert store.state["pending"] is None
+    assert not any(event["type"] == "pending_refreshed_latest" for event in store.events), store.events
+
+
 def run_find_chat_alias_match_path() -> None:
     chats = [{"name": "1ock"}, {"name": "王哥"}]
     assert find_chat(chats, "10ck") == {"name": "1ock"}
@@ -1893,7 +2122,15 @@ def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
                     "latestInbound": "G",
                     "latestOutbound": "我在twitch领箱子",
                     "inbound": [{"text": "G", "top": 0.84}],
-                    "outbound": [{"text": "我在twitch领箱子", "top": 0.72}],
+                    "outbound": [
+                        {
+                            "text": "我在twitch领箱子",
+                            "top": 0.72,
+                            "left": 0.68,
+                            "width": 0.24,
+                            "greenPixels": 120,
+                        }
+                    ],
                 },
             },
             {
@@ -1904,7 +2141,15 @@ def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
                     "latestInbound": "",
                     "latestOutbound": "我在twitch领箱子",
                     "inbound": [{"text": "G", "top": 0.84}],
-                    "outbound": [{"text": "我在twitch领箱子", "top": 0.72}],
+                    "outbound": [
+                        {
+                            "text": "我在twitch领箱子",
+                            "top": 0.72,
+                            "left": 0.68,
+                            "width": 0.24,
+                            "greenPixels": 120,
+                        }
+                    ],
                 },
             },
         ]
@@ -1933,6 +2178,13 @@ def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
     assert "send" not in fake_ui.calls
 
 
+def run_peekaboo_duplicate_json_output_path() -> None:
+    first = {"data": {"windows": [{"window_id": 42}]}}
+    duplicate = {"data": {"windows": [{"window_id": 99}]}}
+    payload = _load_first_json_object(f"{json.dumps(first)}\n{json.dumps(duplicate)}\n")
+    assert payload == first, payload
+
+
 def main() -> int:
     run_happy_path()
     run_manual_reply_cancel()
@@ -1944,16 +2196,20 @@ def main() -> int:
     run_preview_matching_outbound_is_not_inbound_path()
     run_latest_message_refresh_path()
     run_send_confirmation_retry_path()
+    run_send_confirmation_self_echo_marks_sent_path()
     run_empty_inbound_recheck_cancels_pending_path()
     run_compose_text_does_not_count_as_sent()
     run_repeated_identical_text_new_time_path()
     run_ocr_alias_contact_round_trip_path()
     run_claim_preview_fallback_on_panel_mismatch_path()
+    run_recent_auto_outbound_preview_is_not_claimed_path()
+    run_pending_self_echo_tail_cancels_before_refresh_path()
     run_find_chat_alias_match_path()
     run_capture_cleanup_deletes_old_snapshots_path()
     run_ocr_variant_same_message_does_not_refresh_path()
     run_right_side_bubble_overrides_inbound_color_misclass_path()
     run_manual_reply_cancels_even_with_noisy_inbound_tail_path()
+    run_peekaboo_duplicate_json_output_path()
     run_no_claim_sweep_while_pending_wait_path()
     run_pending_menu_flicker_does_not_trigger_claim_path()
     run_queue_claims_on_menu_rising_path()

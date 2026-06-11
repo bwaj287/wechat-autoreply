@@ -107,6 +107,7 @@ def seed_allowed_contacts() -> list[str]:
         "Ted Liu",
         "王哥",
         "刘若愚",
+        "吴瀚铭",
     ]
 
 
@@ -134,6 +135,7 @@ def default_config() -> dict[str, Any]:
         "recheck_tail_span": 0.28,
         "send_max_attempts": 2,
         "pending_stale_ttl_seconds": 86400,
+        "recent_auto_outbound_ttl_seconds": 21600,
         "poll_interval_seconds": 5,
         "menubar_check_interval_seconds": 15,
         "capture_cleanup_interval_seconds": 3600,
