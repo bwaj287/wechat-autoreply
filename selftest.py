@@ -8,17 +8,21 @@ import os
 import tempfile
 from pathlib import Path
 
+from PIL import Image, ImageDraw
+
 from wechat_autoreply.capture_cleanup import delete_capture_snapshots_older_than
 from wechat_autoreply.config_store import default_config
+from wechat_autoreply.json_output import load_first_json_object
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import _extract_chat_panel, _load_first_json_object, find_chat
+from wechat_autoreply.wechat_ui import _extract_chat_panel, _fallback_row_badge_detection, find_chat
 
 
 class MemoryStore:
     def __init__(self) -> None:
         self.config = default_config()
         self.config["enabled"] = True
+        self.config["passive_roster_sweep_enabled"] = False
         self.state = default_state()
         self.events: list[dict] = []
 
@@ -153,6 +157,16 @@ class FakeUI:
 
     def send_message(self):
         self.calls.append("send")
+
+
+class FakeBackgroundUI(FakeUI):
+    def __init__(self, probes, background_probes):
+        super().__init__(probes)
+        self.background_probes = list(background_probes)
+
+    def probe_roster_background(self):
+        self.calls.append(("probe_background", None))
+        return copy.deepcopy(self.background_probes.pop(0))
 
 
 def run_happy_path() -> None:
@@ -1013,6 +1027,249 @@ def run_unknown_menu_signal_does_not_claim_path() -> None:
     assert fake_ui.calls == [], fake_ui.calls
 
 
+def run_passive_roster_sweep_claims_without_menu_signal_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "Darren", "preview": "费了！！", "time": "22:52", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Darren",
+                "visibleChats": [{"name": "Darren", "preview": "费了！！", "time": "22:52", "unread": False}],
+                "chatPanel": {"latestInbound": "费了！！", "latestOutbound": "上一条回复"},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("确实有点费"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 20_000.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "Darren", result
+    assert store.state["pending"]["inbound_text"] == "费了！！"
+    assert any(
+        event["type"] == "wechat_window_action"
+        and event.get("action") == "open"
+        and event.get("trigger") == "passive_roster_sweep"
+        for event in store.events
+    ), store.events
+
+
+def run_passive_roster_sweep_stays_background_without_badge_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeBackgroundUI(
+        [],
+        [
+            {
+                "status": "ok",
+                "screenshot": "/tmp/background-roster.png",
+                "visibleChats": [
+                    {
+                        "name": "Darren",
+                        "preview": "无了",
+                        "unread": False,
+                        "redPixelCount": 0,
+                        "digitPixelCount": 0,
+                        "numericBadge": False,
+                    }
+                ],
+            }
+        ],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不该生成"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 20_000.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "idle_wait", result
+    assert fake_ui.calls == [("probe_background", None)], fake_ui.calls
+    assert store.state["last_roster_sweep_at"] == 20_000.0
+    assert any(
+        event.get("type") == "passive_roster_preflight"
+        and event.get("badge_detected") is False
+        for event in store.events
+    ), store.events
+    assert not any(event.get("type") == "wechat_window_action" for event in store.events), store.events
+
+
+def run_passive_roster_sweep_opens_only_after_background_badge_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeBackgroundUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "Darren", "preview": "费了", "time": "22:52", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Darren",
+                "chatPanel": {
+                    "latestInbound": "费了",
+                    "latestOutbound": "上一条",
+                    "inbound": [
+                        {
+                            "text": "费了",
+                            "top": 0.72,
+                            "left": 0.08,
+                            "width": 0.12,
+                            "grayPixels": 120,
+                        }
+                    ],
+                    "outbound": [{"text": "上一条", "top": 0.42}],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ],
+        [
+            {
+                "status": "ok",
+                "screenshot": "/tmp/background-roster-badge.png",
+                "visibleChats": [
+                    {
+                        "name": "Darren",
+                        "preview": "费了",
+                        "unread": True,
+                        "redPixelCount": 120,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
+            }
+        ],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("确实费了"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 20_000.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert fake_ui.calls[0] == ("probe_background", None), fake_ui.calls
+    assert "activate" in fake_ui.calls
+    assert any(
+        event.get("type") == "passive_roster_preflight"
+        and event.get("badge_detected") is True
+        for event in store.events
+    ), store.events
+
+
+def run_passive_roster_sweep_ignores_background_non_whitelist_badge_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeBackgroundUI(
+        [],
+        [
+            {
+                "status": "ok",
+                "visibleChats": [
+                    {
+                        "name": "工作群",
+                        "preview": "新消息",
+                        "unread": True,
+                        "redPixelCount": 120,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
+            }
+        ],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不该生成"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 20_000.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "idle_wait", result
+    assert fake_ui.calls == [("probe_background", None)], fake_ui.calls
+    assert not any(event.get("type") == "wechat_window_action" for event in store.events), store.events
+
+
+def run_passive_roster_sweep_does_not_clear_non_whitelist_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "Sara", "preview": "在吗", "time": "22:52", "unread": True}],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 20_000.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "no_candidate", result
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert not any(event["type"] == "non_whitelist_unread_cleared" for event in store.events)
+
+
 def run_non_whitelist_unread_cleared_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -1290,6 +1547,154 @@ def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
         ("probe", None),
         "hide",
     ], fake_ui.calls
+
+
+def run_numeric_badge_inbound_bubble_overrides_outbound_text_match_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [
+                    {
+                        "name": "Darren",
+                        "preview": "无了",
+                        "time": "23:29",
+                        "unread": True,
+                        "redPixelCount": 179,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Darren",
+                "chatPanel": {
+                    "latestInbound": "无了",
+                    "latestOutbound": "无了？",
+                    "inbound": [
+                        {
+                            "text": "无了",
+                            "top": 0.75,
+                            "left": 0.08,
+                            "width": 0.12,
+                            "grayPixels": 120,
+                        }
+                    ],
+                    "outbound": [
+                        {
+                            "text": "无了？",
+                            "top": 0.64,
+                            "left": 0.72,
+                            "width": 0.12,
+                            "greenPixels": 120,
+                        }
+                    ],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    llm = FakeLLM("哪能无了，接着整。")
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=llm,
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 9_360.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "Darren", result
+    assert store.state["pending"]["inbound_text"] == "无了"
+    assert llm.calls == [("Darren", "无了")]
+    assert any(
+        event.get("type") == "claim_self_match_overridden_by_inbound_badge"
+        and event.get("contact") == "Darren"
+        for event in store.events
+    ), store.events
+
+
+def run_numeric_badge_latest_outbound_text_match_still_skips_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "Darren", "preview": "无了？", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "Darren",
+                "chatPanel": {
+                    "latestInbound": "费了",
+                    "latestOutbound": "无了？",
+                    "inbound": [
+                        {
+                            "text": "费了",
+                            "top": 0.49,
+                            "left": 0.08,
+                            "width": 0.12,
+                            "grayPixels": 120,
+                        }
+                    ],
+                    "outbound": [
+                        {
+                            "text": "无了？",
+                            "top": 0.72,
+                            "left": 0.72,
+                            "width": 0.12,
+                            "greenPixels": 120,
+                        }
+                    ],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    llm = FakeLLM("不该生成")
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=llm,
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 9_380.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert llm.calls == []
+    assert any(
+        event.get("type") == "claim_skipped"
+        and event.get("reason") == "preview_matches_outbound"
+        and event.get("contact") == "Darren"
+        for event in store.events
+    ), store.events
 
 
 def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
@@ -2181,8 +2586,33 @@ def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
 def run_peekaboo_duplicate_json_output_path() -> None:
     first = {"data": {"windows": [{"window_id": 42}]}}
     duplicate = {"data": {"windows": [{"window_id": 99}]}}
-    payload = _load_first_json_object(f"{json.dumps(first)}\n{json.dumps(duplicate)}\n")
+    payload = load_first_json_object(f"{json.dumps(first)}\n{json.dumps(duplicate)}\n")
     assert payload == first, payload
+    payload = load_first_json_object(f"{json.dumps(first)}\nUnable to find a valid E5 model")
+    assert payload == first, payload
+
+
+def run_warm_avatar_attached_badge_detection_path() -> None:
+    row = {
+        "rowTop": 0.0356,
+        "rowBottom": 0.1631,
+        "nameLeft": 0.1063,
+    }
+    image = Image.new("RGB", (1148, 735), (36, 36, 36))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((90, 82, 115, 112), fill=(180, 45, 20))
+    draw.ellipse((106, 71, 122, 87), fill=(250, 55, 50))
+    draw.line((114, 76, 114, 82), fill=(255, 255, 255), width=2)
+    detected = _fallback_row_badge_detection(image, row)
+    assert detected is not None, detected
+    assert detected["numericBadge"] is True, detected
+    assert detected["digitPixelCount"] >= 6, detected
+
+    avatar_only = Image.new("RGB", (1148, 735), (36, 36, 36))
+    avatar_draw = ImageDraw.Draw(avatar_only)
+    avatar_draw.rectangle((90, 82, 115, 112), fill=(180, 45, 20))
+    avatar_draw.line((97, 90, 98, 96), fill=(255, 255, 255), width=2)
+    assert _fallback_row_badge_detection(avatar_only, row) is None
 
 
 def main() -> int:
@@ -2210,17 +2640,25 @@ def main() -> int:
     run_right_side_bubble_overrides_inbound_color_misclass_path()
     run_manual_reply_cancels_even_with_noisy_inbound_tail_path()
     run_peekaboo_duplicate_json_output_path()
+    run_warm_avatar_attached_badge_detection_path()
     run_no_claim_sweep_while_pending_wait_path()
     run_pending_menu_flicker_does_not_trigger_claim_path()
     run_queue_claims_on_menu_rising_path()
     run_queue_claims_while_pending_after_sweep_interval_path()
     run_stale_pending_gc_path()
     run_unknown_menu_signal_does_not_claim_path()
+    run_passive_roster_sweep_claims_without_menu_signal_path()
+    run_passive_roster_sweep_stays_background_without_badge_path()
+    run_passive_roster_sweep_opens_only_after_background_badge_path()
+    run_passive_roster_sweep_ignores_background_non_whitelist_badge_path()
+    run_passive_roster_sweep_does_not_clear_non_whitelist_path()
     run_non_whitelist_unread_cleared_path()
     run_active_whitelist_chat_claim_without_unread_badge_path()
     run_active_whitelist_chat_latest_outbound_skips_path()
     run_whitelist_preview_fallback_claim_path()
     run_unread_whitelist_candidate_latest_outbound_skips_path()
+    run_numeric_badge_inbound_bubble_overrides_outbound_text_match_path()
+    run_numeric_badge_latest_outbound_text_match_still_skips_path()
     run_empty_queue_persistent_unread_waits_for_signal_change_path()
     run_empty_queue_persistent_unread_sweeps_after_interval_path()
     print("selftest: ok")

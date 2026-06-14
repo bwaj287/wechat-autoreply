@@ -13,6 +13,7 @@ from typing import Any
 from PIL import Image, ImageOps
 
 from .config_store import load_config, save_config
+from .json_output import load_first_json_object
 from .ocr import ocr_image
 from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, PEEKABOO, WECHAT_APP
 from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
@@ -56,24 +57,6 @@ TARGET_ROSTER_WINDOW_X = 96
 TARGET_ROSTER_WINDOW_Y = 84
 TARGET_ROSTER_WINDOW_WIDTH = 980
 TARGET_ROSTER_WINDOW_HEIGHT = 820
-
-
-def _load_first_json_object(raw: str) -> dict[str, Any]:
-    text = str(raw or "").lstrip()
-    if not text:
-        raise ValueError("empty JSON output")
-
-    decoder = json.JSONDecoder()
-    payload, cursor = decoder.raw_decode(text)
-    if not isinstance(payload, dict):
-        raise ValueError("expected JSON object output")
-
-    # Peekaboo's bridge can occasionally append a second valid JSON response.
-    # Validate any trailing documents, but use the first command response.
-    while text[cursor:].strip():
-        cursor += len(text[cursor:]) - len(text[cursor:].lstrip())
-        _, cursor = decoder.raw_decode(text, cursor)
-    return payload
 
 
 def normalize_text(text: str) -> str:
@@ -340,7 +323,7 @@ def _write_clipboard_text(text: str) -> None:
 
 
 def list_wechat_windows() -> list[dict[str, Any]]:
-    payload = _load_first_json_object(
+    payload = load_first_json_object(
         run_peekaboo_variants(
             peekaboo_commands(["list", "windows", "--app", WECHAT_APP, "--json"]),
             timeout=120,
@@ -565,6 +548,26 @@ def capture_window(path: Path, info: dict[str, Any]) -> Path:
     return path
 
 
+def probe_roster_background() -> dict[str, Any]:
+    """Inspect roster badges without activating or focusing WeChat."""
+    windows = list_wechat_windows()
+    roster_info = choose_roster_window(windows)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    roster_path = CAPTURE_DIR / f"wechat-roster-background-{timestamp}.png"
+    capture_window(roster_path, roster_info)
+    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    chats = annotate_unread_chats(
+        extract_visible_chats(roster_obs, roster_info),
+        roster_path,
+    )
+    return {
+        "status": "ok",
+        "window": roster_info,
+        "screenshot": str(roster_path),
+        "visibleChats": chats,
+    }
+
+
 def _is_time(text: str) -> bool:
     return bool(TIME_RE.fullmatch(text.strip().rstrip(".")))
 
@@ -753,7 +756,7 @@ def _annotate_bubble_roles(items: list[dict[str, Any]], image_path: Path) -> Non
             timeout=120,
             check=True,
         )
-        role_payload = json.loads(proc.stdout)
+        role_payload = load_first_json_object(proc.stdout)
     except Exception:
         return
     finally:
@@ -1027,6 +1030,95 @@ def _connected_components(mask: list[list[bool]]) -> list[dict[str, int]]:
     return components
 
 
+def _embedded_numeric_badge_detection(
+    image: Image.Image,
+    *,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+    red_components: list[dict[str, int]],
+    name_x: int,
+) -> dict[str, int] | None:
+    # A badge can touch a red-heavy avatar and become one oversized red component.
+    # Recover only a digit in the component's upper-right area with red on both sides.
+    oversized = [
+        component
+        for component in red_components
+        if 80 <= int(component["count"]) <= 1200
+        and 21 <= int(component["width"]) <= 48
+        and 15 <= int(component["height"]) <= 48
+    ]
+    if not oversized:
+        return None
+
+    white_mask: list[list[bool]] = []
+    for py in range(y0, y1):
+        white_mask.append(
+            [_is_white_digit_pixel(image.getpixel((px, py))) for px in range(x0, x1)]
+        )
+
+    for digit in sorted(_connected_components(white_mask), key=lambda item: int(item["count"]), reverse=True):
+        digit_count = int(digit["count"])
+        digit_width = int(digit["width"])
+        digit_height = int(digit["height"])
+        if digit_count < 6 or digit_count > 40:
+            continue
+        if digit_width < 1 or digit_width > 10 or digit_height < 3 or digit_height > 18:
+            continue
+
+        center_x = (int(digit["minX"]) + int(digit["maxX"])) / 2.0
+        center_y = (int(digit["minY"]) + int(digit["maxY"])) / 2.0
+        absolute_center_x = x0 + center_x
+        if absolute_center_x > name_x + 4:
+            continue
+
+        host = None
+        for component in oversized:
+            relative_x = (center_x - int(component["minX"])) / max(1, int(component["width"]) - 1)
+            relative_y = (center_y - int(component["minY"])) / max(1, int(component["height"]) - 1)
+            if (
+                int(component["minX"]) <= center_x <= int(component["maxX"])
+                and int(component["minY"]) <= center_y <= int(component["maxY"])
+                and relative_x >= 0.48
+                and relative_y <= 0.60
+            ):
+                host = component
+                break
+        if host is None:
+            continue
+
+        cx = int(round(absolute_center_x))
+        cy = int(round(y0 + center_y))
+        window_x0 = max(x0, cx - 8)
+        window_x1 = min(x1, cx + 9)
+        window_y0 = max(y0, cy - 8)
+        window_y1 = min(y1, cy + 9)
+        area = max(1, (window_x1 - window_x0) * (window_y1 - window_y0))
+        red_count = 0
+        left_red = 0
+        right_red = 0
+        left_area = 0
+        right_area = 0
+        for py in range(window_y0, window_y1):
+            for px in range(window_x0, window_x1):
+                is_red = _is_red_badge_pixel(image.getpixel((px, py)))
+                red_count += int(is_red)
+                if px < cx:
+                    left_area += 1
+                    left_red += int(is_red)
+                elif px > cx:
+                    right_area += 1
+                    right_red += int(is_red)
+        red_ratio = red_count / area
+        if red_ratio < 0.40 or red_ratio > 0.88:
+            continue
+        if left_red / max(1, left_area) < 0.25 or right_red / max(1, right_area) < 0.25:
+            continue
+        return {"redPixelCount": red_count, "digitPixelCount": digit_count}
+    return None
+
+
 def _fallback_row_badge_detection(image: Image.Image, row: dict[str, Any]) -> dict[str, Any] | None:
     width, height = image.size
     row_top = float(row.get("rowTop", 0.0) or 0.0)
@@ -1050,8 +1142,9 @@ def _fallback_row_badge_detection(image: Image.Image, row: dict[str, Any]) -> di
         for px in range(x0, x1):
             row_mask.append(_is_red_badge_pixel(image.getpixel((px, py))))
         mask.append(row_mask)
+    components = _connected_components(mask)
     best: dict[str, int] | None = None
-    for component in _connected_components(mask):
+    for component in components:
         comp_w = int(component["width"])
         comp_h = int(component["height"])
         count = int(component["count"])
@@ -1071,7 +1164,22 @@ def _fallback_row_badge_detection(image: Image.Image, row: dict[str, Any]) -> di
         if best is None or count > int(best["count"]):
             best = component
     if best is None:
-        return None
+        embedded = _embedded_numeric_badge_detection(
+            image,
+            x0=x0,
+            x1=x1,
+            y0=y0,
+            y1=y1,
+            red_components=components,
+            name_x=int(round(name_left * width)),
+        )
+        if embedded is None:
+            return None
+        return {
+            **embedded,
+            "numericBadge": True,
+            "unread": True,
+        }
     pad_x = max(1, int(best["width"] * 0.16))
     pad_y = max(1, int(best["height"] * 0.16))
     ix0 = x0 + int(best["minX"]) + pad_x

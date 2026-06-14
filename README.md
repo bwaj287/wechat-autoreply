@@ -17,9 +17,11 @@ The current V5 iteration adds several protections around missed or duplicate rep
 
 - The Brother gateway uses PC model `erge:27b` as its primary logic backend and falls back to local `qwen3.5:9b` when the PC is unavailable.
 - New unread signals can still enter claim flow while another reply is pending, without replacing FIFO queue order.
+- Idle-time passive roster sweeps recover strict numeric unread badges when the Dock signal is missed.
+- Numeric unread badges that touch red-heavy avatars are recovered from their white digit strokes without treating plain red avatars as unread.
 - Recently auto-sent text is remembered for six hours so truncated roster previews or OCR self-echoes are not treated as new inbound messages.
 - Right-side chat bubbles are treated as outbound when color classification conflicts with their position.
-- Peekaboo window-list output tolerates duplicate concatenated JSON responses instead of aborting the entire unread scan.
+- Native OCR and Peekaboo output tolerate diagnostics or duplicate data appended after the first complete JSON response.
 - Very short real messages such as one Chinese character are preserved instead of always becoming a generic placeholder.
 
 ## Why This Project Exists
@@ -472,8 +474,9 @@ The system includes protections against OCR jitter and UI ambiguity:
 - Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
 - Empty panel path triggers reselect attempt before cancel.
 - Dock badge OCR uses dynamic upscaling + adaptive threshold offset for display-scale changes.
+- Roster badge detection validates digit-centered red coverage when a numeric badge merges into a warm-colored avatar.
 - Pending recheck now suppresses some short tail-fragment regressions (for example when a long sentence is re-read as only the last few characters).
-- Peekaboo window enumeration accepts the first complete JSON document when the bridge appends a duplicate response.
+- Native helper output accepts the first complete JSON document when macOS Vision or Peekaboo appends diagnostics or duplicate data.
 - Recent auto-outbound matching covers exact, head/tail fragment, substring, and high-similarity self-echoes.
 
 Image-path specific reliability notes:
@@ -501,6 +504,7 @@ Primary runtime keys in `runtime/config.json`:
 - `send_verify_retry_seconds`: delay before send verification retry.
 - `send_max_attempts`: retry budget for unconfirmed sends.
 - `menubar_check_interval_seconds`: unread signal sampling interval.
+- `passive_roster_sweep_enabled`, `roster_sweep_interval_seconds`: idle-time roster fallback when the Dock signal is missed. The periodic preflight captures the hidden roster without focusing WeChat and only opens it after detecting a numeric unread badge.
 - `pending_stale_ttl_seconds`: stale pending GC TTL.
 - `recent_auto_outbound_ttl_seconds`: how long sent text is retained for self-echo suppression.
 - `allowed_contacts`: whitelist contacts.
@@ -581,7 +585,7 @@ Check:
 
 - Menu signal sampling events (`menu_bar_checked`).
 - Whether `claim_candidates` was followed by `selection_not_confirmed`.
-- Whether a `runner_error` contains `Extra data`; current V5 code tolerates duplicated Peekaboo JSON, so this usually means the runner has not been restarted onto the latest code.
+- Whether a `runner_error` contains `Extra data`; current V5 code tolerates trailing native-tool diagnostics, so this usually means the runner has not been restarted onto the latest code.
 - macOS permissions (Screen Recording, Accessibility).
 - Current display/scale changes that may impact OCR.
 

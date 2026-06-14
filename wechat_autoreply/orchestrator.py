@@ -1813,6 +1813,12 @@ class AutoReplyRunner:
             grace_seconds = max(grace_seconds, sleep_after_click + 1.0)
         return self._run_internal_ui_action(self.ui.probe, *args, grace_seconds=grace_seconds, **kwargs)
 
+    def _probe_roster_background_ui(self) -> dict[str, Any]:
+        probe = getattr(self.ui, "probe_roster_background", None)
+        if not callable(probe):
+            raise RuntimeError("background roster probe unavailable")
+        return dict(probe() or {})
+
     def _focus_input_box_ui(self, selected: dict[str, Any]) -> None:
         self._run_internal_ui_action(self.ui.focus_input_box, selected, grace_seconds=1.0)
 
@@ -2003,6 +2009,41 @@ class AutoReplyRunner:
                 menu_signal_rising = True
             roster_sweep_interval = float(config.get("roster_sweep_interval_seconds", 60) or 60)
             roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= roster_sweep_interval
+            passive_sweep_due = bool(config.get("passive_roster_sweep_enabled", False)) and roster_sweep_due
+            if (
+                passive_sweep_due
+                and not actionable_menu_signal
+                and not bool(state.get("claim_retry_pending", False))
+            ):
+                try:
+                    background_probe = self._probe_roster_background_ui()
+                    visible_chats = list(background_probe.get("visibleChats", []) or [])
+                    allowed_contacts = list(config.get("allowed_contacts", []))
+                    badge_rows = [
+                        {
+                            "name": str(chat.get("name", "")).strip(),
+                            "red": int(chat.get("redPixelCount", 0) or 0),
+                            "digit": int(chat.get("digitPixelCount", 0) or 0),
+                        }
+                        for chat in visible_chats
+                        if _has_row_numeric_unread_badge(chat)
+                        and _match_allowed_contact(str(chat.get("name", "")), allowed_contacts)
+                    ]
+                    state["last_roster_sweep_at"] = now
+                    passive_sweep_due = bool(badge_rows)
+                    self.append_event(
+                        "passive_roster_preflight",
+                        badge_detected=bool(badge_rows),
+                        badge_rows=badge_rows,
+                        visible_chat_count=len(visible_chats),
+                        screenshot=str(background_probe.get("screenshot") or ""),
+                    )
+                except Exception as exc:
+                    self.append_event(
+                        "passive_roster_preflight_failed",
+                        error=str(exc),
+                        fallback="foreground_claim_scan",
+                    )
             pending_claim_allowed = bool(
                 not queue
                 or bool(config.get("sweep_while_pending", False))
@@ -2013,6 +2054,7 @@ class AutoReplyRunner:
                 menu_signal_rising
                 or roster_sweep_due
                 or bool(state.get("claim_retry_pending", False))
+                or passive_sweep_due
             )
             should_sweep = (
                 idle_seconds >= idle_threshold
@@ -2020,17 +2062,25 @@ class AutoReplyRunner:
                 and (
                     (actionable_menu_signal and (menu_checked_now or roster_sweep_due) and claim_signal_allowed)
                     or bool(state.get("claim_retry_pending", False))
+                    or passive_sweep_due
                 )
             )
             claim_result: dict[str, Any] | None = None
             if should_sweep:
                 state["idle_probe_armed"] = False
                 state["last_claim_menu_signal"] = current_menu_signal
+                if bool(state.get("claim_retry_pending", False)):
+                    claim_trigger = "claim_retry"
+                elif actionable_menu_signal:
+                    claim_trigger = "menu_signal"
+                else:
+                    claim_trigger = "passive_roster_sweep"
                 claim_result = self._handle_claim(
                     config,
                     state,
                     idle_seconds,
                     now,
+                    claim_trigger=claim_trigger,
                 )
                 queue = sync_pending_state(state)
 
@@ -2086,6 +2136,8 @@ class AutoReplyRunner:
         state: dict[str, Any],
         idle_seconds: float,
         now: float,
+        *,
+        claim_trigger: str = "menu_signal",
     ) -> dict[str, Any]:
         idle_threshold = float(config.get("idle_threshold_seconds", 30))
         live_idle_seconds = self._live_idle_seconds()
@@ -2106,6 +2158,7 @@ class AutoReplyRunner:
             "wechat_window_action",
             action="open",
             reason="claim_scan",
+            trigger=claim_trigger,
             queue_contacts=queued_contacts(sync_pending_state(state)),
         )
         self._activate_wechat_ui()
@@ -2276,6 +2329,7 @@ class AutoReplyRunner:
                 contacts=[chat.get("name", "") for chat in candidates],
                 visible_unread_rows=unread_rows,
                 row_snapshot=row_snapshot,
+                trigger=claim_trigger,
                 queue_contacts=queued_contacts(queue),
             )
             if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
@@ -2317,11 +2371,14 @@ class AutoReplyRunner:
                     )
             if not candidates:
                 state["claim_retry_pending"] = False
-                non_whitelist_cleared = bool(_clear_non_whitelist_unread(probe_result))
+                non_whitelist_cleared = bool(
+                    claim_trigger != "passive_roster_sweep" and _clear_non_whitelist_unread(probe_result)
+                )
                 self.append_event(
                     "claim_opened_no_new_message",
                     reason="no_visible_whitelist_unread",
                     signal=str(state.get("last_menu_signal") or ""),
+                    trigger=claim_trigger,
                     non_whitelist_cleared=non_whitelist_cleared,
                     visible_chat_count=len(visible_chats),
                     visible_unread_rows=unread_rows,
@@ -2377,6 +2434,10 @@ class AutoReplyRunner:
                     candidate_source = str(candidate.get("source") or "")
                     allow_preview_fallback = candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
                     outbound_snapshot = latest_committed_outbound(panel)
+                    badge_panel_confirms_inbound = bool(
+                        _has_row_numeric_unread_badge(candidate)
+                        and latest_panel_bubble_is_inbound_gray(panel)
+                    )
                     preview_recent_match = _match_recent_auto_outbound(
                         state,
                         contact,
@@ -2384,7 +2445,16 @@ class AutoReplyRunner:
                         now=now,
                         ttl_seconds=recent_outbound_ttl,
                     )
-                    if preview_recent_match:
+                    preview_matches_outbound = _text_matches_outbound(preview_text, outbound_snapshot)
+                    if badge_panel_confirms_inbound and (preview_recent_match or preview_matches_outbound):
+                        self.append_event(
+                            "claim_self_match_overridden_by_inbound_badge",
+                            contact=contact,
+                            preview_text=preview_text,
+                            panel_outbound=outbound_snapshot,
+                            recent_auto_match=bool(preview_recent_match),
+                        )
+                    if preview_recent_match and not badge_panel_confirms_inbound:
                         self.append_event(
                             "claim_skipped_recent_self_preview",
                             contact=contact,
@@ -2394,7 +2464,7 @@ class AutoReplyRunner:
                             age_seconds=preview_recent_match.get("age_seconds"),
                         )
                         continue
-                    if _text_matches_outbound(preview_text, outbound_snapshot):
+                    if preview_matches_outbound and not badge_panel_confirms_inbound:
                         if existing_index >= 0:
                             pending_existing = queue[existing_index]
                             self._cancel_pending(
@@ -2550,7 +2620,7 @@ class AutoReplyRunner:
                         now=now,
                         ttl_seconds=recent_outbound_ttl,
                     )
-                    if inbound_recent_match:
+                    if inbound_recent_match and not badge_panel_confirms_inbound:
                         self.append_event(
                             "claim_skipped_recent_self_echo",
                             contact=contact,
@@ -2596,7 +2666,11 @@ class AutoReplyRunner:
                             panel_inbound=inbound_text,
                         )
                         inbound_text = preview_text
-                    if outbound_snapshot and normalize_text(inbound_text) == normalize_text(outbound_snapshot):
+                    if (
+                        outbound_snapshot
+                        and normalize_text(inbound_text) == normalize_text(outbound_snapshot)
+                        and not badge_panel_confirms_inbound
+                    ):
                         preview_fallback = preview_text
                         if (
                             wechat_ui.has_meaningful_text(preview_fallback)
@@ -2775,10 +2849,15 @@ class AutoReplyRunner:
                 if abort_result is not None:
                     return abort_result
 
-            try:
-                _clear_non_whitelist_unread(follow_up_probe)
-            except Exception as exc:
-                self.append_event("non_whitelist_clear_failed", error=str(exc), queue_contacts=queued_contacts(queue))
+            if claim_trigger != "passive_roster_sweep":
+                try:
+                    _clear_non_whitelist_unread(follow_up_probe)
+                except Exception as exc:
+                    self.append_event(
+                        "non_whitelist_clear_failed",
+                        error=str(exc),
+                        queue_contacts=queued_contacts(queue),
+                    )
 
             changed = added + refreshed
             state["claim_retry_pending"] = False
@@ -2788,7 +2867,12 @@ class AutoReplyRunner:
                 return {"status": "draft_saved", "contact": changed[0], "queue_length": len(queue)}
             return {"status": "drafts_saved", "contacts": changed, "queue_length": len(queue)}
         finally:
-            self.append_event("wechat_window_action", action="hide", reason="claim_scan")
+            self.append_event(
+                "wechat_window_action",
+                action="hide",
+                reason="claim_scan",
+                trigger=claim_trigger,
+            )
             self._hide_wechat_ui()
             if restore_app and hasattr(self.ui, "restore_frontmost_app"):
                 try:

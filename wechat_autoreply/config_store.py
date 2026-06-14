@@ -143,7 +143,7 @@ def default_config() -> dict[str, Any]:
         "chat_panel_vote_frames": 3,
         "chat_panel_vote_interval_seconds": 0.12,
         "preferred_roster_window_bounds": {},
-        "passive_roster_sweep_enabled": False,
+        "passive_roster_sweep_enabled": True,
         "roster_sweep_interval_seconds": 60,
         "sweep_while_pending": False,
         "allowed_contacts": seed_allowed_contacts(),

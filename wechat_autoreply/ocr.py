@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
+from .json_output import load_first_json_object
 from .paths import OCR_HELPER
 
 
@@ -15,5 +15,5 @@ def ocr_image(image_path: Path) -> list[dict]:
         timeout=120,
         check=True,
     )
-    payload = json.loads(proc.stdout)
+    payload = load_first_json_object(proc.stdout)
     return list(payload.get("results", []))
