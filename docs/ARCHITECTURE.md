@@ -3,49 +3,64 @@
 ## Goals
 
 - Keep runtime behavior deterministic and observable.
-- Make on-call debugging possible from logs + queue state only.
-- Enable safe feature extension without breaking gateway controls.
+- Treat OCR, badge, and bubble-role output as evidence rather than truth.
+- Keep policy decisions pure and independently testable.
+- Keep UI side effects behind the orchestrator boundary.
+- Preserve a restartable FIFO queue with one mutation path.
 
-## Layers
+## Runtime Flow
 
-### 1. Entrypoints
+1. `AutoReplyRunner.tick()` samples idle time and the Dock/menu unread signal.
+2. `claim_policy` decides whether evidence is strong enough to enter claim flow.
+3. Passive recovery first captures the hidden roster; WeChat is focused only after a whitelist numeric badge is found.
+4. `wechat_ui` captures windows and returns OCR observations, badge evidence, and panel bubbles.
+5. Claim flow resolves inbound text, suppresses self-echoes, and appends a draft to the FIFO queue.
+6. Pending flow waits for the delay, collects multi-frame OCR samples, and asks `recheck_policy` for consensus.
+7. Manual-reply evidence is classified by `manual_reply_policy` before cancellation.
+8. Send is verified against a committed outbound bubble; uncertain sends remain queued for bounded retry.
 
-- `apps/runner/cli.py`: long-running tick loop.
-- `apps/gateway/cli.py`: operator commands (`on/off/status/queue/reset/restart`).
+## Modules
 
-Legacy wrappers:
+### Entrypoints
 
-- `main.py`
-- `gateway_control.py`
+- `apps/runner/cli.py`: single-process tick loop and runner lock.
+- `apps/gateway/cli.py`: operational commands.
 
-### 2. Core Package
+### Orchestration
 
-- `wechat_autoreply/orchestrator.py`: state machine + decision flow.
-- `wechat_autoreply/wechat_ui.py`: WeChat UI automation and OCR extraction.
-- `wechat_autoreply/vision.py`: menubar unread signal detection.
-- `wechat_autoreply/idle.py`: macOS idle detection.
-- `wechat_autoreply/ollama_client.py`: LLM reply generation.
+- `orchestrator.py`: coordinates sensors, policies, persistence, model calls, and UI side effects.
+- `claim_policy.py`: contact matching, numeric badge thresholds, badge streaks, passive preflight, and claim scheduling.
+- `badge_detection.py`: pixel-level red/digit evidence extraction, including attached warm-avatar badges.
+- `pending_queue.py`: FIFO queue synchronization, lookup, removal, and stale-item pruning.
+- `recheck_policy.py`: deterministic voting over send-time OCR samples.
+- `manual_reply_policy.py`: classifies evidence that the user replied manually.
+- `outbound_history.py`: canonical send matching and bounded recent-outbound self-echo memory.
 
-### 3. Persistence & Observability
+### Observation
 
-- `runtime/config.json`: mutable runtime config.
-- `runtime/state.json`: queue + control-plane state.
-- `runtime/events.jsonl`: append-only event trace.
+- `wechat_ui.py`: WeChat window capture, OCR preparation, row extraction, bubble extraction, and UI actions.
+- `vision.py`: Dock/menu unread signal detection.
+- `ocr.py`: native Vision helper adapter.
+- `json_output.py`: first-complete-JSON parsing for noisy native output.
 
-### 4. Native Helpers
+### Persistence And Observability
 
-- `tools/wechat_row_badges.swift`: chat-row unread badge detection.
-- `tools/wechat_bubble_roles.swift`: inbound/outbound bubble role classification.
-- `tools/wechat_ocr.swift`: OCR bridge.
+- `state_store.py`: atomic state persistence at `~/.openclaw/workspace/wechat-auto-reply-state.json`.
+- `event_log.py`: serialized event writes, retry, and fallback logging.
+- `capture_cleanup.py`: retention cleanup isolated from the main state machine.
 
-## Extension Points
+## Invariants
 
-1. New claim/send policy:
-   - Add pure helper logic near orchestrator helper methods.
-   - Keep queue mutation in one place (`sync_pending_state` path).
-2. New UI detection:
-   - Add detector in `tools/` + call from `wechat_ui.py`.
-   - Keep thresholds normalized to window-relative coordinates.
-3. New control command:
-   - Implement in `apps/gateway/cli.py`.
-   - Keep output one-line friendly for Gateway display.
+- A plain red avatar is never actionable unread evidence.
+- Passive scans do not focus WeChat unless a whitelist numeric badge is found.
+- A gray latest inbound bubble can override text equality with the previous outbound.
+- A pending item is identified and removed by inbound fingerprint, not contact name.
+- `pending` is only a compatibility mirror of `pending_queue[0]`.
+- Event logging and retention cleanup cannot terminate the reply state machine.
+- Foreground WeChat sessions always emit paired open/hide events and restore the previous app when possible.
+
+## Verification
+
+- `tests/`: fast policy and persistence tests.
+- `selftest.py`: integration-style runner scenarios with fake sensors/UI.
+- Native image helpers remain covered by synthetic image regression paths in `selftest.py`.

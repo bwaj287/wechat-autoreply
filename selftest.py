@@ -10,12 +10,13 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from wechat_autoreply.badge_detection import fallback_row_badge_detection
 from wechat_autoreply.capture_cleanup import delete_capture_snapshots_older_than
 from wechat_autoreply.config_store import default_config
 from wechat_autoreply.json_output import load_first_json_object
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import _extract_chat_panel, _fallback_row_badge_detection, find_chat
+from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat
 
 
 class MemoryStore:
@@ -1031,7 +1032,7 @@ def run_passive_roster_sweep_claims_without_menu_signal_path() -> None:
     store = MemoryStore()
     store.config["passive_roster_sweep_enabled"] = True
     store.config["roster_sweep_interval_seconds"] = 60
-    fake_ui = FakeUI(
+    fake_ui = FakeBackgroundUI(
         [
             {
                 "status": "ok",
@@ -1049,6 +1050,22 @@ def run_passive_roster_sweep_claims_without_menu_signal_path() -> None:
                 "status": "ok",
                 "visibleChats": [],
                 "chatPanel": {},
+            },
+        ],
+        [
+            {
+                "status": "ok",
+                "screenshot": "/tmp/background-roster-passive.png",
+                "visibleChats": [
+                    {
+                        "name": "Darren",
+                        "preview": "费了！！",
+                        "unread": True,
+                        "redPixelCount": 120,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
             },
         ]
     )
@@ -1243,14 +1260,14 @@ def run_passive_roster_sweep_does_not_clear_non_whitelist_path() -> None:
     store = MemoryStore()
     store.config["passive_roster_sweep_enabled"] = True
     store.config["roster_sweep_interval_seconds"] = 60
-    fake_ui = FakeUI(
+    fake_ui = FakeBackgroundUI(
+        [],
         [
             {
                 "status": "ok",
                 "visibleChats": [{"name": "Sara", "preview": "在吗", "time": "22:52", "unread": True}],
-                "chatPanel": {},
-            },
-        ]
+            }
+        ],
     )
     runner = AutoReplyRunner(
         vision_sensor=FakeVision([False]),
@@ -1265,8 +1282,8 @@ def run_passive_roster_sweep_does_not_clear_non_whitelist_path() -> None:
     )
 
     result = runner.tick()
-    assert result["status"] == "no_candidate", result
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert result["status"] == "idle_wait", result
+    assert fake_ui.calls == [("probe_background", None)], fake_ui.calls
     assert not any(event["type"] == "non_whitelist_unread_cleared" for event in store.events)
 
 
@@ -1468,6 +1485,108 @@ def run_whitelist_preview_fallback_claim_path() -> None:
     assert result["contact"] == "May", result
     assert store.state["pending"]["contact"] == "May"
     assert store.state["pending"]["inbound_text"] == "在吗"
+
+
+def run_global_signal_visible_whitelist_probe_claim_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    store.config["allowed_contacts"] = ["1ock"]
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [
+                    {
+                        "name": "10ck",
+                        "preview": "哥哥我发现你长得像高司令",
+                        "time": "22:46",
+                        "unread": False,
+                    }
+                ],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "visibleChats": [
+                    {
+                        "name": "1ock",
+                        "preview": "哥哥我发现你长得像高司令",
+                        "time": "22:46",
+                        "unread": False,
+                    }
+                ],
+                "chatPanel": {"latestInbound": "哥哥我发现你长得像高司令", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([2]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("哈哈你别说还真有点"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 11_260.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "1ock", result
+    assert store.state["pending"]["inbound_text"] == "哥哥我发现你长得像高司令"
+
+
+def run_global_signal_hidden_whitelist_search_claim_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    store.config["allowed_contacts"] = ["May", "1ock"]
+    store.state["last_seen_inbound"] = {"May": "older-message"}
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "visibleChats": [{"name": "May", "preview": "好了", "time": "01:50", "unread": True}],
+                "chatPanel": {"latestInbound": "好了", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([2]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("好嘞"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 11_280.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "draft_saved", result
+    assert result["contact"] == "May", result
+    assert store.state["pending"]["inbound_text"] == "好了"
+    assert ("probe", "May") in fake_ui.calls, fake_ui.calls
 
 
 def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
@@ -1737,7 +1856,7 @@ def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
     assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
 
 
-def run_empty_queue_persistent_unread_sweeps_after_interval_path() -> None:
+def run_empty_queue_persistent_unread_suppresses_repeat_claim_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 30
     fake_ui = FakeUI(
@@ -1778,15 +1897,47 @@ def run_empty_queue_persistent_unread_sweeps_after_interval_path() -> None:
 
     clock["now"] = 9_182.0
     third = runner.tick()
-    assert third["status"] == "no_candidate", third
-    assert fake_ui.calls == [
-        "activate",
-        ("probe", None),
-        "hide",
-        "activate",
-        ("probe", None),
-        "hide",
-    ], fake_ui.calls
+    assert third["status"] == "idle_wait", third
+    assert third["menu_unread"] is True, third
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+
+
+def run_same_menu_signal_with_passive_sweep_does_not_reopen_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 30
+    store.config["allowed_contacts"] = ["May"]
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 9_150.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([2, 2]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "no_candidate", first
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+
+    clock["now"] = 9_182.0
+    second = runner.tick()
+    assert second["status"] == "idle_wait", second
+    assert second["menu_unread"] is True, second
+    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
 
 
 def run_send_confirmation_retry_path() -> None:
@@ -2603,7 +2754,7 @@ def run_warm_avatar_attached_badge_detection_path() -> None:
     draw.rectangle((90, 82, 115, 112), fill=(180, 45, 20))
     draw.ellipse((106, 71, 122, 87), fill=(250, 55, 50))
     draw.line((114, 76, 114, 82), fill=(255, 255, 255), width=2)
-    detected = _fallback_row_badge_detection(image, row)
+    detected = fallback_row_badge_detection(image, row)
     assert detected is not None, detected
     assert detected["numericBadge"] is True, detected
     assert detected["digitPixelCount"] >= 6, detected
@@ -2612,7 +2763,7 @@ def run_warm_avatar_attached_badge_detection_path() -> None:
     avatar_draw = ImageDraw.Draw(avatar_only)
     avatar_draw.rectangle((90, 82, 115, 112), fill=(180, 45, 20))
     avatar_draw.line((97, 90, 98, 96), fill=(255, 255, 255), width=2)
-    assert _fallback_row_badge_detection(avatar_only, row) is None
+    assert fallback_row_badge_detection(avatar_only, row) is None
 
 
 def main() -> int:
@@ -2656,11 +2807,14 @@ def main() -> int:
     run_active_whitelist_chat_claim_without_unread_badge_path()
     run_active_whitelist_chat_latest_outbound_skips_path()
     run_whitelist_preview_fallback_claim_path()
+    run_global_signal_visible_whitelist_probe_claim_path()
+    run_global_signal_hidden_whitelist_search_claim_path()
     run_unread_whitelist_candidate_latest_outbound_skips_path()
     run_numeric_badge_inbound_bubble_overrides_outbound_text_match_path()
     run_numeric_badge_latest_outbound_text_match_still_skips_path()
     run_empty_queue_persistent_unread_waits_for_signal_change_path()
-    run_empty_queue_persistent_unread_sweeps_after_interval_path()
+    run_empty_queue_persistent_unread_suppresses_repeat_claim_path()
+    run_same_menu_signal_with_passive_sweep_does_not_reopen_path()
     print("selftest: ok")
     return 0
 

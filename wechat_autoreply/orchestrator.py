@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 import copy
-from difflib import SequenceMatcher
 import hashlib
 import re
 import shutil
@@ -11,13 +10,47 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .capture_cleanup import cleanup_runtime_artifacts_older_than
+from .claim_policy import (
+    candidate_contact_name,
+    canonical_contact_match_key as _canonical_contact_match_key,
+    choose_non_whitelist_unread,
+    choose_whitelist_candidates,
+    contact_badge_streak as _contact_badge_streak,
+    decide_claim,
+    evaluate_passive_preflight,
+    filter_candidates_by_badge_streak as _filter_candidates_by_badge_streak,
+    has_row_numeric_unread_badge as _has_row_numeric_unread_badge,
+    match_allowed_contact as _match_allowed_contact,
+    menu_signal_rising,
+    update_badge_streaks as _update_badge_streaks,
+)
 from .contact_memory import get_contact_memory, remember_contact_memory
 from .config_store import load_config
 from .erge_client import ErgeClient
 from .event_log import append_event
 from .idle import get_idle_time_seconds
+from .manual_reply_policy import detect_manual_reply_trigger
 from .ollama_client import OllamaClient
+from .outbound_history import (
+    compact_message_text as _compact_message_text,
+    draft_match_mode as _draft_match_mode,
+    match_recent_auto_outbound as _match_recent_auto_outbound,
+    message_similarity_score as _message_similarity_score,
+    messages_overlap as _messages_overlap,
+    prune_recent_auto_outbounds as _prune_recent_auto_outbounds,
+    recent_auto_outbound_ttl as _recent_auto_outbound_ttl,
+    remember_recent_auto_outbound as _remember_recent_auto_outbound,
+)
 from .paths import CAPTURE_DIR
+from .pending_queue import (
+    find_queue_index_for_contact,
+    get_pending_queue,
+    prune_stale_pending,
+    queued_contacts,
+    remove_pending_by_fingerprint,
+    sync_pending_state,
+)
+from .recheck_policy import build_recheck_consensus
 from .state_store import load_state, save_state, utc_now_iso
 from .vision import check_unread_dot, unread_signal
 from . import wechat_ui
@@ -29,14 +62,6 @@ HISTORY_MARKER_RE = re.compile(
 DIGIT_PUNCT_SHORT_RE = re.compile(r"^[0-9０-９]+[~～`'\"!！?？.,，。…·•\-_/\\|]*$")
 SYMBOL_ONLY_SHORT_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\-_/\\|]+$")
 SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
-EMOJI_CODE_RE = re.compile(r"\[[^\[\]\s]{1,12}\]")
-EMOJI_CHAR_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
-CONTACT_DAY_SUFFIX_RE = re.compile(
-    r"(?i)\b(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-    r"mon|tue|wed|thu|fri|sat|sun)\b.*$|(?:今天|昨天|前天).*$"
-)
-CONTACT_TIME_SUFFIX_RE = re.compile(r"\b\d{1,2}:\d{2}\b$")
-CONTACT_TRAILING_COUNT_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
 QUOTED_REPLY_CARD_RE = re.compile(r"^\s*([^:：\n]{1,40})\s*[:：]\s*(.+)$")
 STALE_SYSTEM_INBOUND_RE = re.compile(
     r"(?i)\b("
@@ -57,8 +82,6 @@ MEDIA_PREVIEW_PREFIX_RE = re.compile(
     r"(?:[^\]\)）】>〉》］]{0,12})?[\]\)）】>〉》］]"
 )
 MAX_INTERNAL_UI_SUPPRESSION_SECONDS = 0.45
-RECENT_AUTO_OUTBOUND_LIMIT = 8
-RECENT_AUTO_OUTBOUND_TTL_SECONDS = 6 * 60 * 60
 
 
 def normalize_text(text: str) -> str:
@@ -624,264 +647,6 @@ def preview_reliable_for_fallback(preview_text: str) -> bool:
     return len(compact) >= 5
 
 
-def _compact_message_text(text: str) -> str:
-    value = normalize_text(text)
-    return re.sub(r"[\s…。,，!！?？~～·•`'\"\\-_/\\\\|]+", "", value)
-
-
-def _messages_overlap(first: str, second: str) -> bool:
-    first_norm = normalize_text(first)
-    second_norm = normalize_text(second)
-    if not first_norm or not second_norm:
-        return False
-    if first_norm == second_norm or first_norm in second_norm or second_norm in first_norm:
-        return True
-    first_compact = _compact_message_text(first_norm)
-    second_compact = _compact_message_text(second_norm)
-    if not first_compact or not second_compact:
-        return False
-    return first_compact in second_compact or second_compact in first_compact
-
-
-def _message_similarity_score(first: str, second: str) -> float:
-    first_compact = _compact_message_text(first)
-    second_compact = _compact_message_text(second)
-    if not first_compact or not second_compact:
-        return 0.0
-    if first_compact == second_compact:
-        return 1.0
-    if first_compact in second_compact or second_compact in first_compact:
-        shorter = min(len(first_compact), len(second_compact))
-        longer = max(len(first_compact), len(second_compact))
-        if longer and (shorter / longer) >= 0.72:
-            return 0.96
-    if len(first_compact) == len(second_compact) and len(first_compact) >= 4:
-        mismatch = sum(1 for left, right in zip(first_compact, second_compact) if left != right)
-        if mismatch <= 1:
-            return 0.97
-    return SequenceMatcher(None, first_compact, second_compact).ratio()
-
-
-def _canonical_reply_text(text: str) -> str:
-    value = normalize_text(text)
-    if not value:
-        return ""
-    # Remove WeChat emoji code tokens like [偷笑] / [旺柴].
-    value = EMOJI_CODE_RE.sub("", value)
-    # Remove rendered emoji glyphs and major separators/punctuations.
-    value = EMOJI_CHAR_RE.sub("", value)
-    value = re.sub(r"[\s…。,，!！?？~～·•`'\"\\\-_/\\\\|:：;；\[\]\(\)（）【】<>{}《》]+", "", value)
-    return value
-
-
-def _draft_match_mode(draft_text: str, outbound_text: str) -> str:
-    draft_norm = normalize_text(draft_text)
-    outbound_norm = normalize_text(outbound_text)
-    if not draft_norm or not outbound_norm:
-        return ""
-    if draft_norm == outbound_norm:
-        return "strict"
-    if draft_norm in outbound_norm or outbound_norm in draft_norm:
-        return "normalized_substring"
-
-    draft_canonical = _canonical_reply_text(draft_norm)
-    outbound_canonical = _canonical_reply_text(outbound_norm)
-    if not draft_canonical or not outbound_canonical:
-        return ""
-    if draft_canonical == outbound_canonical:
-        return "canonical_exact"
-    if draft_canonical in outbound_canonical or outbound_canonical in draft_canonical:
-        return "canonical_substring"
-
-    max_len = max(len(draft_canonical), len(outbound_canonical))
-    if max_len < 6:
-        return ""
-    min_len = min(len(draft_canonical), len(outbound_canonical))
-    if min_len < max(3, int(max_len * 0.55)):
-        return ""
-    draft_counter = Counter(draft_canonical)
-    outbound_counter = Counter(outbound_canonical)
-    overlap = sum((draft_counter & outbound_counter).values())
-    similarity = overlap / max_len if max_len else 0.0
-    if similarity >= 0.82:
-        return "canonical_charbag"
-    return ""
-
-
-def _auto_outbound_echo_match_mode(candidate_text: str, reference_text: str) -> str:
-    candidate = str(candidate_text or "").strip()
-    reference = str(reference_text or "").strip()
-    if not candidate or not reference:
-        return ""
-    candidate_canonical = _canonical_reply_text(candidate)
-    reference_canonical = _canonical_reply_text(reference)
-    if not candidate_canonical or not reference_canonical:
-        return ""
-    if candidate_canonical == reference_canonical:
-        return "canonical_exact"
-    if (
-        4 <= len(candidate_canonical) <= 16
-        and len(reference_canonical) > len(candidate_canonical)
-        and reference_canonical.endswith(candidate_canonical)
-    ):
-        return "tail_fragment"
-    if (
-        len(candidate_canonical) >= 6
-        and len(reference_canonical) > len(candidate_canonical)
-        and reference_canonical.startswith(candidate_canonical)
-    ):
-        return "head_fragment"
-    if (
-        min(len(candidate_canonical), len(reference_canonical)) >= 6
-        and (
-            candidate_canonical in reference_canonical
-            or reference_canonical in candidate_canonical
-        )
-    ):
-        return "canonical_substring"
-    if min(len(candidate_canonical), len(reference_canonical)) >= 8:
-        similarity = _message_similarity_score(candidate, reference)
-        if similarity >= 0.88:
-            return "similarity"
-    return ""
-
-
-def _recent_auto_outbound_ttl(config: dict[str, Any]) -> float:
-    try:
-        value = float(config.get("recent_auto_outbound_ttl_seconds", RECENT_AUTO_OUTBOUND_TTL_SECONDS))
-    except Exception:
-        value = RECENT_AUTO_OUTBOUND_TTL_SECONDS
-    return max(0.0, value)
-
-
-def _recent_auto_outbounds_bucket(state: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    bucket = state.get("recent_auto_outbounds")
-    if not isinstance(bucket, dict):
-        bucket = {}
-        state["recent_auto_outbounds"] = bucket
-    return bucket
-
-
-def _prune_recent_auto_outbounds(
-    state: dict[str, Any],
-    *,
-    now: float,
-    ttl_seconds: float,
-    limit: int = RECENT_AUTO_OUTBOUND_LIMIT,
-) -> None:
-    bucket = _recent_auto_outbounds_bucket(state)
-    if ttl_seconds <= 0:
-        bucket.clear()
-        return
-    for contact_key in list(bucket.keys()):
-        raw_entries = bucket.get(contact_key)
-        if not isinstance(raw_entries, list):
-            bucket.pop(contact_key, None)
-            continue
-        kept: list[dict[str, Any]] = []
-        for raw_entry in raw_entries:
-            if not isinstance(raw_entry, dict):
-                continue
-            text = str(raw_entry.get("text") or "").strip()
-            if not text:
-                continue
-            ts = float(raw_entry.get("ts", 0.0) or 0.0)
-            if ts > 0 and now - ts > ttl_seconds:
-                continue
-            kept.append(
-                {
-                    "text": text,
-                    "ts": ts,
-                    "source": str(raw_entry.get("source") or "").strip(),
-                }
-            )
-        if kept:
-            bucket[contact_key] = kept[-limit:]
-        else:
-            bucket.pop(contact_key, None)
-
-
-def _recent_auto_outbound_entries(
-    state: dict[str, Any],
-    contact: str,
-    *,
-    now: float,
-    ttl_seconds: float,
-) -> list[dict[str, Any]]:
-    _prune_recent_auto_outbounds(state, now=now, ttl_seconds=ttl_seconds)
-    bucket = _recent_auto_outbounds_bucket(state)
-    contact_value = str(contact or "").strip()
-    entries = list(bucket.get(contact_value) or [])
-    if entries:
-        return entries
-    for key, value in bucket.items():
-        if wechat_ui.names_match(str(key), contact_value):
-            return list(value or [])
-    return []
-
-
-def _remember_recent_auto_outbound(
-    state: dict[str, Any],
-    contact: str,
-    text: str,
-    *,
-    now: float,
-    source: str,
-    ttl_seconds: float,
-    limit: int = RECENT_AUTO_OUTBOUND_LIMIT,
-) -> dict[str, Any]:
-    value = str(text or "").strip()
-    contact_value = str(contact or "").strip()
-    if not contact_value or not wechat_ui.has_meaningful_text(value):
-        return {}
-    _prune_recent_auto_outbounds(state, now=now, ttl_seconds=ttl_seconds, limit=limit)
-    bucket = _recent_auto_outbounds_bucket(state)
-    entries = list(bucket.get(contact_value) or [])
-    normalized_value = normalize_text(value)
-    entries = [entry for entry in entries if normalize_text(str(entry.get("text") or "")) != normalized_value]
-    entry = {"text": value, "ts": now, "source": str(source or "").strip()}
-    entries.append(entry)
-    bucket[contact_value] = entries[-limit:]
-    return entry
-
-
-def _match_recent_auto_outbound(
-    state: dict[str, Any],
-    contact: str,
-    text: str,
-    *,
-    now: float,
-    ttl_seconds: float,
-    extra_texts: list[str] | None = None,
-) -> dict[str, Any]:
-    value = str(text or "").strip()
-    if not value:
-        return {}
-    entries = _recent_auto_outbound_entries(state, contact, now=now, ttl_seconds=ttl_seconds)
-    for extra_text in list(extra_texts or []):
-        extra_value = str(extra_text or "").strip()
-        if extra_value:
-            entries.append({"text": extra_value, "ts": now, "source": "current_pending_draft"})
-    seen: set[str] = set()
-    for entry in reversed(entries):
-        reference = str(entry.get("text") or "").strip()
-        key = normalize_text(reference)
-        if not reference or key in seen:
-            continue
-        seen.add(key)
-        match_mode = _auto_outbound_echo_match_mode(value, reference)
-        if not match_mode:
-            continue
-        ts = float(entry.get("ts", 0.0) or 0.0)
-        return {
-            "match_mode": match_mode,
-            "source": str(entry.get("source") or "").strip(),
-            "age_seconds": round(max(0.0, now - ts), 2) if ts else None,
-            "reference_text": reference,
-        }
-    return {}
-
-
 def _line_matches_outbound_contamination(line: str, references: list[str]) -> bool:
     value = str(line or "").strip()
     if not value:
@@ -1237,169 +1002,6 @@ def _empty_inbound_debug_payload(
     }
 
 
-def candidate_contact_name(candidate: dict[str, Any]) -> str:
-    return str(candidate.get("matchedContact") or candidate.get("name", "")).strip()
-
-
-def _canonical_contact_match_key(text: str) -> str:
-    value = " ".join(str(text or "").strip().split())
-    if not value:
-        return ""
-    value = CONTACT_TRAILING_COUNT_RE.sub("", value).strip()
-    for _ in range(3):
-        before = value
-        value = CONTACT_DAY_SUFFIX_RE.sub("", value).strip()
-        value = CONTACT_TIME_SUFFIX_RE.sub("", value).strip()
-        if value == before:
-            break
-    value = re.sub(r"^[^0-9A-Za-z\u4e00-\u9fff]+|[^0-9A-Za-z\u4e00-\u9fff]+$", "", value).strip()
-    value = wechat_ui.normalize_name_for_match(value)
-    value = " ".join(value.split())
-    return value
-
-
-def _match_allowed_contact(candidate_name: str, allowed_contacts: list[str]) -> str:
-    candidate_key = _canonical_contact_match_key(candidate_name)
-    if not candidate_key:
-        return ""
-    for allowed in allowed_contacts:
-        if candidate_key == _canonical_contact_match_key(allowed):
-            return allowed
-    # Fallback for OCR-truncated names (e.g. "Dar... Yesterday 16:29").
-    # Reuse UI-level robust matcher that handles ellipsis/prefix semantics.
-    for allowed in allowed_contacts:
-        if wechat_ui.names_match(candidate_name, allowed):
-            return allowed
-    return ""
-
-
-def _has_row_numeric_unread_badge(chat: dict[str, Any]) -> bool:
-    if not isinstance(chat, dict):
-        return False
-    # Strict mode: only numeric badge counts as actionable unread.
-    # This avoids false claims caused by generic unread/red heuristics.
-    if not bool(chat.get("numericBadge", False)):
-        return False
-    digit_pixels = int(chat.get("digitPixelCount", 0) or 0)
-    red_pixels = max(1, int(chat.get("redPixelCount", 0) or 0))
-    if digit_pixels >= 10:
-        return True
-    digit_ratio = digit_pixels / red_pixels
-    if digit_pixels >= 8:
-        return digit_ratio >= 0.045
-    if digit_pixels >= 6 and red_pixels <= 80:
-        return digit_ratio >= 0.11
-    return False
-
-
-def _read_badge_streaks(state: dict[str, Any]) -> dict[str, int]:
-    raw = state.get("badge_streaks")
-    if not isinstance(raw, dict):
-        return {}
-    cleaned: dict[str, int] = {}
-    for key, value in raw.items():
-        token = _canonical_contact_match_key(str(key or ""))
-        if not token:
-            continue
-        try:
-            streak = int(value or 0)
-        except Exception:
-            streak = 0
-        if streak > 0:
-            cleaned[token] = streak
-    return cleaned
-
-
-def _badge_streak_key(contact_name: str, allowed_contacts: list[str]) -> str:
-    matched = _match_allowed_contact(contact_name, allowed_contacts) or str(contact_name or "")
-    return _canonical_contact_match_key(matched)
-
-
-def _update_badge_streaks(
-    state: dict[str, Any],
-    probe_result: dict[str, Any],
-    allowed_contacts: list[str],
-) -> dict[str, int]:
-    previous = _read_badge_streaks(state)
-    updated: dict[str, int] = {}
-    for chat in list(probe_result.get("visibleChats", []) or []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        key = _badge_streak_key(str(chat.get("name", "")), allowed_contacts)
-        if not key:
-            continue
-        updated[key] = min(9, int(previous.get(key, 0) or 0) + 1)
-    state["badge_streaks"] = updated
-    return updated
-
-
-def _contact_badge_streak(state: dict[str, Any], contact_name: str, allowed_contacts: list[str]) -> int:
-    key = _badge_streak_key(contact_name, allowed_contacts)
-    if not key:
-        return 0
-    return int(_read_badge_streaks(state).get(key, 0) or 0)
-
-
-def _filter_candidates_by_badge_streak(
-    candidates: list[dict[str, Any]],
-    *,
-    state: dict[str, Any],
-    allowed_contacts: list[str],
-    min_frames: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if min_frames <= 1:
-        return candidates, []
-    stable: list[dict[str, Any]] = []
-    unstable: list[dict[str, Any]] = []
-    for candidate in candidates:
-        contact = candidate_contact_name(candidate)
-        # Strong numeric badge evidence on an exact whitelist hit is reliable enough
-        # to skip the extra frame of debounce. This reduces missed-feeling delays for
-        # top-of-list contacts like May while keeping weak badges on the safer path.
-        digit_pixels = int(candidate.get("digitPixelCount", 0) or 0)
-        if digit_pixels >= 10:
-            stable.append(candidate)
-            continue
-        streak = _contact_badge_streak(state, contact, allowed_contacts)
-        if streak >= min_frames:
-            stable.append(candidate)
-            continue
-        unstable.append(
-            {
-                "contact": contact,
-                "streak": streak,
-                "required": min_frames,
-                "red": int(candidate.get("redPixelCount", 0) or 0),
-                "digit": int(candidate.get("digitPixelCount", 0) or 0),
-            }
-        )
-    return stable, unstable
-
-
-def choose_whitelist_candidates(probe_result: dict[str, Any], allowed_contacts: list[str]) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for chat in probe_result.get("visibleChats", []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        matched_contact = _match_allowed_contact(str(chat.get("name", "")), allowed_contacts)
-        if matched_contact:
-            candidate = copy.deepcopy(chat)
-            candidate["matchedContact"] = matched_contact
-            candidates.append(candidate)
-    return candidates
-
-
-def choose_non_whitelist_unread(probe_result: dict[str, Any], allowed_contacts: list[str]) -> list[dict[str, Any]]:
-    unread: list[dict[str, Any]] = []
-    for chat in probe_result.get("visibleChats", []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        if _match_allowed_contact(str(chat.get("name", "")), allowed_contacts):
-            continue
-        unread.append(copy.deepcopy(chat))
-    return unread
-
-
 def choose_active_whitelist_candidate(probe_result: dict[str, Any], allowed_contacts: list[str]) -> dict[str, Any]:
     active_chat = str(probe_result.get("activeChat") or "").strip()
     if not active_chat:
@@ -1502,33 +1104,139 @@ def choose_whitelist_preview_fallback_candidate(
     return {}
 
 
+def _preview_fingerprint_already_recorded(
+    *,
+    contact: str,
+    preview: str,
+    message_time: str,
+    queue: list[dict[str, Any]],
+    last_seen_inbound: dict[str, str],
+) -> bool:
+    preview_fp = fingerprint(contact, preview, message_time)
+    if str(last_seen_inbound.get(contact, "")) == preview_fp:
+        return True
+    existing_index = find_queue_index_for_contact(queue, contact)
+    if existing_index >= 0:
+        return str(queue[existing_index].get("inbound_fingerprint", "")) == preview_fp
+    return False
+
+
+def choose_global_signal_whitelist_probe_candidates(
+    probe_result: dict[str, Any],
+    allowed_contacts: list[str],
+    *,
+    queue: list[dict[str, Any]],
+    last_seen_inbound: dict[str, str],
+    max_search_contacts: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen_candidate_keys: set[str] = set()
+    visible_contact_keys: set[str] = set()
+    active_chat = str(probe_result.get("activeChat") or "").strip()
+    active_panel = probe_result.get("chatPanel", {}) or {}
+    active_latest_outbound = latest_message_is_outbound(active_panel)
+    visible_chats = sorted(
+        list(probe_result.get("visibleChats", []) or []),
+        key=lambda chat: float(chat.get("ocrTop", 0.0) or 0.0),
+    )
+    for chat in visible_chats:
+        matched_contact = _match_allowed_contact(str(chat.get("name", "")), allowed_contacts)
+        if not matched_contact:
+            continue
+        contact_key = _canonical_contact_match_key(matched_contact)
+        if contact_key:
+            visible_contact_keys.add(contact_key)
+        if _has_row_numeric_unread_badge(chat):
+            continue
+        if (
+            active_chat
+            and active_latest_outbound
+            and _canonical_contact_match_key(matched_contact) == _canonical_contact_match_key(active_chat)
+        ):
+            continue
+        preview = str(chat.get("preview") or "").strip()
+        message_time = str(chat.get("time") or "")
+        if not preview or is_history_marker(preview) or not wechat_ui.has_meaningful_text(preview):
+            continue
+        if not preview_reliable_for_fallback(preview):
+            continue
+        if _preview_fingerprint_already_recorded(
+            contact=matched_contact,
+            preview=preview,
+            message_time=message_time,
+            queue=queue,
+            last_seen_inbound=last_seen_inbound,
+        ):
+            continue
+        candidate = copy.deepcopy(chat)
+        candidate["matchedContact"] = matched_contact
+        candidate["source"] = "global_signal_visible_whitelist_probe"
+        candidates.append(candidate)
+        if contact_key:
+            seen_candidate_keys.add(contact_key)
+
+    search_limit = max(0, int(max_search_contacts or 0))
+    if search_limit <= 0:
+        return candidates
+    search_slots = max(0, search_limit - len(candidates))
+    if search_slots <= 0:
+        return candidates
+
+    queue_order = {
+        _canonical_contact_match_key(contact): index
+        for index, contact in enumerate(queued_contacts(queue))
+        if _canonical_contact_match_key(contact)
+    }
+    seen_order = {
+        _canonical_contact_match_key(contact): index
+        for index, contact in enumerate(last_seen_inbound.keys())
+        if _canonical_contact_match_key(contact)
+    }
+    eligible_search_keys = set(queue_order) | set(seen_order)
+    if not eligible_search_keys:
+        return candidates
+    indexed_contacts = list(enumerate(allowed_contacts))
+    indexed_contacts.sort(
+        key=lambda item: (
+            0 if _canonical_contact_match_key(item[1]) in queue_order else 1,
+            queue_order.get(_canonical_contact_match_key(item[1]), 9999),
+            0 if _canonical_contact_match_key(item[1]) in seen_order else 1,
+            seen_order.get(_canonical_contact_match_key(item[1]), 9999),
+            item[0],
+        )
+    )
+    added_search = 0
+    for _, contact in indexed_contacts:
+        contact_name = str(contact or "").strip()
+        contact_key = _canonical_contact_match_key(contact_name)
+        if not contact_name or not contact_key:
+            continue
+        if contact_key not in eligible_search_keys:
+            continue
+        if contact_key in seen_candidate_keys or contact_key in visible_contact_keys:
+            continue
+        candidates.append(
+            {
+                "name": contact_name,
+                "matchedContact": contact_name,
+                "preview": "",
+                "time": "",
+                "source": "global_signal_whitelist_search",
+                "unread": False,
+            }
+        )
+        seen_candidate_keys.add(contact_key)
+        added_search += 1
+        if added_search >= search_slots:
+            break
+    return candidates
+
+
 def find_visible_chat(probe_result: dict[str, Any], contact: str) -> dict[str, Any]:
     for chat in probe_result.get("visibleChats", []):
         if wechat_ui.names_match(str(chat.get("name", "")), contact):
             return chat
     return {}
-
-
-def get_pending_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
-    queue = state.get("pending_queue")
-    if isinstance(queue, list):
-        return queue
-    pending = state.get("pending")
-    queue = [pending] if pending else []
-    state["pending_queue"] = queue
-    state["pending"] = queue[0] if queue else None
-    return queue
-
-
-def sync_pending_state(state: dict[str, Any], queue: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    current = queue if queue is not None else get_pending_queue(state)
-    state["pending_queue"] = current
-    state["pending"] = current[0] if current else None
-    return current
-
-
-def queued_contacts(queue: list[dict[str, Any]]) -> list[str]:
-    return [str(item.get("contact", "")).strip() for item in queue if item.get("contact")]
 
 
 def latest_committed_outbound(panel: dict[str, Any], max_top: float = 0.90) -> str:
@@ -1647,52 +1355,6 @@ def panel_tail_confidence(panel: dict[str, Any], *, max_items_per_side: int = 2)
     if not values:
         return None
     return min(values)
-
-
-def find_queue_index_for_contact(queue: list[dict[str, Any]], contact: str) -> int:
-    for index, item in enumerate(queue):
-        if wechat_ui.names_match(str(item.get("contact", "")).strip(), contact):
-            return index
-    return -1
-
-
-def remove_pending_by_fingerprint(queue: list[dict[str, Any]], pending: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in queue
-        if item.get("inbound_fingerprint") != pending.get("inbound_fingerprint")
-    ]
-
-
-def _pending_anchor_ts(item: dict[str, Any]) -> float:
-    due_at = float(item.get("due_at", 0.0) or 0.0)
-    created_at = float(item.get("created_at", 0.0) or 0.0)
-    if due_at > 0:
-        return due_at
-    return created_at
-
-
-def prune_stale_pending(
-    queue: list[dict[str, Any]],
-    *,
-    now: float,
-    ttl_seconds: float,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if ttl_seconds <= 0:
-        return list(queue), []
-    kept: list[dict[str, Any]] = []
-    removed: list[dict[str, Any]] = []
-    for item in queue:
-        anchor = _pending_anchor_ts(item)
-        if anchor <= 0:
-            kept.append(item)
-            continue
-        age = now - anchor
-        if age > ttl_seconds:
-            removed.append(item)
-            continue
-        kept.append(item)
-    return kept, removed
 
 
 class AutoReplyRunner:
@@ -1844,6 +1506,47 @@ class AutoReplyRunner:
     def _restore_frontmost_app_ui(self, app_name: str) -> None:
         self._run_internal_ui_action(self.ui.restore_frontmost_app, app_name, grace_seconds=0.75)
 
+    def _open_wechat_foreground(self, *, reason: str, **event_payload: Any) -> str:
+        restore_app = ""
+        if hasattr(self.ui, "capture_frontmost_app"):
+            try:
+                restore_app = str(self.ui.capture_frontmost_app() or "")
+            except Exception:
+                restore_app = ""
+        self.append_event(
+            "wechat_window_action",
+            action="open",
+            reason=reason,
+            **event_payload,
+        )
+        self._activate_wechat_ui()
+        return restore_app
+
+    def _close_wechat_foreground(
+        self,
+        *,
+        reason: str,
+        restore_app: str,
+        **event_payload: Any,
+    ) -> None:
+        self.append_event(
+            "wechat_window_action",
+            action="hide",
+            reason=reason,
+            **event_payload,
+        )
+        self._hide_wechat_ui()
+        if restore_app and hasattr(self.ui, "restore_frontmost_app"):
+            try:
+                self._restore_frontmost_app_ui(restore_app)
+            except Exception as exc:
+                self.append_event(
+                    "restore_frontmost_failed",
+                    context=reason,
+                    error=str(exc),
+                    app=restore_app,
+                )
+
     def _claim_abort_user_active(
         self,
         state: dict[str, Any],
@@ -1958,11 +1661,15 @@ class AutoReplyRunner:
 
             cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 3600))
             if now - float(state.get("last_capture_cleanup_at", 0.0) or 0.0) >= cleanup_interval:
-                cleanup = cleanup_runtime_artifacts_older_than(
-                    older_than_seconds=float(config.get("capture_retention_days", 2)) * 24 * 60 * 60,
-                    now=now,
-                )
                 state["last_capture_cleanup_at"] = now
+                try:
+                    cleanup = cleanup_runtime_artifacts_older_than(
+                        older_than_seconds=float(config.get("capture_retention_days", 2)) * 24 * 60 * 60,
+                        now=now,
+                    )
+                except Exception as exc:
+                    self.append_event("runtime_cleanup_failed", error=str(exc))
+                    cleanup = {}
                 if int(cleanup.get("deleted_count", 0) or 0) > 0:
                     self.append_event(
                         "runtime_cleanup",
@@ -2002,14 +1709,11 @@ class AutoReplyRunner:
             current_menu_signal = str(state.get("last_menu_signal") or "")
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
             previous_claim_signal = str(state.get("last_claim_menu_signal") or "")
-            menu_signal_rising = False
-            if is_actionable_menu_signal(previous_claim_signal) and actionable_menu_signal:
-                menu_signal_rising = int(current_menu_signal) > int(previous_claim_signal)
-            elif actionable_menu_signal and not previous_claim_signal:
-                menu_signal_rising = True
+            menu_signal_rising_now = menu_signal_rising(current_menu_signal, previous_claim_signal)
             roster_sweep_interval = float(config.get("roster_sweep_interval_seconds", 60) or 60)
             roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= roster_sweep_interval
             passive_sweep_due = bool(config.get("passive_roster_sweep_enabled", False)) and roster_sweep_due
+            passive_claim_ready = False
             if (
                 passive_sweep_due
                 and not actionable_menu_signal
@@ -2019,23 +1723,14 @@ class AutoReplyRunner:
                     background_probe = self._probe_roster_background_ui()
                     visible_chats = list(background_probe.get("visibleChats", []) or [])
                     allowed_contacts = list(config.get("allowed_contacts", []))
-                    badge_rows = [
-                        {
-                            "name": str(chat.get("name", "")).strip(),
-                            "red": int(chat.get("redPixelCount", 0) or 0),
-                            "digit": int(chat.get("digitPixelCount", 0) or 0),
-                        }
-                        for chat in visible_chats
-                        if _has_row_numeric_unread_badge(chat)
-                        and _match_allowed_contact(str(chat.get("name", "")), allowed_contacts)
-                    ]
+                    preflight = evaluate_passive_preflight(visible_chats, allowed_contacts)
                     state["last_roster_sweep_at"] = now
-                    passive_sweep_due = bool(badge_rows)
+                    passive_claim_ready = preflight.badge_detected
                     self.append_event(
                         "passive_roster_preflight",
-                        badge_detected=bool(badge_rows),
-                        badge_rows=badge_rows,
-                        visible_chat_count=len(visible_chats),
+                        badge_detected=preflight.badge_detected,
+                        badge_rows=list(preflight.badge_rows),
+                        visible_chat_count=preflight.visible_chat_count,
                         screenshot=str(background_probe.get("screenshot") or ""),
                     )
                 except Exception as exc:
@@ -2044,43 +1739,29 @@ class AutoReplyRunner:
                         error=str(exc),
                         fallback="foreground_claim_scan",
                     )
-            pending_claim_allowed = bool(
-                not queue
-                or bool(config.get("sweep_while_pending", False))
-                or (queue and now >= float(queue[0].get("due_at", 0.0) or 0.0))
-                or menu_signal_rising
-            )
-            claim_signal_allowed = bool(
-                menu_signal_rising
-                or roster_sweep_due
-                or bool(state.get("claim_retry_pending", False))
-                or passive_sweep_due
-            )
-            should_sweep = (
-                idle_seconds >= idle_threshold
-                and pending_claim_allowed
-                and (
-                    (actionable_menu_signal and (menu_checked_now or roster_sweep_due) and claim_signal_allowed)
-                    or bool(state.get("claim_retry_pending", False))
-                    or passive_sweep_due
-                )
+            claim_decision = decide_claim(
+                idle_seconds=idle_seconds,
+                idle_threshold=idle_threshold,
+                has_queue=bool(queue),
+                pending_due=bool(queue and now >= float(queue[0].get("due_at", 0.0) or 0.0)),
+                sweep_while_pending=bool(config.get("sweep_while_pending", False)),
+                actionable_menu_signal=actionable_menu_signal,
+                menu_checked_now=menu_checked_now,
+                menu_signal_rising_now=menu_signal_rising_now,
+                roster_sweep_due=roster_sweep_due,
+                claim_retry_pending=bool(state.get("claim_retry_pending", False)),
+                passive_claim_ready=passive_claim_ready,
             )
             claim_result: dict[str, Any] | None = None
-            if should_sweep:
+            if claim_decision.should_claim:
                 state["idle_probe_armed"] = False
                 state["last_claim_menu_signal"] = current_menu_signal
-                if bool(state.get("claim_retry_pending", False)):
-                    claim_trigger = "claim_retry"
-                elif actionable_menu_signal:
-                    claim_trigger = "menu_signal"
-                else:
-                    claim_trigger = "passive_roster_sweep"
                 claim_result = self._handle_claim(
                     config,
                     state,
                     idle_seconds,
                     now,
-                    claim_trigger=claim_trigger,
+                    claim_trigger=claim_decision.trigger,
                 )
                 queue = sync_pending_state(state)
 
@@ -2147,21 +1828,12 @@ class AutoReplyRunner:
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:
             return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="pre_open_recheck")
-        restore_app = ""
-        if hasattr(self.ui, "capture_frontmost_app"):
-            try:
-                restore_app = str(self.ui.capture_frontmost_app() or "")
-            except Exception:
-                restore_app = ""
         state["last_roster_sweep_at"] = now
-        self.append_event(
-            "wechat_window_action",
-            action="open",
+        restore_app = self._open_wechat_foreground(
             reason="claim_scan",
             trigger=claim_trigger,
             queue_contacts=queued_contacts(sync_pending_state(state)),
         )
-        self._activate_wechat_ui()
         try:
             if self._live_idle_seconds() < idle_threshold:
                 return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="after_open")
@@ -2348,6 +2020,22 @@ class AutoReplyRunner:
                         queue_contacts=queued_contacts(queue),
                     )
             if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
+                global_signal_candidates = choose_global_signal_whitelist_probe_candidates(
+                    probe_result,
+                    allowed_contacts,
+                    queue=queue,
+                    last_seen_inbound=dict(state.get("last_seen_inbound") or {}),
+                    max_search_contacts=int(config.get("global_signal_whitelist_probe_limit", 12) or 12),
+                )
+                if global_signal_candidates:
+                    candidates = global_signal_candidates
+                    self.append_event(
+                        "claim_global_signal_whitelist_probe_candidates",
+                        contacts=[candidate_contact_name(candidate) for candidate in global_signal_candidates],
+                        sources=[str(candidate.get("source") or "") for candidate in global_signal_candidates],
+                        queue_contacts=queued_contacts(queue),
+                    )
+            if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
                 active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
                 if active_fallback:
                     candidates = [active_fallback]
@@ -2429,9 +2117,37 @@ class AutoReplyRunner:
                         self.append_event("claim_skipped", reason="selection_not_confirmed", contact=contact)
                         continue
 
+                    live_visible = find_visible_chat(selected, contact)
+                    if live_visible:
+                        if not str(candidate.get("preview") or "").strip():
+                            candidate["preview"] = str(live_visible.get("preview") or "")
+                        if not str(candidate.get("time") or "").strip():
+                            candidate["time"] = str(live_visible.get("time") or "")
+                        if bool(live_visible.get("unread")):
+                            candidate["unread"] = True
+                        for badge_key in ("redPixelCount", "digitPixelCount", "numericBadge", "click"):
+                            if badge_key in live_visible and not candidate.get(badge_key):
+                                candidate[badge_key] = live_visible.get(badge_key)
+
                     panel = selected.get("chatPanel", {}) or {}
                     preview_text = str(candidate.get("preview") or "")
                     candidate_source = str(candidate.get("source") or "")
+                    if candidate_source.startswith("global_signal_"):
+                        preview_confirms = bool(
+                            wechat_ui.has_meaningful_text(preview_text)
+                            and preview_reliable_for_fallback(preview_text)
+                            and not is_history_marker(preview_text)
+                        )
+                        row_confirms = bool(candidate.get("unread")) or _has_row_numeric_unread_badge(candidate)
+                        panel_confirms = latest_panel_bubble_is_inbound_gray(panel)
+                        if not (preview_confirms or row_confirms or panel_confirms):
+                            self.append_event(
+                                "claim_skipped",
+                                reason="global_signal_probe_unconfirmed",
+                                contact=contact,
+                                source=candidate_source,
+                            )
+                            continue
                     allow_preview_fallback = candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
                     outbound_snapshot = latest_committed_outbound(panel)
                     badge_panel_confirms_inbound = bool(
@@ -2867,18 +2583,11 @@ class AutoReplyRunner:
                 return {"status": "draft_saved", "contact": changed[0], "queue_length": len(queue)}
             return {"status": "drafts_saved", "contacts": changed, "queue_length": len(queue)}
         finally:
-            self.append_event(
-                "wechat_window_action",
-                action="hide",
+            self._close_wechat_foreground(
                 reason="claim_scan",
+                restore_app=restore_app,
                 trigger=claim_trigger,
             )
-            self._hide_wechat_ui()
-            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
-                try:
-                    self._restore_frontmost_app_ui(restore_app)
-                except Exception as exc:
-                    self.append_event("restore_frontmost_failed", context="claim_scan", error=str(exc), app=restore_app)
 
     def _refresh_pending(
         self,
@@ -3043,14 +2752,7 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
-        restore_app = ""
-        if hasattr(self.ui, "capture_frontmost_app"):
-            try:
-                restore_app = str(self.ui.capture_frontmost_app() or "")
-            except Exception:
-                restore_app = ""
-        self.append_event("wechat_window_action", action="open", reason="pending_send_due", contact=contact)
-        self._activate_wechat_ui()
+        restore_app = self._open_wechat_foreground(reason="pending_send_due", contact=contact)
         try:
             if self._live_idle_seconds() < idle_threshold:
                 return self._pending_abort_user_active(
@@ -3297,53 +2999,23 @@ class AutoReplyRunner:
                     events=contamination_events,
                 )
 
-            def _vote_text(values: list[str], *, allow_empty: bool = True) -> str:
-                raws = [str(value or "").strip() for value in values]
-                if not allow_empty:
-                    raws = [value for value in raws if value]
-                if not raws:
-                    return ""
-                normed = [normalize_text(value) for value in raws if allow_empty or value]
-                if not normed:
-                    return ""
-                winner_norm, _ = Counter(normed).most_common(1)[0]
-                winner_raws = [value for value in raws if normalize_text(value) == winner_norm]
-                if not winner_raws:
-                    return ""
-                return max(winner_raws, key=len)
-
-            def _vote_bool(values: list[bool]) -> bool:
-                if not values:
-                    return False
-                needed = (len(values) // 2) + 1
-                return sum(1 for value in values if value) >= needed
-
-            voted_inbound = _vote_text([str(item.get("inbound") or "") for item in samples], allow_empty=True)
-            voted_raw_inbound = _vote_text([str(item.get("raw_inbound") or "") for item in samples], allow_empty=True)
-            voted_outbound = _vote_text([str(item.get("outbound") or "") for item in samples], allow_empty=True)
-            voted_latest_outbound = _vote_bool([bool(item.get("latest_outbound")) for item in samples])
-
-            anchor_snapshot = samples[-1]
-            if voted_outbound:
-                for item in reversed(samples):
-                    if normalize_text(str(item.get("outbound") or "")) == normalize_text(voted_outbound):
-                        anchor_snapshot = item
-                        break
+            consensus = build_recheck_consensus(samples)
+            anchor_snapshot = consensus.anchor_snapshot
             panel = anchor_snapshot.get("panel", {}) or {}
             current_outbound_item = (
                 anchor_snapshot.get("outbound_item") if isinstance(anchor_snapshot.get("outbound_item"), dict) else None
             )
             current_outbound_top = anchor_snapshot.get("outbound_top")
             latest_inbound_top = anchor_snapshot.get("inbound_top")
-            raw_current_inbound = voted_raw_inbound
-            current_inbound = voted_inbound
-            current_outbound = voted_outbound
-            latest_bubble_outbound = voted_latest_outbound
-            has_chat_window = any(bool(item.get("chat_window")) for item in samples)
+            raw_current_inbound = consensus.raw_inbound
+            current_inbound = consensus.inbound
+            current_outbound = consensus.outbound
+            latest_bubble_outbound = consensus.latest_outbound
+            has_chat_window = consensus.has_chat_window
             self.append_event(
                 "pending_recheck_voted",
                 contact=contact,
-                frames=len(samples),
+                frames=consensus.frame_count,
                 voted_inbound=current_inbound,
                 voted_outbound=current_outbound,
                 latest_outbound=latest_bubble_outbound,
@@ -3418,45 +3090,17 @@ class AutoReplyRunner:
                     return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
                 return self._cancel_pending(state, "reply_already_present", pending)
 
-            snapshot_outbound = normalize_text(pending_outbound_snapshot)
-            manual_reply_trigger = ""
-            outbound_changed_from_snapshot = bool(
-                current_outbound and normalize_text(current_outbound) != snapshot_outbound
-            )
             ultra_short_inbound_tail = bool(current_inbound and _is_ultra_short_fragment(current_inbound))
-            if (
-                not current_inbound
-                and outbound_changed_from_snapshot
-            ):
-                manual_reply_trigger = "outbound_without_inbound"
-            outbound_after_latest_inbound = bool(
-                current_outbound
-                and current_outbound_top is not None
-                and latest_inbound_top is not None
-                and current_outbound_top > latest_inbound_top + 0.01
+            manual_reply = detect_manual_reply_trigger(
+                current_inbound=current_inbound,
+                current_outbound=current_outbound,
+                pending_outbound_snapshot=pending_outbound_snapshot,
+                current_outbound_top=current_outbound_top,
+                latest_inbound_top=latest_inbound_top,
+                latest_bubble_outbound=latest_bubble_outbound,
+                ultra_short_inbound_tail=ultra_short_inbound_tail,
             )
-            manual_reply_has_inbound_evidence = bool(current_inbound) or latest_inbound_top is not None
-            if (
-                not manual_reply_trigger
-                and latest_bubble_outbound
-                and manual_reply_has_inbound_evidence
-                and current_outbound
-            ):
-                manual_reply_trigger = "latest_bubble_outbound"
-            if (
-                not manual_reply_trigger
-                and outbound_changed_from_snapshot
-                and manual_reply_has_inbound_evidence
-                and outbound_after_latest_inbound
-            ):
-                manual_reply_trigger = "outbound_after_latest_inbound"
-            if (
-                not manual_reply_trigger
-                and outbound_changed_from_snapshot
-                and ultra_short_inbound_tail
-            ):
-                manual_reply_trigger = "outbound_with_ultra_short_inbound_tail"
-            if manual_reply_trigger:
+            if manual_reply.detected:
                 reliable_signal, blockers = _manual_reply_signal_is_reliable(
                     current_outbound=current_outbound,
                     current_inbound="" if ultra_short_inbound_tail else current_inbound,
@@ -3476,7 +3120,7 @@ class AutoReplyRunner:
                 self.append_event(
                     "pending_manual_reply_ambiguous",
                     contact=contact,
-                    trigger=manual_reply_trigger,
+                    trigger=manual_reply.trigger,
                     blockers=blockers,
                     current_inbound=current_inbound,
                     current_outbound=current_outbound,
@@ -3914,18 +3558,11 @@ class AutoReplyRunner:
                 "send_attempts": updated["send_attempts"],
             }
         finally:
-            self.append_event("wechat_window_action", action="hide", reason="pending_send_due", contact=contact)
-            self._hide_wechat_ui()
-            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
-                try:
-                    self._restore_frontmost_app_ui(restore_app)
-                except Exception as exc:
-                    self.append_event(
-                        "restore_frontmost_failed",
-                        context="pending_send_due",
-                        error=str(exc),
-                        app=restore_app,
-                    )
+            self._close_wechat_foreground(
+                reason="pending_send_due",
+                restore_app=restore_app,
+                contact=contact,
+            )
 
 
 class _VisionSensor:

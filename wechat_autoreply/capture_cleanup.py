@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from .event_log import event_file_lock
 from .paths import CAPTURE_DIR, DEBUG_DIR, EVENTS_PATH, LOG_DIR
 
 
 DEFAULT_CAPTURE_PATTERNS = ("*.png",)
+RETRYABLE_ERRNOS = {errno.EAGAIN, errno.EDEADLK}
 
 
 def _delete_old_files(
@@ -50,7 +53,7 @@ def _delete_old_files(
     }
 
 
-def _prune_events_file(
+def _prune_events_file_once(
     *,
     older_than_seconds: float,
     now: float,
@@ -64,38 +67,39 @@ def _prune_events_file(
     deleted_lines = 0
     deleted_bytes = 0
 
-    with events_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.rstrip("\n")
-            if not line:
-                continue
-            keep = True
-            try:
-                payload = json.loads(line)
-                ts_text = str(payload.get("ts") or "").strip()
-                if ts_text:
-                    event_ts = datetime.fromisoformat(ts_text)
-                    if event_ts.tzinfo is None:
-                        event_ts = event_ts.replace(tzinfo=timezone.utc)
-                    event_ts = event_ts.astimezone(timezone.utc)
-                    if event_ts < cutoff:
-                        keep = False
-            except Exception:
+    with event_file_lock(events_path):
+        with events_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line:
+                    continue
                 keep = True
-            if keep:
-                kept_lines.append(line)
-            else:
-                deleted_lines += 1
-                deleted_bytes += len(raw_line.encode("utf-8"))
+                try:
+                    payload = json.loads(line)
+                    ts_text = str(payload.get("ts") or "").strip()
+                    if ts_text:
+                        event_ts = datetime.fromisoformat(ts_text)
+                        if event_ts.tzinfo is None:
+                            event_ts = event_ts.replace(tzinfo=timezone.utc)
+                        event_ts = event_ts.astimezone(timezone.utc)
+                        if event_ts < cutoff:
+                            keep = False
+                except Exception:
+                    keep = True
+                if keep:
+                    kept_lines.append(line)
+                else:
+                    deleted_lines += 1
+                    deleted_bytes += len(raw_line.encode("utf-8"))
 
-    if deleted_lines <= 0:
-        return {"deleted_count": 0, "deleted_bytes": 0, "deleted_lines": 0, "kept_lines": len(kept_lines)}
+        if deleted_lines <= 0:
+            return {"deleted_count": 0, "deleted_bytes": 0, "deleted_lines": 0, "kept_lines": len(kept_lines)}
 
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=events_path.parent, delete=False) as handle:
-        temp_path = Path(handle.name)
-        for line in kept_lines:
-            handle.write(line + "\n")
-    temp_path.replace(events_path)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=events_path.parent, delete=False) as handle:
+            temp_path = Path(handle.name)
+            for line in kept_lines:
+                handle.write(line + "\n")
+        temp_path.replace(events_path)
 
     return {
         "deleted_count": 1,
@@ -104,6 +108,32 @@ def _prune_events_file(
         "kept_lines": len(kept_lines),
         "deleted_paths": [str(events_path)],
     }
+
+
+def _prune_events_file(
+    *,
+    older_than_seconds: float,
+    now: float,
+    events_path: Path = EVENTS_PATH,
+) -> dict[str, Any]:
+    delays = (0.0, 0.03, 0.12)
+    last_error: OSError | None = None
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            return _prune_events_file_once(
+                older_than_seconds=older_than_seconds,
+                now=now,
+                events_path=events_path,
+            )
+        except OSError as exc:
+            last_error = exc
+            if exc.errno not in RETRYABLE_ERRNOS:
+                raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("event pruning retry loop completed without a result")
 
 
 def cleanup_runtime_artifacts_older_than(

@@ -147,12 +147,15 @@ def _format_contact_memory_block(contact_memory: dict[str, Any] | None) -> str:
     if not isinstance(contact_memory, dict):
         return ""
     profile = _clean_context_line(str(contact_memory.get("profile", "")), max_chars=160)
-    recent_summary = _clean_context_line(str(contact_memory.get("recent_summary", "")), max_chars=320)
+    recent_summary = _clean_context_line(str(contact_memory.get("recent_summary", "")), max_chars=220)
     lines: list[str] = []
     if profile:
         lines.append(f"Contact profile: {profile}")
     if recent_summary:
-        lines.append(f"Longer-term memory with this contact: {recent_summary}")
+        lines.append(
+            "Light recent memory with this contact "
+            f"(weak signal; do not revive old jokes/topics unless the latest message clearly continues them): {recent_summary}"
+        )
     if not lines:
         return ""
     return "\n".join(lines) + "\n\n"

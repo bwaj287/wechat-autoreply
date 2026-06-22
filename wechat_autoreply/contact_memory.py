@@ -11,6 +11,10 @@ from typing import Any
 from .paths import CONTACT_MEMORY_PATH, CONTACT_MEMORY_SEED_PATH, ensure_runtime_dirs
 
 _SHORT_NOISE_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\\-_/|]{1,6}$")
+MEMORY_DECAY_HOURS = 18.0
+MEMORY_SUMMARY_MAX_CHARS = 220
+MEMORY_CONTEXT_TAIL_LIMIT = 4
+MEMORY_MIN_EVENTS = 4
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -204,6 +208,30 @@ def clear_contact_recent_memory(contact: str) -> dict[str, Any]:
     return get_contact_memory(key)
 
 
+def clear_all_recent_memory() -> dict[str, Any]:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    store = load_contact_memory_store()
+    contacts = dict(store.get("contacts") or {})
+    cleared_contacts: list[str] = []
+    for key, value in list(contacts.items()):
+        entry = _default_contact_entry()
+        if isinstance(value, dict):
+            entry.update(value)
+        if str(entry.get("recent_summary") or "").strip() or list(entry.get("recent_events") or []):
+            cleared_contacts.append(str(key))
+        entry["recent_summary"] = ""
+        entry["recent_events"] = []
+        entry["updated_at"] = timestamp
+        contacts[str(key)] = entry
+    store["contacts"] = contacts
+    save_contact_memory_store(store)
+    return {
+        "cleared_contacts": sorted(cleared_contacts),
+        "cleared_count": len(cleared_contacts),
+        "updated_at": timestamp,
+    }
+
+
 def set_contact_profile_lock(contact: str, locked: bool) -> dict[str, Any]:
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     store = load_contact_memory_store()
@@ -222,7 +250,7 @@ def set_contact_profile_lock(contact: str, locked: bool) -> dict[str, Any]:
 def _event_weight(event: dict[str, Any], now: datetime) -> float:
     event_time = _parse_dt(str(event.get("ts") or "")) or now
     age = max(0.0, (now - event_time).total_seconds() / 3600.0)
-    return math.exp(-age / 72.0)
+    return math.exp(-age / MEMORY_DECAY_HOURS)
 
 
 def _summarize_recent_events(events: list[dict[str, Any]], now: datetime) -> str:
@@ -243,8 +271,8 @@ def _summarize_recent_events(events: list[dict[str, Any]], now: datetime) -> str
     if not scored:
         return ""
     scored.sort(key=lambda item: item[0], reverse=True)
-    contact_lines = [item["text"] for _, item in scored if item["role"] == "contact"][:3]
-    self_lines = [item["text"] for _, item in scored if item["role"] == "self"][:2]
+    contact_lines = [item["text"] for _, item in scored if item["role"] == "contact"][:2]
+    self_lines = [item["text"] for _, item in scored if item["role"] == "self"][:1]
     parts: list[str] = []
     if contact_lines:
         if len(contact_lines) == 1:
@@ -257,7 +285,7 @@ def _summarize_recent_events(events: list[dict[str, Any]], now: datetime) -> str
         else:
             parts.append("You recently replied " + " / ".join(self_lines))
     summary = "; ".join(parts).strip()
-    return summary[:320].strip()
+    return summary[:MEMORY_SUMMARY_MAX_CHARS].strip()
 
 
 def remember_contact_memory(
@@ -267,8 +295,8 @@ def remember_contact_memory(
     inbound_text: str = "",
     outbound_text: str = "",
     now: datetime | None = None,
-    max_events: int = 18,
-    retention_days: int = 14,
+    max_events: int = 6,
+    retention_days: int = 3,
 ) -> dict[str, Any]:
     timestamp = now or datetime.now().astimezone()
     store = load_contact_memory_store()
@@ -294,14 +322,9 @@ def remember_contact_memory(
         role = "self" if str(item.get("role") or "").strip().lower() == "self" else "contact"
         filtered_events.append({"role": role, "text": text, "ts": str(item.get("ts") or "")})
 
-    for item in list(context_messages or [])[-6:]:
-        if not isinstance(item, dict):
-            continue
-        role = "self" if str(item.get("role") or "").strip().lower() == "self" else "contact"
-        text = _clean_line(str(item.get("text") or ""))
-        if not _is_meaningful_memory_text(text):
-            continue
-        filtered_events.append({"role": role, "text": text, "ts": timestamp.isoformat(timespec="seconds")})
+    # Context messages are screen-derived hints for this generation only. Do not
+    # persist them, because doing so refreshes old visible chat lines as new memory.
+    _ = context_messages
 
     latest_inbound = _clean_line(inbound_text)
     if _is_meaningful_memory_text(latest_inbound):
@@ -322,7 +345,7 @@ def remember_contact_memory(
             continue
         deduped.append({"role": role, "text": text, "ts": str(item.get("ts") or "")})
 
-    deduped = deduped[-max(6, int(max_events)) :]
+    deduped = deduped[-max(MEMORY_MIN_EVENTS, int(max_events)) :]
     recent_summary = _summarize_recent_events(deduped, timestamp)
     contacts[key] = {
         "profile": profile,

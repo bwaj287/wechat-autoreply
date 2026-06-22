@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import RUNTIME_DIR, STATE_PATH, ensure_runtime_dirs
+from .pending_queue import sync_pending_state
 
 LEGACY_STATE_PATH = RUNTIME_DIR / "state.json"
 
@@ -70,12 +71,9 @@ def load_state() -> dict[str, Any]:
     merged = default_state()
     merged.update(state)
     merged.pop("menu_claim_suppressed", None)
-    pending_queue = list(merged.get("pending_queue") or [])
-    pending = merged.get("pending")
-    if pending and not pending_queue:
-        pending_queue = [pending]
-    merged["pending_queue"] = pending_queue
-    merged["pending"] = pending_queue[0] if pending_queue else None
+    if merged.get("pending") and not list(merged.get("pending_queue") or []):
+        merged["pending_queue"] = [merged["pending"]]
+    sync_pending_state(merged, list(merged.get("pending_queue") or []))
     if merged != state:
         _atomic_write(STATE_PATH, merged)
     return merged
@@ -86,10 +84,7 @@ def save_state(state: dict[str, Any]) -> None:
     merged = default_state()
     merged.update(state)
     merged.pop("menu_claim_suppressed", None)
-    pending_queue = list(merged.get("pending_queue") or [])
-    pending = merged.get("pending")
-    if pending and not pending_queue:
-        pending_queue = [pending]
-    merged["pending_queue"] = pending_queue
-    merged["pending"] = pending_queue[0] if pending_queue else None
+    if merged.get("pending") and not list(merged.get("pending_queue") or []):
+        merged["pending_queue"] = [merged["pending"]]
+    sync_pending_state(merged, list(merged.get("pending_queue") or []))
     _atomic_write(STATE_PATH, merged)

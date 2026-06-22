@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from wechat_autoreply.contact_memory import (
+    clear_all_recent_memory,
     clear_contact_recent_memory,
     get_contact_memory,
     set_contact_profile,
@@ -50,6 +51,7 @@ SUPPORTED_COMMANDS = [
     "memory-show",
     "memory-set",
     "memory-clear",
+    "memory-clear-all",
     "memory-lock",
     "memory-unlock",
     "command",
@@ -63,8 +65,8 @@ RUNNER_PATTERNS = (
     str(PROJECT_ROOT / "apps" / "runner" / "cli.py"),
 )
 
-LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v1"
-LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v1.plist")
+LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v6"
+LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v6.plist")
 
 
 def parse_args() -> argparse.Namespace:
@@ -561,6 +563,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- memory-show <联系人>：查看该联系人的长期画像 + 短期摘要",
         '- memory-set <联系人> "<画像>"：手动设置该联系人的长期画像',
         "- memory-clear <联系人>：清空该联系人的短期摘要与最近事件（保留长期画像）",
+        "- memory-clear-all：清空所有联系人短期摘要与最近事件（保留长期画像）",
         "- memory-lock <联系人>：锁定长期画像，防止后续误改",
         "- memory-unlock <联系人>：解锁长期画像",
         "",
@@ -669,6 +672,15 @@ def main() -> int:
         memory = clear_contact_recent_memory(args.contact_name)
         append_event("gateway_memory_recent_cleared", contact=memory.get("contact"))
         state = load_state()
+    elif command == "memory-clear-all":
+        config = load_config()
+        memory_clear_all_result = clear_all_recent_memory()
+        append_event(
+            "gateway_memory_all_recent_cleared",
+            cleared_count=memory_clear_all_result.get("cleared_count"),
+            cleared_contacts=memory_clear_all_result.get("cleared_contacts"),
+        )
+        state = load_state()
     elif command == "memory-lock":
         config = load_config()
         memory = set_contact_profile_lock(args.contact_name, True)
@@ -710,6 +722,9 @@ def main() -> int:
     elif command == "memory-clear":
         print(f"微信自动回复：已清空 {memory.get('contact') or args.contact_name} 的短期记忆")
         print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
+    elif command == "memory-clear-all":
+        cleared_count = int(memory_clear_all_result.get("cleared_count") or 0)
+        print(f"微信自动回复：已清空所有联系人短期记忆（{cleared_count} 个联系人）")
     elif command == "memory-lock":
         print(f"微信自动回复：已锁定 {memory.get('contact') or args.contact_name} 的长期画像")
         print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
