@@ -23,6 +23,7 @@ IGNORE_TEXTS = {
     "Search",
     "Hold to Fn to use voice input",
 }
+LOGIN_ENTRY_TEXTS = {"enter weixin", "enter wechat"}
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 DOCK_WECHAT_NAMES = ["WeChat", "Weixin"]
 TEXT_SIGNAL_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
@@ -62,6 +63,13 @@ TARGET_ROSTER_WINDOW_HEIGHT = 820
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def wechat_login_required(obs_list: list[dict[str, Any]]) -> bool:
+    texts = {normalize_text(str(item.get("text") or "")) for item in obs_list}
+    if texts & LOGIN_ENTRY_TEXTS:
+        return True
+    return "switch account" in texts and "transfer files only" in texts
 
 
 def normalize_name_for_match(text: str) -> str:
@@ -557,6 +565,13 @@ def probe_roster_background() -> dict[str, Any]:
     roster_path = CAPTURE_DIR / f"wechat-roster-background-{timestamp}.png"
     capture_window(roster_path, roster_info)
     roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    if wechat_login_required(roster_obs):
+        return {
+            "status": "login_required",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "visibleChats": [],
+        }
     chats = annotate_unread_chats(
         extract_visible_chats(roster_obs, roster_info),
         roster_path,
@@ -1508,6 +1523,19 @@ def probe(
     roster_path = CAPTURE_DIR / f"wechat-roster-{timestamp}.png"
     capture_window(roster_path, roster_info)
     roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    if wechat_login_required(roster_obs):
+        return {
+            "status": "login_required",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "screenshots": {"roster": str(roster_path), "chat": ""},
+            "visibleChats": [],
+            "selectedChat": "",
+            "selectedChatRequested": select_chat or "",
+            "activeChat": "",
+            "selectionConfirmed": False,
+            "chatPanel": {},
+        }
     chats = annotate_unread_chats(
         extract_visible_chats(roster_obs, roster_info),
         roster_path,

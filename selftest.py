@@ -14,9 +14,9 @@ from wechat_autoreply.badge_detection import fallback_row_badge_detection
 from wechat_autoreply.capture_cleanup import delete_capture_snapshots_older_than
 from wechat_autoreply.config_store import default_config
 from wechat_autoreply.json_output import load_first_json_object
-from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text
+from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text, fingerprint
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat
+from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat, wechat_login_required
 
 
 class MemoryStore:
@@ -25,6 +25,7 @@ class MemoryStore:
         self.config["enabled"] = True
         self.config["passive_roster_sweep_enabled"] = False
         self.state = default_state()
+        self.saved_states: list[dict] = []
         self.events: list[dict] = []
 
     def load_config(self):
@@ -35,6 +36,7 @@ class MemoryStore:
 
     def save_state(self, state):
         self.state = copy.deepcopy(state)
+        self.saved_states.append(copy.deepcopy(state))
 
     def append_event(self, event_type, **payload):
         self.events.append({"type": event_type, **payload})
@@ -430,6 +432,184 @@ def run_old_outbound_before_inbound_is_not_manual_reply_path() -> None:
     assert not any(event["type"] == "pending_cancelled" for event in store.events), store.events
 
 
+def run_pending_selection_failure_retries_instead_of_cancel_path() -> None:
+    store = MemoryStore()
+    store.config["pending_selection_retry_seconds"] = 60
+    store.config["pending_selection_retry_max_attempts"] = 2
+    pending = {
+        "contact": "1ock",
+        "inbound_text": "我真的吓死了",
+        "message_time": "11:25",
+        "inbound_fingerprint": "fp-1ock",
+        "draft_text": "吓啥，稳住",
+        "created_at": 900.0,
+        "due_at": 950.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "1ock",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "May",
+                "chatPanel": {},
+            }
+        ]
+    )
+    state = store.load_state()
+    config = store.load_config()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1000.0,
+    )
+
+    result = runner._handle_pending(config, state, state["pending_queue"][0], idle_seconds=45, now=1000.0)
+
+    assert result["status"] == "pending_retry_selection_not_confirmed", result
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["1ock"]
+    assert store.state["pending"]["selection_retry_count"] == 1
+    assert store.state["pending"]["due_at"] == 1060.0
+    assert any(event["type"] == "pending_selection_retry_scheduled" for event in store.events), store.events
+    assert not any(event["type"] == "pending_cancelled" for event in store.events), store.events
+
+
+def run_pending_title_ocr_garbage_uses_panel_preview_evidence_path() -> None:
+    store = MemoryStore()
+    store.config["recheck_vote_frames"] = 1
+    pending = {
+        "contact": "May",
+        "inbound_text": "排位也变成132吗",
+        "message_time": "01:28",
+        "inbound_fingerprint": fingerprint("May", "排位也变成132吗", "01:28"),
+        "draft_text": "你是说段位还是分？",
+        "created_at": 900.0,
+        "due_at": 950.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "May",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "JAJWTHBXN UTSPミミッE",
+                "selectedChat": "May",
+                "selectedChatRequested": "May",
+                "visibleChats": [
+                    {"name": "May", "preview": "排位也变成132吗", "time": "01:28", "unread": False}
+                ],
+                "chatPanel": {
+                    "latestInbound": "排位也变成132吗",
+                    "latestOutbound": "",
+                    "inbound": [
+                        {
+                            "text": "排位也变成132吗",
+                            "top": 0.72,
+                            "left": 0.08,
+                            "width": 0.24,
+                            "grayPixels": 120,
+                            "greenPixels": 0,
+                        }
+                    ],
+                    "outbound": [],
+                },
+            }
+        ]
+    )
+    state = store.load_state()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1000.0,
+        dry_run=True,
+    )
+
+    result = runner._handle_pending(
+        store.load_config(), state, state["pending_queue"][0], idle_seconds=45, now=1000.0
+    )
+
+    assert result["status"] == "dry_run_sent", result
+    assert state["pending"] is None
+    assert any(
+        event["type"] == "pending_selection_confirmed_by_panel_evidence"
+        and event.get("contact") == "May"
+        for event in store.events
+    ), store.events
+    assert not any(event["type"] == "pending_selection_retry_scheduled" for event in store.events), store.events
+
+
+def run_pending_selection_failure_snoozes_after_retry_budget_path() -> None:
+    store = MemoryStore()
+    store.config["pending_selection_retry_seconds"] = 60
+    store.config["pending_selection_retry_max_attempts"] = 2
+    store.config["pending_selection_snooze_seconds"] = 1800
+    pending = {
+        "contact": "1ock",
+        "inbound_text": "我真的吓死了",
+        "message_time": "11:25",
+        "inbound_fingerprint": "fp-1ock",
+        "draft_text": "吓啥，稳住",
+        "created_at": 900.0,
+        "due_at": 950.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "1ock",
+        "selection_retry_count": 2,
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "May",
+                "chatPanel": {},
+            }
+        ]
+    )
+    state = store.load_state()
+    config = store.load_config()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1000.0,
+    )
+
+    result = runner._handle_pending(config, state, state["pending_queue"][0], idle_seconds=45, now=1000.0)
+
+    assert result["status"] == "pending_selection_snoozed", result
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["1ock"]
+    assert store.state["pending"]["selection_retry_count"] == 0
+    assert store.state["pending"]["selection_snooze_count"] == 1
+    assert store.state["pending"]["due_at"] == 2800.0
+    assert any(event["type"] == "pending_selection_snoozed" for event in store.events), store.events
+    assert not any(event["type"] == "pending_cancelled" for event in store.events), store.events
+
+
 def run_multi_queue_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -587,6 +767,18 @@ def run_history_marker_trim_path() -> None:
     assert choose_inbound_text(panel, "") == "Haode"
     multiline_panel = {"latestInbound": "Yesterday 20:39\n今天有湖人比赛吗\nHaode"}
     assert choose_inbound_text(multiline_panel, "Haode") == "Haode"
+
+
+def run_wechat_login_required_detection_path() -> None:
+    assert wechat_login_required([{"text": "Enter Weixin"}])
+    assert wechat_login_required([{"text": "Switch Account"}, {"text": "Transfer files only"}])
+    assert not wechat_login_required([{"text": "May"}, {"text": "在吗"}])
+
+
+def run_ocr_symbol_tail_trim_path() -> None:
+    assert choose_inbound_text({"latestInbound": "去不去\n日％•"}, "去不去") == "去不去"
+    assert choose_inbound_text({"latestInbound": "没事哈哈哈哈\n日％♥"}, "没事哈哈哈哈") == "没事哈哈哈哈"
+    assert choose_inbound_text({"latestInbound": "现在在专心赌球\nU"}, "现在在专心赌球") == "现在在专心赌球"
 
 
 def run_preview_matching_outbound_is_not_inbound_path() -> None:
@@ -810,6 +1002,48 @@ def run_pending_menu_flicker_does_not_trigger_claim_path() -> None:
     assert store.state["last_claim_menu_signal"] == "1"
     assert fake_ui.calls == [], fake_ui.calls
     assert not any(event["type"] == "claim_candidates" for event in store.events), store.events
+
+
+def run_empty_claim_menu_flicker_does_not_reopen_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 9_100.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True, False, True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("yo"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "no_candidate", first
+    assert store.state["last_claim_menu_signal"] == "1"
+
+    clock["now"] = 9_120.0
+    second = runner.tick()
+    assert second["status"] == "idle_wait", second
+    assert store.state["last_claim_menu_signal"] == "1"
+    assert store.state["pending_menu_clear_streak"] == 1
+
+    clock["now"] = 9_140.0
+    third = runner.tick()
+    assert third["status"] == "idle_wait", third
+    assert fake_ui.calls.count("activate") == 1, fake_ui.calls
+    assert sum(1 for event in store.events if event["type"] == "claim_candidates") == 1, store.events
 
 
 def run_queue_claims_on_menu_rising_path() -> None:
@@ -1216,6 +1450,356 @@ def run_passive_roster_sweep_opens_only_after_background_badge_path() -> None:
     ), store.events
 
 
+def run_passive_roster_sweep_queues_whitelist_while_pending_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    store.config["allowed_contacts"] = ["Darren", "1ock"]
+    pending = {
+        "contact": "Darren",
+        "inbound_text": "对 饿了 走了",
+        "message_time": "11:14",
+        "inbound_fingerprint": "fp-darren",
+        "draft_text": "行那你先吃，慢走啊",
+        "created_at": 21_000.0,
+        "due_at": 22_000.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "Darren",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeBackgroundUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": "晚上打不打", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "chatPanel": {"latestInbound": "晚上打不打", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ],
+        [
+            {
+                "status": "ok",
+                "screenshot": "/tmp/background-roster-pending-1ock.png",
+                "visibleChats": [
+                    {
+                        "name": "1ock",
+                        "preview": "晚上打不打",
+                        "unread": True,
+                        "redPixelCount": 120,
+                        "digitPixelCount": 10,
+                        "numericBadge": True,
+                    }
+                ],
+            }
+        ],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("打，几点"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 21_100.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "pending_wait_delay", result
+    assert result["queue_length"] == 2, result
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["Darren", "1ock"]
+    assert store.state["pending"]["contact"] == "Darren"
+    assert ("probe_background", None) in fake_ui.calls
+    assert "activate" in fake_ui.calls
+
+
+def run_passive_roster_sweep_ignores_badge_for_already_queued_contact_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    store.config["allowed_contacts"] = ["1ock"]
+    pending = {
+        "contact": "1ock",
+        "inbound_text": "我真的吓死了",
+        "message_time": "11:25",
+        "inbound_fingerprint": "fp-1ock",
+        "draft_text": "吓啥，稳住",
+        "created_at": 31_000.0,
+        "due_at": 32_000.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "1ock",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeBackgroundUI(
+        [],
+        [
+            {
+                "status": "ok",
+                "screenshot": "/tmp/background-roster-queued-1ock.png",
+                "visibleChats": [
+                    {
+                        "name": "1ock",
+                        "preview": "我真的吓死了",
+                        "unread": True,
+                        "redPixelCount": 95,
+                        "digitPixelCount": 8,
+                        "numericBadge": True,
+                    }
+                ],
+            }
+        ],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 31_100.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "pending_wait_delay", result
+    assert fake_ui.calls == [("probe_background", None)], fake_ui.calls
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["1ock"]
+    assert any(
+        event.get("type") == "passive_roster_preflight"
+        and event.get("badge_detected") is True
+        and not event.get("actionable_badge_rows")
+        and event.get("ignored_queued_badge_rows")
+        for event in store.events
+    ), store.events
+    assert not any(event.get("type") == "wechat_window_action" for event in store.events), store.events
+
+
+def run_claim_persists_pending_before_return_path() -> None:
+    store = MemoryStore()
+    config = store.load_config()
+    config["allowed_contacts"] = ["1ock"]
+    config["send_delay_seconds"] = 180
+    state = store.load_state()
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": "我真的吓死了", "time": "11:25", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "chatPanel": {
+                    "latestInbound": "我真的吓死了",
+                    "latestOutbound": "",
+                    "inbound": [{"text": "我真的吓死了", "top": 0.72, "left": 0.08, "grayPixels": 120}],
+                    "outbound": [],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("吓啥，稳住"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 30_000.0,
+    )
+
+    result = runner._handle_claim(
+        config,
+        state,
+        idle_seconds=45,
+        now=30_000.0,
+        claim_trigger="passive_roster_sweep",
+    )
+
+    assert result["status"] == "draft_saved", result
+    assert store.saved_states, "claim flow should persist pending before tick finally"
+    saved_queue = list(store.saved_states[0].get("pending_queue") or [])
+    assert [item["contact"] for item in saved_queue] == ["1ock"], store.saved_states[0]
+    assert saved_queue[0]["draft_text"] == "吓啥，稳住"
+    assert store.saved_states[0].get("last_seen_inbound", {}).get("1ock")
+
+
+def run_claim_title_ocr_garbage_uses_panel_preview_evidence_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    store.config["allowed_contacts"] = ["1ock"]
+    inbound_text = "哥哥 山火会不会影响班夫啊"
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "JAJWTHBXN UTSPミミッE",
+                "selectedChat": "1ock",
+                "selectedChatRequested": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": {
+                    "latestInbound": inbound_text,
+                    "latestOutbound": "行，那先别折腾快递啦",
+                    "inbound": [
+                        {"text": inbound_text, "top": 0.75, "left": 0.39, "width": 0.18, "grayPixels": 12000}
+                    ],
+                    "outbound": [{"text": "行，那先别折腾快递啦", "top": 0.60, "left": 0.58}],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": {},
+            },
+        ]
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("应该影响不大，但得看山火和风向"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 40_000.0,
+    )
+
+    result = runner.tick()
+
+    assert result["status"] == "draft_saved", result
+    assert store.state["pending"]["contact"] == "1ock"
+    assert store.state["pending"]["inbound_text"] == inbound_text
+    assert fake_ui.calls.count(("probe", "1ock")) == 1, fake_ui.calls
+    assert any(
+        event["type"] == "claim_selection_confirmed_by_panel_evidence"
+        and event.get("contact") == "1ock"
+        and event.get("mode") == "panel_preview_match"
+        for event in store.events
+    ), store.events
+
+
+def run_claim_selection_failure_persists_one_badge_backed_retry_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    store.config["allowed_contacts"] = ["1ock"]
+    inbound_text = "哥哥 山火会不会影响班夫啊"
+    wrong_panel = {
+        "latestInbound": "不相关的旧消息",
+        "inbound": [{"text": "不相关的旧消息", "top": 0.75, "left": 0.39, "grayPixels": 8000}],
+        "outbound": [],
+    }
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": True}],
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "May",
+                "selectedChat": "1ock",
+                "selectedChatRequested": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": wrong_panel,
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "May",
+                "selectedChat": "1ock",
+                "selectedChatRequested": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": wrong_panel,
+            },
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": wrong_panel,
+            },
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": wrong_panel,
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "selectedChat": "1ock",
+                "selectedChatRequested": "1ock",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": {
+                    "latestInbound": inbound_text,
+                    "inbound": [{"text": inbound_text, "top": 0.75, "left": 0.39, "grayPixels": 12000}],
+                    "outbound": [],
+                },
+            },
+            {
+                "status": "ok",
+                "visibleChats": [{"name": "1ock", "preview": inbound_text, "time": "01:01", "unread": False}],
+                "chatPanel": {},
+            },
+        ]
+    )
+    clock = {"now": 41_000.0}
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([True]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("应该影响不大，但得看山火和风向"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock["now"],
+    )
+
+    first = runner.tick()
+    assert first["status"] == "no_candidate", first
+    assert store.state["claim_retry_pending"] is True
+    assert store.state["claim_retry_candidate"]["contact"] == "1ock"
+
+    clock["now"] = 41_005.0
+    second = runner.tick()
+    assert second["status"] == "draft_saved", second
+    assert store.state["pending"]["contact"] == "1ock"
+    assert store.state["claim_retry_pending"] is False
+    assert store.state["claim_retry_candidate"] is None
+    assert any(event["type"] == "claim_selection_retry_candidate" for event in store.events), store.events
+
+
 def run_passive_roster_sweep_ignores_background_non_whitelist_badge_path() -> None:
     store = MemoryStore()
     store.config["passive_roster_sweep_enabled"] = True
@@ -1336,7 +1920,7 @@ def run_non_whitelist_unread_cleared_path() -> None:
     assert any(event["type"] == "non_whitelist_unread_cleared" for event in store.events)
 
 
-def run_active_whitelist_chat_claim_without_unread_badge_path() -> None:
+def run_active_whitelist_chat_without_unread_badge_skips_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
     fake_ui = FakeUI(
@@ -1391,10 +1975,9 @@ def run_active_whitelist_chat_claim_without_unread_badge_path() -> None:
     )
 
     result = runner.tick()
-    assert result["status"] == "draft_saved", result
-    assert result["contact"] == "1ock", result
-    assert store.state["pending"]["contact"] == "1ock"
-    assert "我们有四个人" in store.state["pending"]["inbound_text"]
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert ("probe", "1ock") not in fake_ui.calls, fake_ui.calls
 
 
 def run_active_whitelist_chat_latest_outbound_skips_path() -> None:
@@ -1487,7 +2070,7 @@ def run_whitelist_preview_fallback_claim_path() -> None:
     assert store.state["pending"]["inbound_text"] == "在吗"
 
 
-def run_global_signal_visible_whitelist_probe_claim_path() -> None:
+def run_global_signal_visible_whitelist_without_badge_skips_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
     store.config["allowed_contacts"] = ["1ock"]
@@ -1539,12 +2122,13 @@ def run_global_signal_visible_whitelist_probe_claim_path() -> None:
     )
 
     result = runner.tick()
-    assert result["status"] == "draft_saved", result
-    assert result["contact"] == "1ock", result
-    assert store.state["pending"]["inbound_text"] == "哥哥我发现你长得像高司令"
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert ("probe", "1ock") not in fake_ui.calls, fake_ui.calls
+    assert not any(event["type"] == "claim_global_signal_whitelist_probe_candidates" for event in store.events)
 
 
-def run_global_signal_hidden_whitelist_search_claim_path() -> None:
+def run_global_signal_hidden_whitelist_search_skips_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
     store.config["allowed_contacts"] = ["May", "1ock"]
@@ -1583,10 +2167,10 @@ def run_global_signal_hidden_whitelist_search_claim_path() -> None:
     )
 
     result = runner.tick()
-    assert result["status"] == "draft_saved", result
-    assert result["contact"] == "May", result
-    assert store.state["pending"]["inbound_text"] == "好了"
-    assert ("probe", "May") in fake_ui.calls, fake_ui.calls
+    assert result["status"] == "no_candidate", result
+    assert store.state["pending"] is None
+    assert ("probe", "May") not in fake_ui.calls, fake_ui.calls
+    assert not any(event["type"] == "claim_global_signal_whitelist_probe_candidates" for event in store.events)
 
 
 def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
@@ -2012,6 +2596,111 @@ def run_send_confirmation_retry_path() -> None:
     assert any(event["type"] == "send_unconfirmed_retry_scheduled" for event in store.events)
 
 
+def run_stale_unconfirmed_send_closes_without_opening_path() -> None:
+    store = MemoryStore()
+    store.config["contact_memory_enabled"] = False
+    store.config["send_confirmation_timeout_seconds"] = 180
+    pending = {
+        "contact": "May",
+        "inbound_text": "我4号去底特律",
+        "message_time": "17:41",
+        "inbound_fingerprint": "fp-may-detroit",
+        "draft_text": "行，那这趟稳了。到时候直接飞底特律？",
+        "created_at": 1_000.0,
+        "due_at": 2_800.0,
+        "outbound_snapshot": "你来机票呢",
+        "active_chat_title": "May",
+        "send_attempts": 1,
+        "last_send_attempt_at": 1_100.0,
+        "send_confirmation_attempts": 1,
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI([])
+    state = store.load_state()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(0),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1_301.0,
+    )
+
+    result = runner._handle_pending(
+        store.load_config(), state, state["pending_queue"][0], idle_seconds=0, now=1_301.0
+    )
+
+    assert result["status"] == "sent", result
+    assert result["confirmation"] == "send_action_timeout", result
+    assert state["pending"] is None
+    assert fake_ui.calls == [], fake_ui.calls
+    assert any(
+        event["type"] == "auto_sent"
+        and event.get("confirmation") == "send_action_timeout"
+        and event.get("inferred") is True
+        for event in store.events
+    ), store.events
+
+
+def run_unconfirmed_send_selection_failures_have_finite_budget_path() -> None:
+    store = MemoryStore()
+    store.config["contact_memory_enabled"] = False
+    store.config["send_confirmation_max_attempts"] = 3
+    pending = {
+        "contact": "May",
+        "inbound_text": "我4号去底特律",
+        "message_time": "17:41",
+        "inbound_fingerprint": "fp-may-detroit",
+        "draft_text": "行，那这趟稳了。到时候直接飞底特律？",
+        "created_at": 1_000.0,
+        "due_at": 1_200.0,
+        "outbound_snapshot": "你来机票呢",
+        "active_chat_title": "May",
+        "send_attempts": 1,
+        "last_send_attempt_at": 1_190.0,
+        "send_confirmation_attempts": 2,
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "",
+                "chatPanel": {},
+            }
+        ]
+    )
+    state = store.load_state()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1_205.0,
+    )
+
+    result = runner._handle_pending(
+        store.load_config(), state, state["pending_queue"][0], idle_seconds=45, now=1_205.0
+    )
+
+    assert result["status"] == "sent", result
+    assert result["confirmation"] == "send_confirmation_exhausted", result
+    assert state["pending"] is None
+    assert fake_ui.calls.count("send") == 0, fake_ui.calls
+    assert fake_ui.calls.count("activate") == 1, fake_ui.calls
+    assert fake_ui.calls.count("hide") == 1, fake_ui.calls
+
+
 def run_send_confirmation_self_echo_marks_sent_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -2082,7 +2771,140 @@ def run_send_confirmation_self_echo_marks_sent_path() -> None:
     ), store.events
 
 
-def run_empty_inbound_recheck_cancels_pending_path() -> None:
+def run_empty_panel_second_click_recovers_pending_send_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    pending = {
+        "contact": "May",
+        "inbound_text": "在电影爆笑",
+        "message_time": "00:50",
+        "inbound_fingerprint": fingerprint("May", "在电影爆笑", "00:50"),
+        "draft_text": "这也能算“笑”？我看是惊吓吧",
+        "created_at": 6_000.0,
+        "due_at": 6_100.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "May",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": False,
+                "activeChat": "",
+                "chatPanel": {},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {"latestInbound": "在电影爆笑", "latestOutbound": ""},
+            },
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {"latestInbound": "在电影爆笑", "latestOutbound": "这也能算“笑”？我看是惊吓吧"},
+            },
+        ]
+    )
+    state = store.load_state()
+    config = store.load_config()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 6_200.0,
+    )
+
+    result = runner._handle_pending(config, state, state["pending_queue"][0], idle_seconds=45, now=6_200.0)
+
+    assert result["status"] == "sent", result
+    assert state["pending"] is None
+    assert fake_ui.calls.count(("probe", "May")) == 4, fake_ui.calls
+    assert any(event["type"] == "pending_reselect_empty_panel_second_click" for event in store.events), store.events
+    assert any(event["type"] == "pending_reselect_empty_panel_recovered" for event in store.events), store.events
+
+
+def run_historical_outbound_draft_clears_retry_path() -> None:
+    store = MemoryStore()
+    store.config["roster_sweep_interval_seconds"] = 9999
+    draft_text = "这也能算“笑”？我看是惊吓吧，你脑子没被炸坏就行"
+    pending = {
+        "contact": "May",
+        "inbound_text": "最近还有啥好看\n你去看了 scary movie没\n巨好笑\n在电影爆笑",
+        "message_time": "00:50",
+        "inbound_fingerprint": "fp-may-movie",
+        "draft_text": draft_text,
+        "created_at": 6_000.0,
+        "due_at": 6_100.0,
+        "outbound_snapshot": "不嘻嘻",
+        "active_chat_title": "May",
+        "send_attempts": 1,
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    fake_ui = FakeUI(
+        [
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "May",
+                "chatPanel": {
+                    "latestInbound": "硬太密了",
+                    "latestOutbound": "没入院我看我只有万字解说",
+                    "inbound": [
+                        {"text": "在电影爆笑", "top": 0.18},
+                        {"text": "硬太密了", "top": 0.82},
+                    ],
+                    "outbound": [
+                        {"text": draft_text, "top": 0.34},
+                        {"text": "没入院我看我只有万字解说", "top": 0.58},
+                    ],
+                },
+            },
+        ]
+    )
+    state = store.load_state()
+    config = store.load_config()
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不用"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 6_200.0,
+    )
+
+    result = runner._handle_pending(config, state, state["pending_queue"][0], idle_seconds=45, now=6_200.0)
+
+    assert result["status"] == "sent", result
+    assert state["pending"] is None
+    assert "send" not in fake_ui.calls, fake_ui.calls
+    assert any(
+        event["type"] == "auto_sent"
+        and event.get("confirmation") == "historical_outbound"
+        and event.get("match_mode")
+        for event in store.events
+    ), store.events
+
+
+def run_empty_inbound_recheck_retries_pending_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
     fake_ui = FakeUI(
@@ -2137,9 +2959,11 @@ def run_empty_inbound_recheck_cancels_pending_path() -> None:
 
     clock["now"] = 6405.0
     second = runner.tick()
-    assert second["status"] == "cancelled", second
+    assert second["status"] == "pending_retry_selection_not_confirmed", second
     assert second["reason"] == "empty_inbound_recheck", second
-    assert store.state["pending"] is None
+    assert store.state["pending"]["contact"] == "1ock"
+    assert store.state["pending"]["selection_retry_count"] == 1
+    assert any(event["type"] == "pending_selection_retry_scheduled" for event in store.events), store.events
 
 
 def run_compose_text_does_not_count_as_sent() -> None:
@@ -2771,14 +3595,23 @@ def main() -> int:
     run_manual_reply_cancel()
     run_bottom_green_bubble_cancels_pending_path()
     run_old_outbound_before_inbound_is_not_manual_reply_path()
+    run_pending_selection_failure_retries_instead_of_cancel_path()
+    run_pending_title_ocr_garbage_uses_panel_preview_evidence_path()
+    run_pending_selection_failure_snoozes_after_retry_budget_path()
     run_multi_queue_path()
     run_follow_up_claim_second_pass_path()
     run_history_marker_trim_path()
+    run_wechat_login_required_detection_path()
+    run_ocr_symbol_tail_trim_path()
     run_preview_matching_outbound_is_not_inbound_path()
     run_latest_message_refresh_path()
     run_send_confirmation_retry_path()
+    run_stale_unconfirmed_send_closes_without_opening_path()
+    run_unconfirmed_send_selection_failures_have_finite_budget_path()
     run_send_confirmation_self_echo_marks_sent_path()
-    run_empty_inbound_recheck_cancels_pending_path()
+    run_empty_panel_second_click_recovers_pending_send_path()
+    run_historical_outbound_draft_clears_retry_path()
+    run_empty_inbound_recheck_retries_pending_path()
     run_compose_text_does_not_count_as_sent()
     run_repeated_identical_text_new_time_path()
     run_ocr_alias_contact_round_trip_path()
@@ -2794,6 +3627,7 @@ def main() -> int:
     run_warm_avatar_attached_badge_detection_path()
     run_no_claim_sweep_while_pending_wait_path()
     run_pending_menu_flicker_does_not_trigger_claim_path()
+    run_empty_claim_menu_flicker_does_not_reopen_path()
     run_queue_claims_on_menu_rising_path()
     run_queue_claims_while_pending_after_sweep_interval_path()
     run_stale_pending_gc_path()
@@ -2801,14 +3635,19 @@ def main() -> int:
     run_passive_roster_sweep_claims_without_menu_signal_path()
     run_passive_roster_sweep_stays_background_without_badge_path()
     run_passive_roster_sweep_opens_only_after_background_badge_path()
+    run_passive_roster_sweep_queues_whitelist_while_pending_path()
+    run_passive_roster_sweep_ignores_badge_for_already_queued_contact_path()
+    run_claim_persists_pending_before_return_path()
+    run_claim_title_ocr_garbage_uses_panel_preview_evidence_path()
+    run_claim_selection_failure_persists_one_badge_backed_retry_path()
     run_passive_roster_sweep_ignores_background_non_whitelist_badge_path()
     run_passive_roster_sweep_does_not_clear_non_whitelist_path()
     run_non_whitelist_unread_cleared_path()
-    run_active_whitelist_chat_claim_without_unread_badge_path()
+    run_active_whitelist_chat_without_unread_badge_skips_path()
     run_active_whitelist_chat_latest_outbound_skips_path()
     run_whitelist_preview_fallback_claim_path()
-    run_global_signal_visible_whitelist_probe_claim_path()
-    run_global_signal_hidden_whitelist_search_claim_path()
+    run_global_signal_visible_whitelist_without_badge_skips_path()
+    run_global_signal_hidden_whitelist_search_skips_path()
     run_unread_whitelist_candidate_latest_outbound_skips_path()
     run_numeric_badge_inbound_bubble_overrides_outbound_text_match_path()
     run_numeric_badge_latest_outbound_text_match_still_skips_path()

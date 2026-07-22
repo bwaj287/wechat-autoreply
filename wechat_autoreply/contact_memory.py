@@ -272,18 +272,12 @@ def _summarize_recent_events(events: list[dict[str, Any]], now: datetime) -> str
         return ""
     scored.sort(key=lambda item: item[0], reverse=True)
     contact_lines = [item["text"] for _, item in scored if item["role"] == "contact"][:2]
-    self_lines = [item["text"] for _, item in scored if item["role"] == "self"][:1]
     parts: list[str] = []
     if contact_lines:
         if len(contact_lines) == 1:
             parts.append(f"They recently mentioned {contact_lines[0]}")
         else:
             parts.append("They recently mentioned " + " / ".join(contact_lines))
-    if self_lines:
-        if len(self_lines) == 1:
-            parts.append(f"You recently replied {self_lines[0]}")
-        else:
-            parts.append("You recently replied " + " / ".join(self_lines))
     summary = "; ".join(parts).strip()
     return summary[:MEMORY_SUMMARY_MAX_CHARS].strip()
 

@@ -53,6 +53,7 @@
 
 - A plain red avatar is never actionable unread evidence.
 - Passive scans do not focus WeChat unless a whitelist numeric badge is found.
+- A global Dock/menu unread signal without a visible whitelist numeric badge is treated as non-whitelist; the runner must not search through whitelist contacts.
 - A gray latest inbound bubble can override text equality with the previous outbound.
 - A pending item is identified and removed by inbound fingerprint, not contact name.
 - `pending` is only a compatibility mirror of `pending_queue[0]`.

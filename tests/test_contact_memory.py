@@ -34,6 +34,25 @@ class ContactMemoryTests(unittest.TestCase):
         self.assertNotIn("old joke", memory["recent_summary"])
         self.assertNotIn("old reply", memory["recent_summary"])
 
+    def test_recent_summary_does_not_feed_previous_self_reply_back_to_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = Path(tmp) / "contact_memory.json"
+            seed_path = Path(tmp) / "missing_seed.json"
+            with (
+                patch.object(contact_memory, "CONTACT_MEMORY_PATH", runtime_path),
+                patch.object(contact_memory, "CONTACT_MEMORY_SEED_PATH", seed_path),
+            ):
+                memory = contact_memory.remember_contact_memory(
+                    "Ted Liu",
+                    inbound_text="现在在专心赌球",
+                    outbound_text="你这日%是啥暗号",
+                    now=datetime(2026, 7, 3, 20, 45, tzinfo=timezone.utc),
+                )
+
+        self.assertIn("现在在专心赌球", memory["recent_summary"])
+        self.assertNotIn("你这日%", memory["recent_summary"])
+        self.assertNotIn("You recently replied", memory["recent_summary"])
+
     def test_clear_all_recent_memory_preserves_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime_path = Path(tmp) / "contact_memory.json"

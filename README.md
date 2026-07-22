@@ -24,7 +24,10 @@ V3-V5 运行中出现过的疑难问题已被整理为 V6 的发布约束：
 
 - 没有红点时反复打开微信。
 - 暖色或红色头像被误识别为未读 badge。
+- 暖色头像的红色像素稀释真实数字 `1`，导致白名单消息被漏掉。
 - Dock 未读信号漏报后完全不触发。
+- 点击未读行后红点先消失、标题 OCR 又乱码，导致消息已读但没有进入队列。
+- runner 在线但微信停在 `Enter Weixin` 登录页，健康检查仍显示正常。
 - OCR 把自己刚发的消息当成新消息。
 - 对方回复与我方旧消息文本相似时被错误忽略。
 - 发送前单帧 OCR 抖动导致误取消或误发送。
@@ -37,13 +40,16 @@ V3-V5 运行中出现过的疑难问题已被整理为 V6 的发布约束：
 
 ## 核心安全约束
 
-- 只有明确的数字未读 badge 才能进入消息认领流程，单纯红色像素不算。
+- 只有底层已经验证数字形状的未读 badge 才能进入消息认领流程；单纯红色像素不算，暖色头像也不能稀释真实数字证据。
 - 后台 roster 预检未发现白名单未读时，不把微信切到前台。
+- 全局 Dock/menu 有未读但左栏没有白名单数字红点时，视为非白名单未读；系统只清左栏非白名单红点，不通过搜索框轮询白名单。
 - UI 自动化前必须满足系统空闲时间要求，默认 30 秒。
 - 草稿进入 FIFO 队列，发送前重新读取聊天面板并进行多帧共识。
 - 检测到人工回复、输入框内容或可靠的消息变化时，取消或延后自动发送。
 - 每个 pending item 使用入站消息 fingerprint 标识，不按联系人名称粗暴删除。
 - 发送结果不确定时保留队列并有限重试，不盲目重复发送。
+- 红点因点击消失后，只有联系人行、预览和右侧灰色入站气泡一致时才能继续认领；否则只进行有限重试。
+- 微信登录页必须报告 `wechat_login_required`，不能伪装成空 roster 的健康状态。
 - 日志或清理失败不能终止回复状态机。
 - 微信前台会话结束后尽量恢复之前的前台应用。
 
@@ -290,10 +296,14 @@ curl -s http://127.0.0.1:4010/health
 | `passive_roster_sweep_enabled` | `true` | Dock 信号漏报时启用后台 roster 恢复 |
 | `roster_sweep_interval_seconds` | `60` | 后台 roster 预检间隔 |
 | `badge_stability_frames` | `2` | 白名单 badge 稳定帧要求 |
+| `claim_selection_retry_max_attempts` | `2` | 已见数字红点但联系人选择未确认时的最大认领轮次 |
+| `claim_selection_retry_ttl_seconds` | `300` | 单个认领候选在红点被点击清除后的保留时间 |
 | `pending_stale_ttl_seconds` | `86400` | pending 最大保留时间 |
 | `recent_auto_outbound_ttl_seconds` | `21600` | 自回声历史保留时间 |
-| `send_verify_retry_seconds` | `45` | 未确认发送的重试等待 |
-| `send_max_attempts` | `2` | 最大尝试发送次数 |
+| `send_verify_retry_seconds` | `45` | 未确认发送的复检等待 |
+| `send_confirmation_max_attempts` | `3` | 发送后最多进行几次界面确认（含即时确认） |
+| `send_confirmation_timeout_seconds` | `180` | 发送动作成功执行但气泡始终不可见时，停止开窗并按已发送收口 |
+| `send_max_attempts` | `2` | 输入框仍保留草稿时，最多重新执行几次发送动作 |
 | `capture_retention_days` | `2` | 调试截图和事件保留天数 |
 | `ollama_model` | `qwen3.5:9b` | 本机文本模型 |
 | `erge_enabled` | `true` | 是否启用 brother 路由 |
@@ -319,6 +329,7 @@ curl -s http://127.0.0.1:4010/health
 | --- | --- |
 | `menu_bar_checked` | Dock/menu 未读采样 |
 | `passive_roster_preflight` | 不聚焦微信的后台 roster 预检 |
+| `wechat_login_required` | 微信停在登录入口，runner 在线但自动回复不可用 |
 | `wechat_window_action` | 微信进入或退出前台及原因 |
 | `claim_candidates` | 本轮检测到的候选行 |
 | `draft_saved_locally` | 草稿已加入队列 |
@@ -355,11 +366,16 @@ tail -n 100 runtime/events.jsonl
 
 1. 开关是否为 `on`。
 2. runner 是否运行。
-3. 联系人是否在 `wechat-whitelist.txt`。
-4. `menu_bar_checked` 或 `passive_roster_preflight` 是否发现 badge。
-5. 是否生成 `draft_saved_locally`。
-6. 是否因系统不够 idle 尚未到发送窗口。
-7. 是否出现 `pending_cancelled` 或 `pending_message_changed_recheck`。
+3. `diagnose` 是否显示 `wechat_login_required: true`。
+4. 联系人是否在 `wechat-whitelist.txt`。
+5. `menu_bar_checked` 或 `passive_roster_preflight` 是否发现白名单数字 badge。
+6. 是否生成 `draft_saved_locally`。
+7. 是否因系统不够 idle 尚未到发送窗口。
+8. 是否出现 `pending_cancelled` 或 `pending_message_changed_recheck`。
+
+### Runner 在线但无法回复
+
+如果 `status` 显示“微信需要登录”或 `diagnose` 显示 `last_error: wechat_login_required`，说明 launchd 和 Python runner 正常，但微信停在 `Enter Weixin` 登录入口。完成微信登录后，下一轮后台 roster 预检会自动清除该告警；不要通过重启 runner 绕过登录状态。
 
 ### 没有新消息却打开微信
 
@@ -367,7 +383,7 @@ tail -n 100 runtime/events.jsonl
 
 ### 红色头像被当作未读
 
-检查 `claim_candidates` 和对应 roster 截图。V6 必须同时看到红色 badge 区域和白色数字笔画；单纯暖色头像不应触发。相关代码位于 `badge_detection.py` 和 `claim_policy.py`。
+检查 `claim_candidates` 和对应 roster 截图。V6 必须同时看到 badge 形状和白色数字笔画；单纯暖色头像不应触发。底层一旦确认数字形状，上层不能再用整行红色像素比例否决，否则王哥这类暖色头像会把真实数字 `1` 稀释掉。相关代码位于 `badge_detection.py` 和 `claim_policy.py`。
 
 ### 队列有内容但迟迟不发
 

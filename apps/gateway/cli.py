@@ -356,6 +356,8 @@ def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     no_new_lines = _recent_open_without_new_message_lines(limit=3)
     runner = _runner_snapshot()
     lines = [base, _runner_brief(runner)]
+    if bool(state.get("wechat_login_required")) or state.get("last_error") == "wechat_login_required":
+        lines.append("警告：微信需要登录，自动回复当前不可用")
     if traces:
         lines.extend(["最近记录：", *traces])
     if no_new_lines:
@@ -404,6 +406,7 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     lines.append(f"- queue_length: {len(queue)}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
     lines.append(f"- last_error: {state.get('last_error') or '-'}")
+    lines.append(f"- wechat_login_required: {bool(state.get('wechat_login_required'))}")
     lines.append(f"- last_menu_signal: {state.get('last_menu_signal') or '-'}")
     lines.append(f"- last_menu_unread: {bool(state.get('last_menu_unread'))}")
     lines.append(f"- last_menu_check_at: {_format_epoch(state.get('last_menu_check_at'))}")

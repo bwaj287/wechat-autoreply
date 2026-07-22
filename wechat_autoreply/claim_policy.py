@@ -59,9 +59,12 @@ def has_row_numeric_unread_badge(chat: dict[str, Any]) -> bool:
     red_pixels = max(1, int(chat.get("redPixelCount", 0) or 0))
     if digit_pixels >= 10:
         return True
-    digit_ratio = digit_pixels / red_pixels
+    # The image detector has already verified that these pixels form a digit
+    # inside a badge-shaped red component. Do not divide by total row redness:
+    # warm avatars can inflate that count and hide a real one-digit badge.
     if digit_pixels >= 8:
-        return digit_ratio >= 0.045
+        return True
+    digit_ratio = digit_pixels / red_pixels
     if digit_pixels >= 6 and red_pixels <= 80:
         return digit_ratio >= 0.11
     return False
@@ -248,6 +251,7 @@ def decide_claim(
         or sweep_while_pending
         or pending_due
         or menu_signal_rising_now
+        or passive_claim_ready
     )
     if idle_seconds < idle_threshold:
         return ClaimDecision(False, "", pending_allowed, "user_active")

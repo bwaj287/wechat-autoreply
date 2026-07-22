@@ -65,7 +65,7 @@ class ClaimPolicyTests(unittest.TestCase):
         self.assertTrue(decision.pending_allowed)
         self.assertEqual(decision.trigger, CLAIM_TRIGGER_MENU)
 
-    def test_passive_badge_does_not_interrupt_pending_delay(self) -> None:
+    def test_passive_badge_can_queue_new_whitelist_while_pending_waits(self) -> None:
         decision = decide_claim(
             idle_seconds=45,
             idle_threshold=30,
@@ -79,8 +79,9 @@ class ClaimPolicyTests(unittest.TestCase):
             claim_retry_pending=False,
             passive_claim_ready=True,
         )
-        self.assertFalse(decision.should_claim)
-        self.assertEqual(decision.reason, "pending_queue_blocks_claim")
+        self.assertTrue(decision.should_claim)
+        self.assertTrue(decision.pending_allowed)
+        self.assertEqual(decision.trigger, CLAIM_TRIGGER_PASSIVE)
 
     def test_preflight_only_accepts_whitelist_numeric_badges(self) -> None:
         visible = [
@@ -108,6 +109,17 @@ class ClaimPolicyTests(unittest.TestCase):
                     "numericBadge": False,
                     "digitPixelCount": 30,
                     "redPixelCount": 400,
+                }
+            )
+        )
+
+    def test_confirmed_single_digit_badge_survives_warm_avatar_redness(self) -> None:
+        self.assertTrue(
+            has_row_numeric_unread_badge(
+                {
+                    "numericBadge": True,
+                    "digitPixelCount": 8,
+                    "redPixelCount": 208,
                 }
             )
         )
