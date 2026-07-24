@@ -48,6 +48,8 @@ from .pending_queue import (
     prune_stale_pending,
     queued_contacts,
     remove_pending_by_fingerprint,
+    replace_pending,
+    select_next_pending,
     sync_pending_state,
 )
 from .recheck_policy import build_recheck_consensus
@@ -172,6 +174,25 @@ def _tail_cluster(items: list[dict[str, Any]], max_gap: float = 0.14) -> list[di
         last_top = top
     cluster.reverse()
     return cluster
+
+
+def _trim_card_prefix_before_newer_messages(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(items) < 2:
+        return items
+    last_card_metadata_index = -1
+    for index, item in enumerate(items):
+        if _looks_like_card_metadata_text(str(item.get("text") or "")):
+            last_card_metadata_index = index
+    if last_card_metadata_index < 0 or last_card_metadata_index >= len(items) - 1:
+        return items
+    newer_items = items[last_card_metadata_index + 1 :]
+    if not any(
+        _is_context_text_candidate(str(item.get("text") or ""))
+        and not _looks_like_card_metadata_text(str(item.get("text") or ""))
+        for item in newer_items
+    ):
+        return items
+    return newer_items
 
 
 def _clean_multiline_latest_inbound(latest_inbound: str, preview: str) -> str:
@@ -301,6 +322,7 @@ def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -
                 ]
             )
             if recent_rows:
+                recent_rows = _trim_card_prefix_before_newer_messages(recent_rows)
                 quote_payload = _extract_quote_payload(panel, recent_rows, preview)
                 if quote_payload.get("text"):
                     return quote_payload
@@ -337,6 +359,7 @@ def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -
                     return payload
         tail_rows = _tail_cluster(inbound_items)
         if tail_rows:
+            tail_rows = _trim_card_prefix_before_newer_messages(tail_rows)
             quote_payload = _extract_quote_payload(panel, tail_rows[-3:], preview)
             if quote_payload.get("text"):
                 return quote_payload
@@ -1641,12 +1664,13 @@ class AutoReplyRunner:
                     queue_contacts=queued_contacts(queue),
                 )
             had_queue = bool(queue)
+            next_pending = select_next_pending(queue)
             # If a pending send is already due, do one immediate signal check first.
             # This makes "new unread while pending" go through claim flow before send-time recheck.
             if (
-                queue
+                next_pending is not None
                 and idle_seconds >= idle_threshold
-                and now >= float(queue[0].get("due_at", 0.0) or 0.0)
+                and now >= float(next_pending.get("due_at", 0.0) or 0.0)
                 and not menu_checked_now
             ):
                 _record_menu_signal(self._menu_unread_signal(), source="due_precheck")
@@ -1710,7 +1734,10 @@ class AutoReplyRunner:
                 idle_seconds=idle_seconds,
                 idle_threshold=idle_threshold,
                 has_queue=bool(queue),
-                pending_due=bool(queue and now >= float(queue[0].get("due_at", 0.0) or 0.0)),
+                pending_due=bool(
+                    next_pending is not None
+                    and now >= float(next_pending.get("due_at", 0.0) or 0.0)
+                ),
                 sweep_while_pending=bool(config.get("sweep_while_pending", False)),
                 actionable_menu_signal=actionable_menu_signal,
                 menu_checked_now=menu_checked_now,
@@ -1731,11 +1758,12 @@ class AutoReplyRunner:
                     claim_trigger=claim_decision.trigger,
                 )
                 queue = sync_pending_state(state)
+                next_pending = select_next_pending(queue)
 
             if claim_result and claim_result.get("status") in {"draft_saved", "drafts_saved"} and not had_queue:
                 result = claim_result
-            elif queue:
-                result = self._handle_pending(config, state, queue[0], idle_seconds, now)
+            elif next_pending is not None:
+                result = self._handle_pending(config, state, next_pending, idle_seconds, now)
             elif claim_result is not None:
                 result = claim_result
             else:
@@ -3493,7 +3521,8 @@ class AutoReplyRunner:
                 updated["low_confidence_retries"] = retries
                 if retries >= max_retries:
                     updated["due_at"] = now + snooze_seconds
-                    queue[0] = updated
+                    if replace_pending(queue, pending, updated) < 0:
+                        raise RuntimeError(f"pending queue item disappeared during recheck: {contact}")
                     sync_pending_state(state, queue)
                     self.append_event(
                         "pending_recheck_snoozed",
@@ -3514,7 +3543,8 @@ class AutoReplyRunner:
                         "seconds_remaining": round(float(updated["due_at"]) - now, 2),
                     }
                 updated["due_at"] = now + delay_seconds
-                queue[0] = updated
+                if replace_pending(queue, pending, updated) < 0:
+                    raise RuntimeError(f"pending queue item disappeared during recheck: {contact}")
                 sync_pending_state(state, queue)
                 self.append_event(
                     "pending_recheck_low_confidence",
@@ -3875,7 +3905,8 @@ class AutoReplyRunner:
             if send_action_performed:
                 updated["last_send_attempt_at"] = now
             updated["due_at"] = now + float(config.get("send_verify_retry_seconds", 45))
-            queue[0] = updated
+            if replace_pending(queue, pending, updated) < 0:
+                raise RuntimeError(f"pending queue item disappeared during send confirmation: {contact}")
             sync_pending_state(state, queue)
             if send_action_performed and updated["send_attempts"] >= int(config.get("send_max_attempts", 2)):
                 return self._cancel_pending(

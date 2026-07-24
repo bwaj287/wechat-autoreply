@@ -18,6 +18,17 @@
 - 图片消息：可通过本机 `brother` 多模态网关处理
 - launchd 标签：`ai.openclaw.wechat.autoreply.v6`
 
+## 最近修复记录
+
+### 2026-07-23
+
+- 修复 pending 队首休眠时阻塞后续已到期消息：发送调度改为选择最早 `due_at`，队列仍保留原始入队顺序。
+- 修复非队首 pending 在发送确认或低置信度重试时错误覆盖 `queue[0]`：所有更新按对象或入站 fingerprint 原位写回。
+- 修复旧分享卡片与其后的新文本被合并成一条入站消息：卡片元数据后存在普通消息时，只把较新的消息组交给模型。
+- 修复右侧标题靠近面板边缘时被排除：标题 OCR 区域覆盖真实窗口边界，`10ck` 可通过现有名称归一化正确匹配 `1ock`。
+- 新增真实事故回归：延期队首不能阻塞 Darren、非队首发送重试不能覆盖其他联系人、旧卡片不能污染 `我今天回来 / 7.40到`、卡片正文不能取代 `1ock` 标题。
+- 运行时已清理事故遗留 pending，并通过完整 selftest 与 29 个单元测试。
+
 ## V6 解决的问题
 
 V3-V5 运行中出现过的疑难问题已被整理为 V6 的发布约束：
@@ -33,6 +44,10 @@ V3-V5 运行中出现过的疑难问题已被整理为 V6 的发布约束：
 - 发送前单帧 OCR 抖动导致误取消或误发送。
 - 用户已经手动回复，但队列仍继续发送。
 - 同一联系人连续多条消息时删错 pending item。
+- 延期或休眠的队首消息阻塞后续已到期联系人。
+- 非队首消息重试时覆盖队首，造成重复 pending 或丢失其他联系人。
+- 旧分享卡片与较新的普通消息被合并，导致回复答非所问。
+- `1ock` 被 OCR 成 `10ck` 且标题位置贴近面板边界，程序误点已打开联系人并切出空白聊天面板。
 - 事件日志与清理任务争用文件，导致 runner 因 `Resource deadlock avoided` 退出。
 - 原生工具输出附带诊断文本或重复 JSON，导致解析失败。
 
@@ -44,9 +59,9 @@ V3-V5 运行中出现过的疑难问题已被整理为 V6 的发布约束：
 - 后台 roster 预检未发现白名单未读时，不把微信切到前台。
 - 全局 Dock/menu 有未读但左栏没有白名单数字红点时，视为非白名单未读；系统只清左栏非白名单红点，不通过搜索框轮询白名单。
 - UI 自动化前必须满足系统空闲时间要求，默认 30 秒。
-- 草稿进入 FIFO 队列，发送前重新读取聊天面板并进行多帧共识。
+- 草稿按入队顺序持久化，发送调度选择最早到期项；发送前重新读取聊天面板并进行多帧共识。
 - 检测到人工回复、输入框内容或可靠的消息变化时，取消或延后自动发送。
-- 每个 pending item 使用入站消息 fingerprint 标识，不按联系人名称粗暴删除。
+- 每个 pending item 使用入站消息 fingerprint 标识；删除和非队首更新都不能按联系人名称或 `queue[0]` 粗暴处理。
 - 发送结果不确定时保留队列并有限重试，不盲目重复发送。
 - 红点因点击消失后，只有联系人行、预览和右侧灰色入站气泡一致时才能继续认领；否则只进行有限重试。
 - 微信登录页必须报告 `wechat_login_required`，不能伪装成空 roster 的健康状态。
@@ -66,9 +81,9 @@ periodic sweep ───┘                         │
                                                      │
                                              OCR + context + model
                                                      │
-                                                FIFO pending
+                                                pending queue
                                                      │
-                                           delay + multi-frame recheck
+                                      earliest due + multi-frame recheck
                                                      │
                                       cancel / refresh / verify and send
 ```
@@ -76,7 +91,7 @@ periodic sweep ───┘                         │
 正常情况下，系统只有两个理由可以主动打开微信：
 
 - `claim_scan`：发现可操作的未读证据，读取并认领消息。
-- `pending_send_due`：队首草稿到期，执行发送前复检。
+- `pending_send_due`：当前最早到期草稿进入发送前复检。
 
 其他无理由的前台打开应视为缺陷。
 
@@ -91,7 +106,7 @@ wechat_autoreply/
   orchestrator.py              编排传感器、策略、状态、模型和 UI 副作用
   claim_policy.py              白名单、数字 badge、稳定帧和认领决策
   badge_detection.py           像素级 badge 检测及暖色头像重叠恢复
-  pending_queue.py             FIFO 队列及 pending 兼容镜像
+  pending_queue.py             pending 队列、到期调度及兼容镜像
   recheck_policy.py            发送前多帧 OCR 共识
   manual_reply_policy.py       人工回复证据分类
   outbound_history.py          发送确认和近期自回声抑制
@@ -226,7 +241,7 @@ runner 使用 `runtime/runner.lock` 保证同一时间只有一个实例。服�
 | `status` | 查看开关、队列数量和近期关键事件 |
 | `runner` | 查看 runner 进程健康 |
 | `runner-start` | runner 离线时启动 |
-| `queue` | 查看 FIFO 待发送队列 |
+| `queue` | 查看待发送队列及各项到期时间 |
 | `since` | 查看自上次查询后自动发送的数量 |
 | `diagnose` | 查看详细诊断和近期事件 |
 | `restart` / `reset` | 清空 runtime state 并重启 |
@@ -390,10 +405,12 @@ tail -n 100 runtime/events.jsonl
 检查：
 
 - 系统 idle 是否达到阈值。
-- `due_at` 是否已经到达。
+- 队列中最早的 `due_at` 是否已经到达；休眠项不应阻塞其他已到期联系人。
 - 是否反复出现 `pending_message_changed_recheck`。
+- 是否反复出现 `pending_selection_retry_scheduled` 或 `pending_selection_snoozed`。
 - 是否检测到人工回复或输入框内容。
 - 当前聊天面板是否选中了正确联系人。
+- 如果标题 OCR 成联系人近似名，确认名称归一化后仍能匹配，且程序没有重复点击已经打开的联系人。
 
 ### 模型回复很慢
 
@@ -434,7 +451,7 @@ tail -n 30 runtime/events.jsonl
 
 - 未读 badge 与被动预检策略。
 - 暖色头像重叠 badge。
-- FIFO pending queue 不变量。
+- pending 到期调度、非队首原位更新和 fingerprint 不变量。
 - 发送前 OCR 共识。
 - 人工回复证据。
 - 发送确认与自回声历史。

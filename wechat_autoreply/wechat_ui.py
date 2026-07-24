@@ -1081,7 +1081,7 @@ def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
         width = obs["bbox"]["w"]
         # Only trust the actual chat-title strip at the upper-left of the right panel.
         # This excludes the green "new message(s)" banner on the upper-right.
-        if left < 0.33 or left > 0.62 or top > 0.09 or width < 0.02:
+        if left < 0.30 or left > 0.62 or top > 0.09 or width < 0.02:
             continue
         if _is_time(text):
             continue

@@ -5,6 +5,8 @@ import unittest
 from wechat_autoreply.pending_queue import (
     prune_stale_pending,
     remove_pending_by_fingerprint,
+    replace_pending,
+    select_next_pending,
     sync_pending_state,
 )
 
@@ -28,6 +30,20 @@ class PendingQueueTests(unittest.TestCase):
         kept, removed = prune_stale_pending([fresh, stale], now=100, ttl_seconds=50)
         self.assertEqual(kept, [fresh])
         self.assertEqual(removed, [stale])
+
+    def test_next_pending_uses_earliest_due_time_not_queue_order(self) -> None:
+        snoozed = {"contact": "1ock", "due_at": 200}
+        overdue = {"contact": "Darren", "due_at": 90}
+        self.assertIs(select_next_pending([snoozed, overdue]), overdue)
+
+    def test_replace_pending_updates_non_head_item_in_place(self) -> None:
+        snoozed = {"contact": "1ock", "inbound_fingerprint": "one"}
+        due = {"contact": "Darren", "inbound_fingerprint": "two"}
+        updated = {**due, "send_attempts": 1}
+        queue = [snoozed, due]
+        self.assertEqual(replace_pending(queue, due, updated), 1)
+        self.assertIs(queue[0], snoozed)
+        self.assertIs(queue[1], updated)
 
 
 if __name__ == "__main__":

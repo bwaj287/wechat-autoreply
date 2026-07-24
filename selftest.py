@@ -16,7 +16,13 @@ from wechat_autoreply.config_store import default_config
 from wechat_autoreply.json_output import load_first_json_object
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text, fingerprint
 from wechat_autoreply.state_store import default_state
-from wechat_autoreply.wechat_ui import _extract_chat_panel, find_chat, wechat_login_required
+from wechat_autoreply.wechat_ui import (
+    _extract_chat_panel,
+    _pick_selected_title,
+    find_chat,
+    names_match,
+    wechat_login_required,
+)
 
 
 class MemoryStore:
@@ -704,6 +710,51 @@ def run_multi_queue_path() -> None:
     assert store.state["pending_queue"] == []
 
 
+def run_overdue_pending_bypasses_snoozed_queue_head_path() -> None:
+    store = MemoryStore()
+    store.config["contact_memory_enabled"] = False
+    store.config["roster_sweep_interval_seconds"] = 9999
+    snoozed = {
+        "contact": "1ock",
+        "inbound_text": "稍后再看",
+        "message_time": "12:21",
+        "inbound_fingerprint": "fp-1ock-snoozed",
+        "draft_text": "行",
+        "created_at": 900.0,
+        "due_at": 1_300.0,
+    }
+    overdue = {
+        "contact": "Darren",
+        "inbound_text": "我今天回来\n7.40到",
+        "message_time": "17:21",
+        "inbound_fingerprint": "fp-darren-overdue",
+        "draft_text": "行，7:40到是吧，到了说一声",
+        "created_at": 700.0,
+        "due_at": 800.0,
+        "send_attempts": 1,
+        "last_send_attempt_at": 700.0,
+    }
+    store.state["pending_queue"] = [copy.deepcopy(snoozed), copy.deepcopy(overdue)]
+    store.state["pending"] = copy.deepcopy(snoozed)
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=FakeUI([]),
+        llm_client=FakeLLM("unused"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1_000.0,
+    )
+
+    result = runner.tick()
+
+    assert result["status"] == "sent", result
+    assert result["contact"] == "Darren", result
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["1ock"]
+
+
 def run_follow_up_claim_second_pass_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
@@ -767,6 +818,36 @@ def run_history_marker_trim_path() -> None:
     assert choose_inbound_text(panel, "") == "Haode"
     multiline_panel = {"latestInbound": "Yesterday 20:39\n今天有湖人比赛吗\nHaode"}
     assert choose_inbound_text(multiline_panel, "Haode") == "Haode"
+
+
+def run_card_then_new_messages_prefers_new_message_group_path() -> None:
+    panel = {
+        "inbound": [
+            {"text": "万锦免费赛车体验！跑进1分20秒送＄15礼卡", "top": 0.4283},
+            {"text": "@鱼多多's note14 Shares", "top": 0.4915},
+            {"text": "0设 小红书", "top": 0.5690},
+            {"text": "我今天回来", "top": 0.6802},
+            {"text": "7.40到", "top": 0.7530},
+        ],
+        "outbound": [{"text": "他没说在哪里啊", "top": 0.3018}],
+    }
+    assert choose_inbound_text(panel, "7.40 到") == "我今天回来\n7.40到"
+
+
+def run_chat_title_near_panel_edge_is_not_replaced_by_message_path() -> None:
+    observations = [
+        {
+            "text": "10ck",
+            "bbox": {"left": 0.3275, "top": 0.0291, "w": 0.0401},
+        },
+        {
+            "text": "个石相活动！烟孙一旅北夫赘区以州图！尽西耳有许啊",
+            "bbox": {"left": 0.3885, "top": 0.0775, "w": 0.3345},
+        },
+    ]
+    title = _pick_selected_title(observations)
+    assert title == "10ck", title
+    assert names_match(title, "1ock")
 
 
 def run_wechat_login_required_detection_path() -> None:
@@ -2582,16 +2663,30 @@ def run_send_confirmation_retry_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "draft_saved", first
+    snoozed = {
+        "contact": "May",
+        "inbound_text": "稍后处理",
+        "message_time": "17:00",
+        "inbound_fingerprint": "fp-may-snoozed",
+        "draft_text": "行",
+        "created_at": 5_000.0,
+        "due_at": 6_000.0,
+    }
+    store.state["pending_queue"].insert(0, copy.deepcopy(snoozed))
+    store.state["pending"] = copy.deepcopy(snoozed)
 
     clock["now"] = 5305.0
     second = runner.tick()
     assert second["status"] == "send_unconfirmed_retry", second
-    assert store.state["pending"]["send_attempts"] == 1
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["May", "Barrys"]
+    assert "send_attempts" not in store.state["pending_queue"][0]
+    assert store.state["pending_queue"][1]["send_attempts"] == 1
 
     clock["now"] = 5351.0
     third = runner.tick()
     assert third["status"] == "sent", third
-    assert store.state["pending"] is None
+    assert [item["contact"] for item in store.state["pending_queue"]] == ["May"]
+    assert store.state["pending"]["contact"] == "May"
     assert fake_ui.calls.count("send") == 1
     assert any(event["type"] == "send_unconfirmed_retry_scheduled" for event in store.events)
 
@@ -3599,8 +3694,11 @@ def main() -> int:
     run_pending_title_ocr_garbage_uses_panel_preview_evidence_path()
     run_pending_selection_failure_snoozes_after_retry_budget_path()
     run_multi_queue_path()
+    run_overdue_pending_bypasses_snoozed_queue_head_path()
     run_follow_up_claim_second_pass_path()
     run_history_marker_trim_path()
+    run_card_then_new_messages_prefers_new_message_group_path()
+    run_chat_title_near_panel_edge_is_not_replaced_by_message_path()
     run_wechat_login_required_detection_path()
     run_ocr_symbol_tail_trim_path()
     run_preview_matching_outbound_is_not_inbound_path()

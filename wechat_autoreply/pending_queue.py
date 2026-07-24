@@ -28,6 +28,15 @@ def queued_contacts(queue: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("contact", "")).strip() for item in queue if item.get("contact")]
 
 
+def select_next_pending(queue: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not queue:
+        return None
+    return min(
+        queue,
+        key=lambda item: float(item.get("due_at", 0.0) or 0.0),
+    )
+
+
 def find_queue_index_for_contact(queue: list[dict[str, Any]], contact: str) -> int:
     from . import wechat_ui
 
@@ -46,6 +55,24 @@ def remove_pending_by_fingerprint(
         for item in queue
         if item.get("inbound_fingerprint") != pending.get("inbound_fingerprint")
     ]
+
+
+def replace_pending(
+    queue: list[dict[str, Any]],
+    pending: dict[str, Any],
+    updated: dict[str, Any],
+) -> int:
+    for index, item in enumerate(queue):
+        if item is pending:
+            queue[index] = updated
+            return index
+    pending_fingerprint = str(pending.get("inbound_fingerprint") or "")
+    if pending_fingerprint:
+        for index, item in enumerate(queue):
+            if str(item.get("inbound_fingerprint") or "") == pending_fingerprint:
+                queue[index] = updated
+                return index
+    return -1
 
 
 def _pending_anchor_ts(item: dict[str, Any]) -> float:
