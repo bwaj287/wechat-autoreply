@@ -19,6 +19,7 @@ from .ollama_client import (
     _format_quoted_message_block,
     _normalize_reply_text,
     _preferred_emoji_names,
+    _ROLE_GROUNDING_INSTRUCTIONS,
     _same_language_hint,
     _stable_pick_codes,
 )
@@ -107,6 +108,7 @@ class ErgeClient:
         return (
             "You write short, natural WeChat replies.\n"
             f"{_same_language_hint(inbound_text)}\n"
+            f"{_ROLE_GROUNDING_INSTRUCTIONS}"
             f"{style_block}"
             f"{emoji_prompt_block}"
             f"{screenshot_hint}"
@@ -122,7 +124,7 @@ class ErgeClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
-            f"Latest incoming message: {inbound_text}\n\n"
+            f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply with the final WeChat message only."
         )
 
@@ -412,7 +414,12 @@ class ErgeClient:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Return only the final WeChat reply in plain language. Do not output JSON or pipeline details.",
+                            "content": (
+                                "Return only the final WeChat reply in plain language. "
+                                "Treat conversation role labels as authoritative: [YOU_SENT] is the user's own "
+                                "historical message and must never be answered; reply only to [LATEST_CONTACT_SENT]. "
+                                "Do not output JSON or pipeline details."
+                            ),
                         },
                         {"role": "user", "content": user_content},
                     ],

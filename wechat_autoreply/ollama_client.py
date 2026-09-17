@@ -27,6 +27,13 @@ _NEGATIVE_HINT_RE = re.compile(
 _POSITIVE_HINT_RE = re.compile(r"(哈哈|开心|好耶|太棒|稳了|nice|great|awesome|congrats|good job)", re.IGNORECASE)
 _CASUAL_DEFAULT_EMOJI_NAMES = ["微笑", "旺柴", "机智", "捂脸", "嘿哈", "呲牙", "让我看看", "耶"]
 
+_ROLE_GROUNDING_INSTRUCTIONS = (
+    "Conversation roles are authoritative:\n"
+    "- [CONTACT_SENT] was sent by the contact to you.\n"
+    "- [YOU_SENT] was sent by you to the contact and is history only. Never answer a [YOU_SENT] line.\n"
+    "- Reply only to [LATEST_CONTACT_SENT], using older lines only to understand the exchange.\n"
+)
+
 
 def _same_language_hint(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", text or ""):
@@ -136,11 +143,17 @@ def _format_context_block(conversation_context: list[dict[str, str]] | None) -> 
         text = _clean_context_line(str(item.get("text", "")))
         if not text:
             continue
-        speaker = "Me" if role in {"self", "me", "outbound", "assistant"} else "Them"
-        lines.append(f"{speaker}: {text}")
+        if role in {"self", "me", "outbound", "assistant"}:
+            speaker = "YOU_SENT"
+        elif role in {"contact", "them", "inbound", "user"}:
+            speaker = "CONTACT_SENT"
+        else:
+            # A missing/unknown role must not silently become an incoming message.
+            continue
+        lines.append(f"[{speaker}] {text}")
     if not lines:
         return ""
-    return "Recent chat context (oldest to latest):\n" + "\n".join(lines[-8:]) + "\n\n"
+    return "Recent chat history (oldest to latest; role labels are authoritative):\n" + "\n".join(lines[-8:]) + "\n\n"
 
 
 def _format_contact_memory_block(contact_memory: dict[str, Any] | None) -> str:
@@ -226,6 +239,7 @@ class OllamaClient:
         prompt = (
             "You write short, natural WeChat replies.\n"
             f"{_same_language_hint(inbound_text)}\n"
+            f"{_ROLE_GROUNDING_INSTRUCTIONS}"
             f"{style_block}"
             f"{emoji_prompt_block}"
             "Keep it colloquial and human.\n"
@@ -239,7 +253,7 @@ class OllamaClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
-            f"Latest incoming message: {inbound_text}\n\n"
+            f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply:"
         )
         response = requests.post(
