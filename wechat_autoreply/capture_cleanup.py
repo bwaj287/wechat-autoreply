@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .event_log import event_file_lock
+from .event_log import ensure_events_file_local, event_file_lock
 from .paths import CAPTURE_DIR, DEBUG_DIR, EVENTS_PATH, LOG_DIR
 
 
@@ -59,6 +59,10 @@ def _prune_events_file_once(
     now: float,
     events_path: Path = EVENTS_PATH,
 ) -> dict[str, Any]:
+    if not events_path.exists():
+        return {"deleted_count": 0, "deleted_bytes": 0, "deleted_lines": 0, "kept_lines": 0}
+
+    ensure_events_file_local(events_path)
     if not events_path.exists():
         return {"deleted_count": 0, "deleted_bytes": 0, "deleted_lines": 0, "kept_lines": 0}
 

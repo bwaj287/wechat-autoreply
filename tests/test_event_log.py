@@ -12,6 +12,23 @@ from wechat_autoreply import capture_cleanup, event_log
 
 
 class EventLogTests(unittest.TestCase):
+    def test_dataless_event_log_is_archived_before_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events_path = Path(tmp) / "events.jsonl"
+            lock_path = Path(tmp) / "events.lock"
+            events_path.write_text('{"type":"old"}\n', encoding="utf-8")
+            with (
+                patch.object(event_log, "EVENTS_PATH", events_path),
+                patch.object(event_log, "EVENTS_LOCK_PATH", lock_path),
+                patch.object(event_log, "_is_dataless", return_value=True),
+            ):
+                event_log.append_event("new_event")
+
+            payload = json.loads(events_path.read_text(encoding="utf-8"))
+            archives = list(Path(tmp).glob("events.dataless-*.jsonl"))
+            self.assertEqual(payload["type"], "new_event")
+            self.assertEqual(len(archives), 1)
+
     def test_append_event_writes_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             events_path = Path(tmp) / "events.jsonl"

@@ -19,7 +19,7 @@ from wechat_autoreply.contact_memory import (
     set_contact_profile_lock,
 )
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
-from wechat_autoreply.event_log import append_event
+from wechat_autoreply.event_log import append_event, read_event_lines
 from wechat_autoreply.paths import EVENTS_PATH, PROJECT_ROOT
 from wechat_autoreply.state_store import default_state, load_state, save_state, utc_now_iso
 
@@ -169,7 +169,7 @@ def recent_trace_lines(limit: int = 5) -> list[str]:
     if not EVENTS_PATH.exists():
         return []
     lines: list[str] = []
-    raw_lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    raw_lines = read_event_lines()
     for raw in reversed(raw_lines):
         try:
             event = json.loads(raw)
@@ -191,7 +191,7 @@ def _recent_events(limit: int = 20) -> list[dict[str, Any]]:
     if not EVENTS_PATH.exists():
         return []
     events: list[dict[str, Any]] = []
-    for raw in reversed(EVENTS_PATH.read_text(encoding="utf-8").splitlines()):
+    for raw in reversed(read_event_lines()):
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
@@ -209,7 +209,7 @@ def _recent_open_without_new_message_lines(limit: int = 3) -> list[str]:
     if not EVENTS_PATH.exists():
         return []
     lines: list[str] = []
-    raw_lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    raw_lines = read_event_lines()
     for raw in reversed(raw_lines):
         try:
             event = json.loads(raw)
@@ -449,7 +449,7 @@ def sent_since_output(config: dict[str, Any], state: dict[str, Any]) -> tuple[st
 
     auto_sent_events: list[dict[str, Any]] = []
     if EVENTS_PATH.exists():
-        for raw in EVENTS_PATH.read_text(encoding="utf-8").splitlines():
+        for raw in read_event_lines():
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
