@@ -38,6 +38,7 @@ from .outbound_history import (
     message_similarity_score as _message_similarity_score,
     messages_overlap as _messages_overlap,
     prune_recent_auto_outbounds as _prune_recent_auto_outbounds,
+    recent_auto_outbound_texts as _recent_auto_outbound_texts,
     recent_auto_outbound_ttl as _recent_auto_outbound_ttl,
     remember_recent_auto_outbound as _remember_recent_auto_outbound,
 )
@@ -1808,6 +1809,99 @@ class AutoReplyRunner:
             request_timeout_seconds=float(config.get("erge_request_timeout_seconds", 120)),
         )
 
+    def _generate_guarded_reply(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+        client: Any,
+        contact: str,
+        inbound_text: str,
+        *,
+        now: float,
+        conversation_context: list[dict[str, str]] | None,
+        contact_memory: dict[str, Any] | None,
+        screenshot_path: str | None,
+        quoted_message: dict[str, Any] | None,
+    ) -> str:
+        ttl_seconds = _recent_auto_outbound_ttl(config)
+        avoid_replies = _recent_auto_outbound_texts(
+            state,
+            contact,
+            now=now,
+            ttl_seconds=ttl_seconds,
+            limit=3,
+        )
+
+        def generate(blocked_replies: list[str]) -> str:
+            kwargs = {
+                "conversation_context": conversation_context,
+                "contact_memory": contact_memory,
+                "screenshot_path": screenshot_path,
+                "quoted_message": quoted_message,
+            }
+            try:
+                return client.generate_reply(
+                    contact,
+                    inbound_text,
+                    avoid_replies=blocked_replies,
+                    **kwargs,
+                )
+            except TypeError as exc:
+                if "avoid_replies" not in str(exc):
+                    raise
+                return client.generate_reply(contact, inbound_text, **kwargs)
+
+        draft_text = generate(avoid_replies)
+        duplicate = _match_recent_auto_outbound(
+            state,
+            contact,
+            draft_text,
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+        if not duplicate:
+            return draft_text
+
+        reference = str(duplicate.get("reference_text") or "").strip()
+        self.append_event(
+            "duplicate_draft_detected",
+            contact=contact,
+            inbound_text=inbound_text,
+            draft_text=draft_text,
+            reference_text=reference,
+            match_mode=str(duplicate.get("match_mode") or ""),
+        )
+        retry_avoid = list(avoid_replies)
+        if reference and reference not in retry_avoid:
+            retry_avoid.append(reference)
+        retry_text = generate(retry_avoid)
+        retry_duplicate = _match_recent_auto_outbound(
+            state,
+            contact,
+            retry_text,
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+        if retry_duplicate:
+            self.append_event(
+                "duplicate_draft_blocked",
+                contact=contact,
+                inbound_text=inbound_text,
+                draft_text=retry_text,
+                reference_text=str(retry_duplicate.get("reference_text") or ""),
+                match_mode=str(retry_duplicate.get("match_mode") or ""),
+            )
+            return ""
+
+        self.append_event(
+            "duplicate_draft_regenerated",
+            contact=contact,
+            inbound_text=inbound_text,
+            previous_draft=draft_text,
+            draft_text=retry_text,
+        )
+        return retry_text
+
     def _handle_claim(
         self,
         config: dict[str, Any],
@@ -2511,6 +2605,8 @@ class AutoReplyRunner:
                             inbound_payload=inbound_payload,
                         )
                         queue_fingerprints.discard(str(existing.get("inbound_fingerprint", "")))
+                        if updated is None:
+                            continue
                         queue_fingerprints.add(str(updated.get("inbound_fingerprint", "")))
                         refreshed.append(contact)
                         continue
@@ -2522,14 +2618,29 @@ class AutoReplyRunner:
                         continue
 
                     contact_memory = self._load_contact_memory(config, contact)
-                    draft_text = llm.generate_reply(
+                    draft_text = self._generate_guarded_reply(
+                        config,
+                        state,
+                        llm,
                         contact,
                         inbound_text,
+                        now=now,
                         conversation_context=context_messages,
                         contact_memory=contact_memory,
                         screenshot_path=_preferred_chat_screenshot(selected),
                         quoted_message=inbound_payload,
                     )
+                    if not draft_text:
+                        state.setdefault("last_seen_inbound", {})[contact] = inbound_fingerprint
+                        self.save_state(state)
+                        self._remember_contact_memory(
+                            config,
+                            contact,
+                            context_messages=context_messages,
+                            inbound_text=inbound_text,
+                            source="duplicate_draft_blocked",
+                        )
+                        continue
                     pending = {
                         "contact": contact,
                         "inbound_text": inbound_text,
@@ -2670,7 +2781,7 @@ class AutoReplyRunner:
         refresh_delay_seconds: float | None = None,
         context_messages: list[dict[str, str]] | None = None,
         inbound_payload: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         existing = queue[pending_index]
         contact = str(existing.get("contact", "")).strip()
         client = llm or self._build_llm(config)
@@ -2683,14 +2794,39 @@ class AutoReplyRunner:
                 quoted_message=inbound_payload,
             )
         contact_memory = self._load_contact_memory(config, contact)
-        draft_text = client.generate_reply(
+        draft_text = self._generate_guarded_reply(
+            config,
+            state,
+            client,
             contact,
             inbound_text,
+            now=now,
             conversation_context=context_messages,
             contact_memory=contact_memory,
             screenshot_path=_preferred_chat_screenshot(selected),
             quoted_message=inbound_payload,
         )
+        if not draft_text:
+            current_fingerprint = fingerprint(contact, inbound_text, message_time)
+            queue.pop(pending_index)
+            sync_pending_state(state, queue)
+            state.setdefault("last_seen_inbound", {})[contact] = current_fingerprint
+            self.save_state(state)
+            self.append_event(
+                "pending_cancelled",
+                reason="duplicate_draft_blocked",
+                contact=contact,
+                remaining_queue=len(queue),
+                queue_contacts=queued_contacts(queue),
+            )
+            self._remember_contact_memory(
+                config,
+                contact,
+                context_messages=context_messages,
+                inbound_text=inbound_text,
+                source="duplicate_draft_blocked",
+            )
+            return None
         delay_seconds = float(
             refresh_delay_seconds
             if refresh_delay_seconds is not None
@@ -3725,6 +3861,13 @@ class AutoReplyRunner:
                     refresh_delay_seconds=refresh_delay_seconds,
                     inbound_payload=current_inbound_payload,
                 )
+                if updated is None:
+                    return {
+                        "status": "pending_cancelled",
+                        "reason": "duplicate_draft_blocked",
+                        "contact": contact,
+                        "queue_length": len(queue),
+                    }
                 return {
                     "status": "pending_refreshed",
                     "contact": contact,

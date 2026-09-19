@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from wechat_autoreply.ollama_client import _format_context_block
+from wechat_autoreply.ollama_client import _format_avoid_replies_block, _format_context_block
 from wechat_autoreply.orchestrator import build_reply_context
 
 
 class ReplyContextTests(unittest.TestCase):
+    def test_avoid_block_marks_already_sent_replies(self) -> None:
+        block = _format_avoid_replies_block(["刚发过的回复"])
+
+        self.assertIn("[ALREADY_SENT_DO_NOT_REPEAT] 刚发过的回复", block)
+        self.assertIn("genuinely new reply", block)
+
     def test_context_preserves_sender_roles_in_screen_order(self) -> None:
         panel = {
             "inbound": [

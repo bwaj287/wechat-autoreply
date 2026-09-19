@@ -203,6 +203,30 @@ def _recent_auto_outbound_entries(
     return []
 
 
+def recent_auto_outbound_texts(
+    state: dict[str, Any],
+    contact: str,
+    *,
+    now: float,
+    ttl_seconds: float,
+    limit: int = 3,
+) -> list[str]:
+    entries = _recent_auto_outbound_entries(state, contact, now=now, ttl_seconds=ttl_seconds)
+    texts: list[str] = []
+    seen: set[str] = set()
+    for entry in reversed(entries):
+        text = str(entry.get("text") or "").strip()
+        key = normalize_text(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        texts.append(text)
+        if len(texts) >= max(0, int(limit)):
+            break
+    texts.reverse()
+    return texts
+
+
 def remember_recent_auto_outbound(
     state: dict[str, Any],
     contact: str,

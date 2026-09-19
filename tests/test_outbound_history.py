@@ -5,11 +5,29 @@ import unittest
 from wechat_autoreply.outbound_history import (
     draft_match_mode,
     match_recent_auto_outbound,
+    recent_auto_outbound_texts,
     remember_recent_auto_outbound,
 )
 
 
 class OutboundHistoryTests(unittest.TestCase):
+    def test_recent_texts_return_newest_unique_replies(self) -> None:
+        state: dict = {}
+        for now, text in ((10, "第一条"), (20, "第二条"), (30, "第三条")):
+            remember_recent_auto_outbound(
+                state,
+                "May",
+                text,
+                now=now,
+                source="auto_sent",
+                ttl_seconds=3600,
+            )
+
+        self.assertEqual(
+            recent_auto_outbound_texts(state, "May", now=40, ttl_seconds=3600, limit=2),
+            ["第二条", "第三条"],
+        )
+
     def test_send_confirmation_ignores_punctuation_and_emoji_codes(self) -> None:
         self.assertIn(
             draft_match_mode("钱马上转过去", "钱马上转过去！[旺柴]"),

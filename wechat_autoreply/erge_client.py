@@ -14,6 +14,7 @@ from .ollama_client import (
     OllamaClient,
     _append_code_with_budget,
     _contains_emoji,
+    _format_avoid_replies_block,
     _format_contact_memory_block,
     _format_context_block,
     _format_quoted_message_block,
@@ -79,6 +80,7 @@ class ErgeClient:
         conversation_context: list[dict[str, str]] | None = None,
         contact_memory: dict[str, Any] | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         style_block = (
             f"{self.fallback_client.style_instructions}\n"
@@ -89,6 +91,7 @@ class ErgeClient:
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
         quoted_block = _format_quoted_message_block(quoted_message)
+        avoid_block = _format_avoid_replies_block(avoid_replies)
         if self.fallback_client.emoji_enabled and self.fallback_client.emoji_codes:
             sampled = " ".join(self.fallback_client.emoji_codes[:20])
             emoji_prompt_block = (
@@ -124,6 +127,7 @@ class ErgeClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
+            f"{avoid_block}"
             f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply with the final WeChat message only."
         )
@@ -374,6 +378,7 @@ class ErgeClient:
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         if not self._erge_healthy():
             self.last_backend = "local_small"
@@ -385,6 +390,7 @@ class ErgeClient:
                 conversation_context,
                 contact_memory=contact_memory,
                 quoted_message=quoted_message,
+                avoid_replies=avoid_replies,
             )
 
         prompt = self._build_prompt(
@@ -393,6 +399,7 @@ class ErgeClient:
             conversation_context,
             contact_memory,
             quoted_message=quoted_message,
+            avoid_replies=avoid_replies,
         )
         user_content: str | list[dict[str, Any]]
         screenshot = Path(str(screenshot_path or "").strip())
@@ -443,4 +450,5 @@ class ErgeClient:
                 conversation_context,
                 contact_memory=contact_memory,
                 quoted_message=quoted_message,
+                avoid_replies=avoid_replies,
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -584,6 +585,12 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _fresh_runtime_state_preserving_safety_history(before_state: dict[str, Any]) -> dict[str, Any]:
+    state = default_state()
+    state["recent_auto_outbounds"] = copy.deepcopy(before_state.get("recent_auto_outbounds") or {})
+    return state
+
+
 def reset_runtime_state(command: str = "restart") -> tuple[dict[str, Any], dict[str, Any]]:
     def stop_runner_processes() -> None:
         for target in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "apps" / "runner" / "cli.py"):
@@ -610,7 +617,7 @@ def reset_runtime_state(command: str = "restart") -> tuple[dict[str, Any], dict[
 
     stop_runner_processes()
 
-    state = default_state()
+    state = _fresh_runtime_state_preserving_safety_history(before_state)
     state["last_run_at"] = utc_now_iso()
     save_state(state)
 

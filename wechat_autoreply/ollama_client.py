@@ -190,6 +190,22 @@ def _format_quoted_message_block(quoted_message: dict[str, Any] | None) -> str:
     return f"{label}: {quoted_text}\n\n"
 
 
+def _format_avoid_replies_block(avoid_replies: list[str] | None) -> str:
+    lines: list[str] = []
+    for value in list(avoid_replies or []):
+        text = _clean_context_line(value, max_chars=180)
+        if text and text not in lines:
+            lines.append(text)
+    if not lines:
+        return ""
+    tagged = "\n".join(f"[ALREADY_SENT_DO_NOT_REPEAT] {text}" for text in lines[-3:])
+    return (
+        "Replies already sent to this contact are listed below. "
+        "Do not repeat, substantially copy, or merely append to them. Write a genuinely new reply.\n"
+        f"{tagged}\n\n"
+    )
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -220,6 +236,7 @@ class OllamaClient:
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         del screenshot_path
         num_predict = max(12, min(48, self.max_reply_chars // 2))
@@ -228,6 +245,7 @@ class OllamaClient:
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
         quoted_block = _format_quoted_message_block(quoted_message)
+        avoid_block = _format_avoid_replies_block(avoid_replies)
         if self.emoji_enabled and self.emoji_codes:
             sampled = " ".join(self.emoji_codes[:20])
             emoji_prompt_block = (
@@ -253,6 +271,7 @@ class OllamaClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
+            f"{avoid_block}"
             f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply:"
         )

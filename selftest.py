@@ -30,6 +30,22 @@ class MemoryStore:
         self.config = default_config()
         self.config["enabled"] = True
         self.config["passive_roster_sweep_enabled"] = False
+        # Keep regression fixtures independent from the operator's live whitelist.
+        self.config["allowed_contacts"] = [
+            "测试白名单",
+            "家人",
+            "客户A",
+            "shawn",
+            "May",
+            "Darren",
+            "Barrys",
+            "1ock",
+            "可乐",
+            "Ted Liu",
+            "王哥",
+            "刘若愚",
+            "吴瀚铭",
+        ]
         self.state = default_state()
         self.saved_states: list[dict] = []
         self.events: list[dict] = []
