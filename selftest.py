@@ -191,7 +191,10 @@ class FakeBackgroundUI(FakeUI):
 
     def probe_roster_background(self):
         self.calls.append(("probe_background", None))
-        return copy.deepcopy(self.background_probes.pop(0))
+        result = self.background_probes.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return copy.deepcopy(result)
 
 
 def run_happy_path() -> None:
@@ -865,6 +868,33 @@ def run_chat_title_near_panel_edge_is_not_replaced_by_message_path() -> None:
     assert title == "10ck", title
     assert names_match(title, "1ock")
 
+    observations = [
+        {"text": "May", "bbox": {"left": 0.2646, "top": 0.0254, "w": 0.0326}},
+        {"text": "还是欧服", "bbox": {"left": 0.3270, "top": 0.0725, "w": 0.0567}},
+    ]
+    assert _pick_selected_title(observations) == "May"
+    assert _pick_selected_title(observations[1:]) == ""
+
+
+def run_roster_panel_keeps_left_aligned_inbound_path() -> None:
+    observations = [
+        {
+            "text": "没事",
+            "bbox": {"top": 0.554, "left": 0.327, "w": 0.030},
+            "bubbleRole": "inbound",
+            "grayPixels": 2331,
+        },
+        {
+            "text": "然后地址给我一个",
+            "bbox": {"top": 0.485, "left": 0.810, "w": 0.087},
+            "bubbleRole": "outbound",
+            "greenPixels": 3953,
+        },
+    ]
+    panel = _extract_chat_panel(observations, selected_title="May")
+    assert panel["latestInbound"] == "没事", panel
+    assert panel["latestOutbound"] == "然后地址给我一个", panel
+
 
 def run_wechat_login_required_detection_path() -> None:
     assert wechat_login_required([{"text": "Enter Weixin"}])
@@ -1471,6 +1501,42 @@ def run_passive_roster_sweep_stays_background_without_badge_path() -> None:
     assert not any(event.get("type") == "wechat_window_action" for event in store.events), store.events
 
 
+def run_passive_roster_failure_reports_and_throttles_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    fake_ui = FakeBackgroundUI(
+        [],
+        [
+            RuntimeError("APP_NOT_FOUND: Application 'WeChat' not found"),
+            {"status": "ok", "screenshot": "", "visibleChats": []},
+        ],
+    )
+    clock = [20_000.0]
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("不该生成"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: clock[0],
+    )
+
+    runner.tick()
+    assert store.state["wechat_window_unavailable"] is True
+    assert store.state["last_roster_sweep_at"] == 20_000.0
+    clock[0] += 5
+    runner.tick()
+    assert fake_ui.calls == [("probe_background", None)], fake_ui.calls
+    clock[0] += 55
+    runner.tick()
+    assert fake_ui.calls == [("probe_background", None)] * 2, fake_ui.calls
+    assert store.state["wechat_window_unavailable"] is False
+
+
 def run_passive_roster_sweep_opens_only_after_background_badge_path() -> None:
     store = MemoryStore()
     store.config["passive_roster_sweep_enabled"] = True
@@ -1683,6 +1749,59 @@ def run_passive_roster_sweep_ignores_badge_for_already_queued_contact_path() -> 
         for event in store.events
     ), store.events
     assert not any(event.get("type") == "wechat_window_action" for event in store.events), store.events
+
+
+def run_passive_roster_sweep_refreshes_queued_contact_with_new_preview_path() -> None:
+    store = MemoryStore()
+    store.config["passive_roster_sweep_enabled"] = True
+    store.config["roster_sweep_interval_seconds"] = 60
+    store.config["allowed_contacts"] = ["1ock"]
+    pending = {
+        "contact": "1ock",
+        "inbound_text": "旧消息",
+        "message_time": "11:25",
+        "inbound_fingerprint": "old-fingerprint",
+        "draft_text": "旧草稿",
+        "created_at": 31_000.0,
+        "due_at": 32_000.0,
+        "outbound_snapshot": "",
+        "active_chat_title": "1ock",
+    }
+    store.state["pending_queue"] = [copy.deepcopy(pending)]
+    store.state["pending"] = copy.deepcopy(pending)
+    new_chat = {"name": "1ock", "preview": "新的消息", "time": "11:26", "unread": True}
+    fake_ui = FakeBackgroundUI(
+        [
+            {"status": "ok", "visibleChats": [new_chat], "chatPanel": {}},
+            {
+                "status": "ok",
+                "selectionConfirmed": True,
+                "activeChat": "1ock",
+                "selectedChat": "1ock",
+                "selectedChatRequested": "1ock",
+                "chatPanel": {"latestInbound": "新的消息", "latestOutbound": ""},
+            },
+            {"status": "ok", "visibleChats": [], "chatPanel": {}},
+        ],
+        [{"status": "ok", "visibleChats": [{**new_chat, "redPixelCount": 120, "digitPixelCount": 10, "numericBadge": True}]}],
+    )
+    runner = AutoReplyRunner(
+        vision_sensor=FakeVision([False]),
+        idle_sensor=FakeIdle(45),
+        ui=fake_ui,
+        llm_client=FakeLLM("回复新消息"),
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 31_100.0,
+    )
+
+    result = runner.tick()
+    assert result["status"] == "pending_wait_delay", result
+    assert store.state["pending_queue"][0]["inbound_text"] == "新的消息", store.state["pending_queue"]
+    assert store.state["pending_queue"][0]["draft_text"] == "回复新消息", store.state["pending_queue"]
+    assert any(event.get("type") == "pending_refreshed_latest" for event in store.events), store.events
 
 
 def run_claim_persists_pending_before_return_path() -> None:
@@ -3584,7 +3703,7 @@ def run_right_side_bubble_overrides_inbound_color_misclass_path() -> None:
     assert panel["latestOutbound"] == "我在twitch领箱子", panel
 
 
-def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
+def run_old_outbound_does_not_cancel_noisy_inbound_tail_path() -> None:
     store = MemoryStore()
     store.config["roster_sweep_interval_seconds"] = 9999
     fake_ui = FakeUI(
@@ -3663,9 +3782,8 @@ def run_manual_reply_cancels_even_with_noisy_inbound_tail_path() -> None:
 
     clock["now"] = 50_305.0
     second = runner.tick()
-    assert second["status"] == "cancelled", second
-    assert second["reason"] == "manual_reply_detected", second
-    assert store.state["pending"] is None
+    assert second["status"] == "pending_refreshed", second
+    assert store.state["pending"] is not None
     assert "send" not in fake_ui.calls
 
 
@@ -3715,6 +3833,7 @@ def main() -> int:
     run_history_marker_trim_path()
     run_card_then_new_messages_prefers_new_message_group_path()
     run_chat_title_near_panel_edge_is_not_replaced_by_message_path()
+    run_roster_panel_keeps_left_aligned_inbound_path()
     run_wechat_login_required_detection_path()
     run_ocr_symbol_tail_trim_path()
     run_preview_matching_outbound_is_not_inbound_path()
@@ -3736,7 +3855,7 @@ def main() -> int:
     run_capture_cleanup_deletes_old_snapshots_path()
     run_ocr_variant_same_message_does_not_refresh_path()
     run_right_side_bubble_overrides_inbound_color_misclass_path()
-    run_manual_reply_cancels_even_with_noisy_inbound_tail_path()
+    run_old_outbound_does_not_cancel_noisy_inbound_tail_path()
     run_peekaboo_duplicate_json_output_path()
     run_warm_avatar_attached_badge_detection_path()
     run_no_claim_sweep_while_pending_wait_path()
@@ -3748,9 +3867,11 @@ def main() -> int:
     run_unknown_menu_signal_does_not_claim_path()
     run_passive_roster_sweep_claims_without_menu_signal_path()
     run_passive_roster_sweep_stays_background_without_badge_path()
+    run_passive_roster_failure_reports_and_throttles_path()
     run_passive_roster_sweep_opens_only_after_background_badge_path()
     run_passive_roster_sweep_queues_whitelist_while_pending_path()
     run_passive_roster_sweep_ignores_badge_for_already_queued_contact_path()
+    run_passive_roster_sweep_refreshes_queued_contact_with_new_preview_path()
     run_claim_persists_pending_before_return_path()
     run_claim_title_ocr_garbage_uses_panel_preview_evidence_path()
     run_claim_selection_failure_persists_one_badge_backed_retry_path()

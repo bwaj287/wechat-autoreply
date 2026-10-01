@@ -206,6 +206,10 @@ def fallback_row_badge_detection(
     x1 = min(width, int(round((name_left + scan_pad_right) * width)))
     y0 = max(0, int(round(max(0.0, row_top - 0.012) * height)))
     y1 = min(height, int(round(min(1.0, row_top + max(0.085, min(0.135, row_span * 0.78))) * height)))
+    name_top = float(row.get("nameTop", 0.0) or 0.0)
+    if name_top > row_top:
+        # The preview line can contain red emoji with white centers; badge pixels sit above it.
+        y1 = min(y1, int(round(min(1.0, name_top + 0.02) * height)))
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
 

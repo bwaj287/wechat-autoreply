@@ -813,6 +813,8 @@ def _manual_reply_signal_is_reliable(
     has_chat_window: bool,
 ) -> tuple[bool, list[str]]:
     blockers: list[str] = []
+    if not current_inbound:
+        blockers.append("no_inbound_text")
     if not current_outbound:
         blockers.append("no_outbound_text")
     if current_outbound_item is None:
@@ -1628,12 +1630,12 @@ class AutoReplyRunner:
                 _record_menu_signal(self._menu_unread_signal(), source="interval")
                 menu_checked_now = True
 
-            cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 3600))
+            cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 43200))
             if now - float(state.get("last_capture_cleanup_at", 0.0) or 0.0) >= cleanup_interval:
                 state["last_capture_cleanup_at"] = now
                 try:
                     cleanup = cleanup_runtime_artifacts_older_than(
-                        older_than_seconds=float(config.get("capture_retention_days", 2)) * 24 * 60 * 60,
+                        older_than_seconds=float(config.get("capture_retention_days", 1)) * 24 * 60 * 60,
                         now=now,
                     )
                 except Exception as exc:
@@ -1699,18 +1701,31 @@ class AutoReplyRunner:
                         )
                     elif str(background_probe.get("status") or "") == "ok":
                         self._mark_wechat_available(state)
+                        state["wechat_window_unavailable"] = False
                     visible_chats = list(background_probe.get("visibleChats", []) or [])
                     allowed_contacts = list(config.get("allowed_contacts", []))
                     preflight = evaluate_passive_preflight(visible_chats, allowed_contacts)
                     state["last_roster_sweep_at"] = now
-                    queue_contacts_snapshot = queued_contacts(queue)
+                    def queued_badge_is_same_message(row: dict[str, Any]) -> bool:
+                        chat = find_visible_chat(background_probe, str(row.get("name") or ""))
+                        preview = str(chat.get("preview") or "") if chat else ""
+                        row_time = str(chat.get("time") or "") if chat else ""
+                        for pending_item in queue:
+                            if not wechat_ui.names_match(
+                                str(row.get("name") or ""), str(pending_item.get("contact") or "")
+                            ):
+                                continue
+                            pending_time = str(pending_item.get("message_time") or "")
+                            if row_time and pending_time and row_time != pending_time:
+                                continue
+                            if preview_panel_equivalent(preview, str(pending_item.get("inbound_text") or "")):
+                                return True
+                        return False
+
                     actionable_badge_rows = [
                         row
                         for row in preflight.badge_rows
-                        if not any(
-                            wechat_ui.names_match(str(row.get("name") or ""), queued_contact)
-                            for queued_contact in queue_contacts_snapshot
-                        )
+                        if not queued_badge_is_same_message(row)
                     ]
                     ignored_queued_badge_rows = [
                         row for row in preflight.badge_rows if row not in actionable_badge_rows
@@ -1726,9 +1741,14 @@ class AutoReplyRunner:
                         screenshot=str(background_probe.get("screenshot") or ""),
                     )
                 except Exception as exc:
+                    # A failed background probe should not run again every tick.
+                    state["last_roster_sweep_at"] = now
+                    error = str(exc)
+                    if "APP_NOT_FOUND" in error or "no roster window found" in error:
+                        state["wechat_window_unavailable"] = True
                     self.append_event(
                         "passive_roster_preflight_failed",
-                        error=str(exc),
+                        error=error,
                         fallback="foreground_claim_scan",
                     )
             claim_decision = decide_claim(
@@ -1832,11 +1852,15 @@ class AutoReplyRunner:
             limit=3,
         )
 
-        def generate(blocked_replies: list[str]) -> str:
+        def generate(blocked_replies: list[str], *, focused: bool = False) -> str:
             kwargs = {
-                "conversation_context": conversation_context,
-                "contact_memory": contact_memory,
-                "screenshot_path": screenshot_path,
+                "conversation_context": [] if focused else conversation_context,
+                "contact_memory": None if focused else contact_memory,
+                "screenshot_path": (
+                    screenshot_path
+                    if not focused or inbound_text.lstrip().startswith(("[", "［"))
+                    else None
+                ),
                 "quoted_message": quoted_message,
             }
             try:
@@ -1874,7 +1898,7 @@ class AutoReplyRunner:
         retry_avoid = list(avoid_replies)
         if reference and reference not in retry_avoid:
             retry_avoid.append(reference)
-        retry_text = generate(retry_avoid)
+        retry_text = generate(retry_avoid, focused=True)
         retry_duplicate = _match_recent_auto_outbound(
             state,
             contact,
@@ -2631,16 +2655,13 @@ class AutoReplyRunner:
                         quoted_message=inbound_payload,
                     )
                     if not draft_text:
-                        state.setdefault("last_seen_inbound", {})[contact] = inbound_fingerprint
-                        self.save_state(state)
-                        self._remember_contact_memory(
-                            config,
-                            contact,
-                            context_messages=context_messages,
+                        self.append_event(
+                            "draft_retry_scheduled",
+                            contact=contact,
+                            reason="duplicate_draft_blocked",
                             inbound_text=inbound_text,
-                            source="duplicate_draft_blocked",
+                            retry_seconds=120,
                         )
-                        continue
                     pending = {
                         "contact": contact,
                         "inbound_text": inbound_text,
@@ -2651,7 +2672,8 @@ class AutoReplyRunner:
                         "inbound_fingerprint": inbound_fingerprint,
                         "draft_text": draft_text,
                         "created_at": now,
-                        "due_at": now + float(config.get("send_delay_seconds", 300)),
+                        "due_at": now + (120 if not draft_text else float(config.get("send_delay_seconds", 300))),
+                        "draft_retry_count": 0,
                         "low_confidence_retries": 0,
                         "outbound_snapshot": outbound_snapshot,
                         "active_chat_title": selected.get("activeChat", ""),
@@ -2663,23 +2685,24 @@ class AutoReplyRunner:
                     sync_pending_state(state, queue)
                     self.save_state(state)
                     added.append(contact)
-                    self.append_event(
-                        "draft_saved_locally",
-                        contact=contact,
-                        inbound_text=inbound_text,
-                        draft_text=draft_text,
-                        due_at=pending["due_at"],
-                        idle_seconds=round(idle_seconds, 2),
-                        context_turns=len(context_messages),
-                        queue_length=len(queue),
-                        queue_contacts=queued_contacts(queue),
-                    )
+                    if draft_text:
+                        self.append_event(
+                            "draft_saved_locally",
+                            contact=contact,
+                            inbound_text=inbound_text,
+                            draft_text=draft_text,
+                            due_at=pending["due_at"],
+                            idle_seconds=round(idle_seconds, 2),
+                            context_turns=len(context_messages),
+                            queue_length=len(queue),
+                            queue_contacts=queued_contacts(queue),
+                        )
                     self._remember_contact_memory(
                         config,
                         contact,
                         context_messages=context_messages,
                         inbound_text=inbound_text,
-                        source="draft_saved",
+                        source="draft_saved" if draft_text else "draft_retry_scheduled",
                     )
 
             process_candidates(candidates)
@@ -2806,31 +2829,12 @@ class AutoReplyRunner:
             screenshot_path=_preferred_chat_screenshot(selected),
             quoted_message=inbound_payload,
         )
-        if not draft_text:
-            current_fingerprint = fingerprint(contact, inbound_text, message_time)
-            queue.pop(pending_index)
-            sync_pending_state(state, queue)
-            state.setdefault("last_seen_inbound", {})[contact] = current_fingerprint
-            self.save_state(state)
-            self.append_event(
-                "pending_cancelled",
-                reason="duplicate_draft_blocked",
-                contact=contact,
-                remaining_queue=len(queue),
-                queue_contacts=queued_contacts(queue),
-            )
-            self._remember_contact_memory(
-                config,
-                contact,
-                context_messages=context_messages,
-                inbound_text=inbound_text,
-                source="duplicate_draft_blocked",
-            )
-            return None
         delay_seconds = float(
-            refresh_delay_seconds
-            if refresh_delay_seconds is not None
-            else config.get("send_delay_seconds", 300)
+            120 if not draft_text else (
+                refresh_delay_seconds
+                if refresh_delay_seconds is not None
+                else config.get("send_delay_seconds", 300)
+            )
         )
         updated = copy.deepcopy(existing)
         updated.update(
@@ -2842,6 +2846,7 @@ class AutoReplyRunner:
                 "message_time": message_time,
                 "inbound_fingerprint": fingerprint(contact, inbound_text, message_time),
                 "draft_text": draft_text,
+                "draft_retry_count": 0,
                 "created_at": now,
                 "due_at": now + delay_seconds,
                 "low_confidence_retries": 0,
@@ -2854,6 +2859,14 @@ class AutoReplyRunner:
         sync_pending_state(state, queue)
         state.setdefault("last_seen_inbound", {})[contact] = str(updated.get("inbound_fingerprint", ""))
         self.save_state(state)
+        if not draft_text:
+            self.append_event(
+                "draft_retry_scheduled",
+                contact=contact,
+                reason="duplicate_draft_blocked",
+                inbound_text=inbound_text,
+                retry_seconds=delay_seconds,
+            )
         self.append_event(
             "pending_refreshed_latest",
             reason=reason,
@@ -2874,7 +2887,7 @@ class AutoReplyRunner:
             contact,
             context_messages=context_messages,
             inbound_text=inbound_text,
-            source="pending_refreshed",
+            source="pending_refreshed" if draft_text else "draft_retry_scheduled",
         )
         return updated
 
@@ -3013,6 +3026,67 @@ class AutoReplyRunner:
                 "contact": pending.get("contact"),
                 "queue_length": len(queue),
             }
+        if not str(pending.get("draft_text") or "").strip():
+            contact = str(pending.get("contact") or "").strip()
+            created_at = float(pending.get("created_at", now) or now)
+            if now - created_at >= 3600:
+                sync_pending_state(state, remove_pending_by_fingerprint(queue, pending))
+                self.save_state(state)
+                self.append_event(
+                    "draft_retry_expired",
+                    contact=contact,
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    retry_count=int(pending.get("draft_retry_count", 0) or 0),
+                )
+                return {"status": "draft_retry_expired", "contact": contact, "queue_length": len(sync_pending_state(state))}
+            retry_count = int(pending.get("draft_retry_count", 0) or 0) + 1
+            quoted_message = {
+                "quoted_text": str(pending.get("quoted_text") or ""),
+                "quoted_role": str(pending.get("quoted_role") or ""),
+                "quoted_sender": str(pending.get("quoted_sender") or ""),
+            }
+            try:
+                draft_text = self._generate_guarded_reply(
+                    config,
+                    state,
+                    self._build_llm(config),
+                    contact,
+                    str(pending.get("inbound_text") or ""),
+                    now=now,
+                    conversation_context=[],
+                    contact_memory=None,
+                    screenshot_path=None,
+                    quoted_message=quoted_message,
+                )
+            except Exception as exc:
+                draft_text = ""
+                self.append_event("draft_retry_failed", contact=contact, error=str(exc))
+            pending["draft_retry_count"] = retry_count
+            if draft_text:
+                pending["draft_text"] = draft_text
+                pending["due_at"] = now + float(config.get("send_delay_seconds", 300))
+                self.append_event(
+                    "draft_retry_recovered",
+                    contact=contact,
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    draft_text=draft_text,
+                    retry_count=retry_count,
+                )
+                status = "draft_retry_recovered"
+            else:
+                retry_seconds = min(120 * (2 ** min(retry_count - 1, 4)), 1800)
+                pending["due_at"] = now + retry_seconds
+                self.append_event(
+                    "draft_retry_scheduled",
+                    contact=contact,
+                    reason="duplicate_or_generation_failed",
+                    retry_count=retry_count,
+                    retry_seconds=retry_seconds,
+                )
+                status = "draft_retry_wait"
+            sync_pending_state(state, queue)
+            self.save_state(state)
+            return {"status": status, "contact": contact, "queue_length": len(queue)}
         # Recheck right before foreground UI action to avoid stale idle snapshots.
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:

@@ -921,6 +921,7 @@ def annotate_unread_chats(
                 "name": chat["name"],
                 "rowTop": round(prev_mid, 4),
                 "rowBottom": round(next_mid, 4),
+                "nameTop": float(chat.get("ocrTop", 0.0) or 0.0),
                 "nameLeft": float(chat.get("ocrLeft", 0.15) or 0.15),
             }
         )
@@ -1081,7 +1082,7 @@ def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
         width = obs["bbox"]["w"]
         # Only trust the actual chat-title strip at the upper-left of the right panel.
         # This excludes the green "new message(s)" banner on the upper-right.
-        if left < 0.30 or left > 0.62 or top > 0.09 or width < 0.02:
+        if left < 0.25 or left > 0.62 or top > 0.06 or width < 0.02:
             continue
         if _is_time(text):
             continue
@@ -1283,7 +1284,7 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
         width = obs["bbox"]["w"]
         if top < 0.11 or top > 0.90:
             continue
-        if left < 0.38 or width < 0.02:
+        if left < 0.30 or width < 0.02:
             continue
         if _is_time(text) or text == selected_title:
             continue

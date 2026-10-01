@@ -26,6 +26,7 @@ def default_state() -> dict[str, Any]:
         "pending_menu_clear_streak": 0,
         "claim_retry_candidate": None,
         "wechat_login_required": False,
+        "wechat_window_unavailable": False,
         "last_wechat_login_required_event_at": 0.0,
         "last_capture_cleanup_at": 0.0,
         "last_roster_sweep_at": 0.0,
