@@ -17,15 +17,15 @@ class Settings:
     host: str = os.getenv("ERGE_HOST", "127.0.0.1")
     port: int = int(os.getenv("ERGE_PORT", "4010"))
 
-    logic_primary_base_url: str = os.getenv("ERGE_LOGIC_BASE_URL", "http://192.168.10.2:11434")
-    logic_primary_model: str = os.getenv("ERGE_LOGIC_MODEL", "erge:27b")
+    logic_primary_base_url: str = os.getenv("ERGE_LOGIC_BASE_URL", "http://192.168.50.83:11434")
+    logic_primary_model: str = os.getenv("ERGE_LOGIC_MODEL", "qwen3.8:27b")
 
     logic_local_base_url: str = os.getenv("ERGE_LOCAL_LOGIC_BASE_URL", "http://127.0.0.1:11434")
     logic_local_model: str = os.getenv("ERGE_LOCAL_LOGIC_MODEL", "qwen3.5:9b")
 
-    health_pc_base_url: str = os.getenv("ERGE_HEALTH_PC_BASE_URL", "http://192.168.10.2:11434")
-    health_pc_model: str = os.getenv("ERGE_HEALTH_PC_MODEL", "erge:27b")
-    game_mode_url: str = os.getenv("ERGE_GAME_MODE_URL", "http://192.168.10.2:4011/game-mode")
+    health_pc_base_url: str = os.getenv("ERGE_HEALTH_PC_BASE_URL", "http://192.168.50.83:11434")
+    health_pc_model: str = os.getenv("ERGE_HEALTH_PC_MODEL", "qwen3.8:27b")
+    game_mode_url: str = os.getenv("ERGE_GAME_MODE_URL", "http://192.168.50.83:4011/game-mode")
 
     vision_base_url: str = os.getenv("ERGE_VISION_BASE_URL", "http://127.0.0.1:11434")
     vision_model: str = os.getenv("ERGE_VISION_MODEL", "qwen3-vl:4b")
@@ -35,6 +35,7 @@ class Settings:
     game_mode_timeout_seconds: float = float(os.getenv("ERGE_GAME_MODE_TIMEOUT_SECONDS", "1"))
     probe_timeout_seconds: float = float(os.getenv("ERGE_PROBE_TIMEOUT_SECONDS", "8"))
     busy_threshold_seconds: float = float(os.getenv("ERGE_BUSY_THRESHOLD_SECONDS", "5"))
+    primary_start_timeout_seconds: float = float(os.getenv("ERGE_PRIMARY_START_TIMEOUT_SECONDS", "90"))
     request_timeout_seconds: float = float(os.getenv("ERGE_REQUEST_TIMEOUT_SECONDS", "120"))
 
     pdf_text_threshold_chars: int = int(os.getenv("ERGE_PDF_TEXT_THRESHOLD_CHARS", "120"))

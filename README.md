@@ -299,7 +299,7 @@ runner 使用 `runtime/runner.lock` 保证同一时间只有一个实例。服�
 ```text
 runner
   └─ brother gateway: http://127.0.0.1:4010
-       ├─ PC logic primary: erge:27b @ http://192.168.10.2:11434
+       ├─ PC logic primary: qwen3.8:27b @ http://192.168.50.83:11434
        ├─ local logic fallback: qwen3.5:9b @ http://127.0.0.1:11434
        └─ local vision: qwen3-vl:4b @ http://127.0.0.1:11434
 ```
@@ -315,6 +315,10 @@ curl -s http://127.0.0.1:4010/health
 - `logic_probe.status=healthy`：PC 主模型可用。
 - `logic_probe.reason=pc_unreachable`：实际回复会降级到本机 `qwen3.5:9b`。
 - `logic_probe.reason=pc_model_missing`：PC 可达，但不存在配置的模型标签。
+
+PC 通过家庭 LAN 与 Mac 通信；`192.168.50.83` 当前由 DHCP 分配，地址变化后需同步更新二哥配置。游戏模式由 `http://192.168.50.83:4011/game-mode` 控制，开启后新请求降级到本机模型。PC 模型空闲卸载后，首次请求需要额外加载时间。
+
+PC 在线且游戏模式关闭时，二哥等待 PC 完成推理，包括模型冷启动；PC 离线或游戏模式开启时直接回小弟。PC 已接单但 90 秒仍无正文时，才将本轮视为超时失败并回小弟（`ERGE_PRIMARY_START_TIMEOUT_SECONDS`）；已开始输出的正常长回答不会仅因总耗时超过 90 秒而降级。
 
 模型名称和端点可通过 `ERGE_*` 环境变量覆盖，默认值见 `erge_gateway/config.py`。
 
