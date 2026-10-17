@@ -14,11 +14,13 @@ from .ollama_client import (
     OllamaClient,
     _append_code_with_budget,
     _contains_emoji,
+    _format_avoid_replies_block,
     _format_contact_memory_block,
     _format_context_block,
     _format_quoted_message_block,
     _normalize_reply_text,
     _preferred_emoji_names,
+    _ROLE_GROUNDING_INSTRUCTIONS,
     _same_language_hint,
     _stable_pick_codes,
 )
@@ -78,6 +80,7 @@ class ErgeClient:
         conversation_context: list[dict[str, str]] | None = None,
         contact_memory: dict[str, Any] | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         style_block = (
             f"{self.fallback_client.style_instructions}\n"
@@ -88,6 +91,7 @@ class ErgeClient:
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
         quoted_block = _format_quoted_message_block(quoted_message)
+        avoid_block = _format_avoid_replies_block(avoid_replies)
         if self.fallback_client.emoji_enabled and self.fallback_client.emoji_codes:
             sampled = " ".join(self.fallback_client.emoji_codes[:20])
             emoji_prompt_block = (
@@ -107,6 +111,7 @@ class ErgeClient:
         return (
             "You write short, natural WeChat replies.\n"
             f"{_same_language_hint(inbound_text)}\n"
+            f"{_ROLE_GROUNDING_INSTRUCTIONS}"
             f"{style_block}"
             f"{emoji_prompt_block}"
             f"{screenshot_hint}"
@@ -122,7 +127,8 @@ class ErgeClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
-            f"Latest incoming message: {inbound_text}\n\n"
+            f"{avoid_block}"
+            f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply with the final WeChat message only."
         )
 
@@ -372,6 +378,7 @@ class ErgeClient:
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         if not self._erge_healthy():
             self.last_backend = "local_small"
@@ -383,6 +390,7 @@ class ErgeClient:
                 conversation_context,
                 contact_memory=contact_memory,
                 quoted_message=quoted_message,
+                avoid_replies=avoid_replies,
             )
 
         prompt = self._build_prompt(
@@ -391,6 +399,7 @@ class ErgeClient:
             conversation_context,
             contact_memory,
             quoted_message=quoted_message,
+            avoid_replies=avoid_replies,
         )
         user_content: str | list[dict[str, Any]]
         screenshot = Path(str(screenshot_path or "").strip())
@@ -412,7 +421,12 @@ class ErgeClient:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Return only the final WeChat reply in plain language. Do not output JSON or pipeline details.",
+                            "content": (
+                                "Return only the final WeChat reply in plain language. "
+                                "Treat conversation role labels as authoritative: [YOU_SENT] is the user's own "
+                                "historical message and must never be answered; reply only to [LATEST_CONTACT_SENT]. "
+                                "Do not output JSON or pipeline details."
+                            ),
                         },
                         {"role": "user", "content": user_content},
                     ],
@@ -436,4 +450,5 @@ class ErgeClient:
                 conversation_context,
                 contact_memory=contact_memory,
                 quoted_message=quoted_message,
+                avoid_replies=avoid_replies,
             )

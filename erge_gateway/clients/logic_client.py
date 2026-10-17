@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from erge_gateway.config import Settings
 
@@ -110,15 +112,39 @@ class LogicClient:
         return LogicHealth(status="healthy", latency_ms=latency_ms, reason="pc_model_ready")
 
     def _primary_chat(self, messages: list[dict[str, str]]) -> LogicResult:
-        response = requests.post(
+        start_timeout = self.settings.primary_start_timeout_seconds
+        payload = self._chat_payload(self.settings.logic_primary_model, messages)
+        payload["stream"] = True
+        started = time.monotonic()
+        chunks: list[str] = []
+        done = False
+        with requests.post(
             f"{self.settings.logic_primary_base_url}/api/chat",
-            json=self._chat_payload(self.settings.logic_primary_model, messages),
-            timeout=self.settings.request_timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        content = payload.get("message", {}).get("content", "")
-        return LogicResult(content=str(content).strip(), backend="pc_5080")
+            json=payload,
+            stream=True,
+            timeout=(self.settings.connect_timeout_seconds, start_timeout),
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(chunk_size=1):
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError) as exc:
+                    raise requests.RequestException("Invalid PC stream event") from exc
+                if event.get("error"):
+                    raise requests.RequestException(str(event["error"]))
+                content = str(event.get("message", {}).get("content") or "")
+                if not chunks and time.monotonic() - started > start_timeout:
+                    raise requests.Timeout("PC did not start answering before the deadline")
+                if content:
+                    chunks.append(content)
+                if event.get("done"):
+                    done = True
+                    break
+        if not done or not "".join(chunks).strip():
+            raise requests.RequestException("PC returned no complete readable answer")
+        return LogicResult(content="".join(chunks).strip(), backend="pc_5080")
 
     def _local_chat(self, messages: list[dict[str, str]], *, fallback_reason: str | None = None) -> LogicResult:
         response = requests.post(
@@ -141,5 +167,6 @@ class LogicClient:
             return self._primary_chat(normalized)
         except requests.Timeout:
             return self._local_chat(normalized, fallback_reason="pc_timeout")
-        except requests.RequestException:
-            return self._local_chat(normalized, fallback_reason="pc_infer_failed")
+        except requests.RequestException as exc:
+            reason = "pc_timeout" if isinstance(exc.__context__, ReadTimeoutError) else "pc_infer_failed"
+            return self._local_chat(normalized, fallback_reason=reason)

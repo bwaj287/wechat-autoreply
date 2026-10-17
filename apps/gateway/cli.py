@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -12,13 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from wechat_autoreply.contact_memory import (
+    clear_all_recent_memory,
     clear_contact_recent_memory,
     get_contact_memory,
     set_contact_profile,
     set_contact_profile_lock,
 )
 from wechat_autoreply.config_store import load_config, save_config, set_enabled, status_line
-from wechat_autoreply.event_log import append_event
+from wechat_autoreply.event_log import append_event, read_event_lines
 from wechat_autoreply.paths import EVENTS_PATH, PROJECT_ROOT
 from wechat_autoreply.state_store import default_state, load_state, save_state, utc_now_iso
 
@@ -29,6 +31,10 @@ TRACE_TYPES = {
     "pending_message_changed_recheck",
     "auto_sent",
     "pending_cancelled",
+    "draft_retry_scheduled",
+    "draft_retry_recovered",
+    "draft_retry_expired",
+    "draft_retry_failed",
     "runner_error",
     "claim_opened_no_new_message",
 }
@@ -50,6 +56,7 @@ SUPPORTED_COMMANDS = [
     "memory-show",
     "memory-set",
     "memory-clear",
+    "memory-clear-all",
     "memory-lock",
     "memory-unlock",
     "command",
@@ -63,8 +70,8 @@ RUNNER_PATTERNS = (
     str(PROJECT_ROOT / "apps" / "runner" / "cli.py"),
 )
 
-LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v1"
-LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v1.plist")
+LAUNCH_AGENT_LABEL = "ai.openclaw.wechat.autoreply.v6"
+LAUNCH_AGENT_PLIST = Path("/Users/shawnwang/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v6.plist")
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,7 +174,7 @@ def recent_trace_lines(limit: int = 5) -> list[str]:
     if not EVENTS_PATH.exists():
         return []
     lines: list[str] = []
-    raw_lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    raw_lines = read_event_lines()
     for raw in reversed(raw_lines):
         try:
             event = json.loads(raw)
@@ -189,7 +196,7 @@ def _recent_events(limit: int = 20) -> list[dict[str, Any]]:
     if not EVENTS_PATH.exists():
         return []
     events: list[dict[str, Any]] = []
-    for raw in reversed(EVENTS_PATH.read_text(encoding="utf-8").splitlines()):
+    for raw in reversed(read_event_lines()):
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
@@ -207,7 +214,7 @@ def _recent_open_without_new_message_lines(limit: int = 3) -> list[str]:
     if not EVENTS_PATH.exists():
         return []
     lines: list[str] = []
-    raw_lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    raw_lines = read_event_lines()
     for raw in reversed(raw_lines):
         try:
             event = json.loads(raw)
@@ -354,6 +361,10 @@ def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     no_new_lines = _recent_open_without_new_message_lines(limit=3)
     runner = _runner_snapshot()
     lines = [base, _runner_brief(runner)]
+    if bool(state.get("wechat_login_required")) or state.get("last_error") == "wechat_login_required":
+        lines.append("警告：微信需要登录，自动回复当前不可用")
+    elif bool(config.get("enabled")) and bool(state.get("wechat_window_unavailable")):
+        lines.append("警告：微信窗口不可用，自动回复暂时无法读取消息；请检查微信是否仍在运行")
     if traces:
         lines.extend(["最近记录：", *traces])
     if no_new_lines:
@@ -402,6 +413,8 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     lines.append(f"- queue_length: {len(queue)}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
     lines.append(f"- last_error: {state.get('last_error') or '-'}")
+    lines.append(f"- wechat_login_required: {bool(state.get('wechat_login_required'))}")
+    lines.append(f"- wechat_window_unavailable: {bool(state.get('wechat_window_unavailable'))}")
     lines.append(f"- last_menu_signal: {state.get('last_menu_signal') or '-'}")
     lines.append(f"- last_menu_unread: {bool(state.get('last_menu_unread'))}")
     lines.append(f"- last_menu_check_at: {_format_epoch(state.get('last_menu_check_at'))}")
@@ -444,7 +457,7 @@ def sent_since_output(config: dict[str, Any], state: dict[str, Any]) -> tuple[st
 
     auto_sent_events: list[dict[str, Any]] = []
     if EVENTS_PATH.exists():
-        for raw in EVENTS_PATH.read_text(encoding="utf-8").splitlines():
+        for raw in read_event_lines():
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
@@ -561,6 +574,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         "- memory-show <联系人>：查看该联系人的长期画像 + 短期摘要",
         '- memory-set <联系人> "<画像>"：手动设置该联系人的长期画像',
         "- memory-clear <联系人>：清空该联系人的短期摘要与最近事件（保留长期画像）",
+        "- memory-clear-all：清空所有联系人短期摘要与最近事件（保留长期画像）",
         "- memory-lock <联系人>：锁定长期画像，防止后续误改",
         "- memory-unlock <联系人>：解锁长期画像",
         "",
@@ -576,6 +590,12 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
         '- ./wechat_env/bin/python gateway_control.py memory-set May "朋友，口语一点，可以轻微调侃，别太油"',
     ]
     return "\n".join(lines)
+
+
+def _fresh_runtime_state_preserving_safety_history(before_state: dict[str, Any]) -> dict[str, Any]:
+    state = default_state()
+    state["recent_auto_outbounds"] = copy.deepcopy(before_state.get("recent_auto_outbounds") or {})
+    return state
 
 
 def reset_runtime_state(command: str = "restart") -> tuple[dict[str, Any], dict[str, Any]]:
@@ -604,7 +624,7 @@ def reset_runtime_state(command: str = "restart") -> tuple[dict[str, Any], dict[
 
     stop_runner_processes()
 
-    state = default_state()
+    state = _fresh_runtime_state_preserving_safety_history(before_state)
     state["last_run_at"] = utc_now_iso()
     save_state(state)
 
@@ -669,6 +689,15 @@ def main() -> int:
         memory = clear_contact_recent_memory(args.contact_name)
         append_event("gateway_memory_recent_cleared", contact=memory.get("contact"))
         state = load_state()
+    elif command == "memory-clear-all":
+        config = load_config()
+        memory_clear_all_result = clear_all_recent_memory()
+        append_event(
+            "gateway_memory_all_recent_cleared",
+            cleared_count=memory_clear_all_result.get("cleared_count"),
+            cleared_contacts=memory_clear_all_result.get("cleared_contacts"),
+        )
+        state = load_state()
     elif command == "memory-lock":
         config = load_config()
         memory = set_contact_profile_lock(args.contact_name, True)
@@ -710,6 +739,9 @@ def main() -> int:
     elif command == "memory-clear":
         print(f"微信自动回复：已清空 {memory.get('contact') or args.contact_name} 的短期记忆")
         print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))
+    elif command == "memory-clear-all":
+        cleared_count = int(memory_clear_all_result.get("cleared_count") or 0)
+        print(f"微信自动回复：已清空所有联系人短期记忆（{cleared_count} 个联系人）")
     elif command == "memory-lock":
         print(f"微信自动回复：已锁定 {memory.get('contact') or args.contact_name} 的长期画像")
         print(memory_show_output(config, state, str(memory.get("contact") or args.contact_name)))

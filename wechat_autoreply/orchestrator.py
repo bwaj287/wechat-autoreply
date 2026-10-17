@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 import copy
-from difflib import SequenceMatcher
 import hashlib
 import re
 import shutil
@@ -11,13 +10,50 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .capture_cleanup import cleanup_runtime_artifacts_older_than
+from .claim_policy import (
+    candidate_contact_name,
+    canonical_contact_match_key as _canonical_contact_match_key,
+    choose_non_whitelist_unread,
+    choose_whitelist_candidates,
+    contact_badge_streak as _contact_badge_streak,
+    decide_claim,
+    evaluate_passive_preflight,
+    filter_candidates_by_badge_streak as _filter_candidates_by_badge_streak,
+    has_row_numeric_unread_badge as _has_row_numeric_unread_badge,
+    match_allowed_contact as _match_allowed_contact,
+    menu_signal_rising,
+    update_badge_streaks as _update_badge_streaks,
+)
 from .contact_memory import get_contact_memory, remember_contact_memory
 from .config_store import load_config
 from .erge_client import ErgeClient
 from .event_log import append_event
 from .idle import get_idle_time_seconds
+from .manual_reply_policy import detect_manual_reply_trigger
 from .ollama_client import OllamaClient
+from .outbound_history import (
+    compact_message_text as _compact_message_text,
+    draft_match_mode as _draft_match_mode,
+    match_recent_auto_outbound as _match_recent_auto_outbound,
+    message_similarity_score as _message_similarity_score,
+    messages_overlap as _messages_overlap,
+    prune_recent_auto_outbounds as _prune_recent_auto_outbounds,
+    recent_auto_outbound_texts as _recent_auto_outbound_texts,
+    recent_auto_outbound_ttl as _recent_auto_outbound_ttl,
+    remember_recent_auto_outbound as _remember_recent_auto_outbound,
+)
 from .paths import CAPTURE_DIR
+from .pending_queue import (
+    find_queue_index_for_contact,
+    get_pending_queue,
+    prune_stale_pending,
+    queued_contacts,
+    remove_pending_by_fingerprint,
+    replace_pending,
+    select_next_pending,
+    sync_pending_state,
+)
+from .recheck_policy import build_recheck_consensus
 from .state_store import load_state, save_state, utc_now_iso
 from .vision import check_unread_dot, unread_signal
 from . import wechat_ui
@@ -29,14 +65,8 @@ HISTORY_MARKER_RE = re.compile(
 DIGIT_PUNCT_SHORT_RE = re.compile(r"^[0-9０-９]+[~～`'\"!！?？.,，。…·•\-_/\\|]*$")
 SYMBOL_ONLY_SHORT_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\-_/\\|]+$")
 SHORT_PING_RE = re.compile(r"^[?？!！]{1,3}$")
-EMOJI_CODE_RE = re.compile(r"\[[^\[\]\s]{1,12}\]")
-EMOJI_CHAR_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
-CONTACT_DAY_SUFFIX_RE = re.compile(
-    r"(?i)\b(?:today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-    r"mon|tue|wed|thu|fri|sat|sun)\b.*$|(?:今天|昨天|前天).*$"
-)
-CONTACT_TIME_SUFFIX_RE = re.compile(r"\b\d{1,2}:\d{2}\b$")
-CONTACT_TRAILING_COUNT_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
+CJK_SYMBOL_ARTIFACT_RE = re.compile(r"^[日曰口][%％~～`'\"!！?？.,，。…·•♥♡❤\-_/\\|]{1,4}$")
+SINGLE_ASCII_ARTIFACT_RE = re.compile(r"^[A-Za-z]$")
 QUOTED_REPLY_CARD_RE = re.compile(r"^\s*([^:：\n]{1,40})\s*[:：]\s*(.+)$")
 STALE_SYSTEM_INBOUND_RE = re.compile(
     r"(?i)\b("
@@ -145,6 +175,25 @@ def _tail_cluster(items: list[dict[str, Any]], max_gap: float = 0.14) -> list[di
         last_top = top
     cluster.reverse()
     return cluster
+
+
+def _trim_card_prefix_before_newer_messages(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(items) < 2:
+        return items
+    last_card_metadata_index = -1
+    for index, item in enumerate(items):
+        if _looks_like_card_metadata_text(str(item.get("text") or "")):
+            last_card_metadata_index = index
+    if last_card_metadata_index < 0 or last_card_metadata_index >= len(items) - 1:
+        return items
+    newer_items = items[last_card_metadata_index + 1 :]
+    if not any(
+        _is_context_text_candidate(str(item.get("text") or ""))
+        and not _looks_like_card_metadata_text(str(item.get("text") or ""))
+        for item in newer_items
+    ):
+        return items
+    return newer_items
 
 
 def _clean_multiline_latest_inbound(latest_inbound: str, preview: str) -> str:
@@ -274,6 +323,7 @@ def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -
                 ]
             )
             if recent_rows:
+                recent_rows = _trim_card_prefix_before_newer_messages(recent_rows)
                 quote_payload = _extract_quote_payload(panel, recent_rows, preview)
                 if quote_payload.get("text"):
                     return quote_payload
@@ -310,6 +360,7 @@ def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -
                     return payload
         tail_rows = _tail_cluster(inbound_items)
         if tail_rows:
+            tail_rows = _trim_card_prefix_before_newer_messages(tail_rows)
             quote_payload = _extract_quote_payload(panel, tail_rows[-3:], preview)
             if quote_payload.get("text"):
                 return quote_payload
@@ -386,6 +437,8 @@ def _is_likely_ocr_noise_line(line: str) -> bool:
         return True
     if is_history_marker(value):
         return True
+    if CJK_SYMBOL_ARTIFACT_RE.fullmatch(value):
+        return True
     if SHORT_PING_RE.fullmatch(value):
         return False
     if wechat_ui.is_nontext_message(value):
@@ -402,6 +455,15 @@ def _is_likely_ocr_noise_line(line: str) -> bool:
     if len(normalized) <= 2 and not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", value):
         return True
     return False
+
+
+def _is_likely_trailing_ocr_artifact_line(line: str) -> bool:
+    value = str(line or "").strip()
+    if not value:
+        return True
+    if _is_likely_ocr_noise_line(value):
+        return True
+    return bool(SINGLE_ASCII_ARTIFACT_RE.fullmatch(value))
 
 
 def _sanitize_inbound_lines(lines: list[str], preview: str = "") -> list[str]:
@@ -424,7 +486,7 @@ def _sanitize_inbound_lines(lines: list[str], preview: str = "") -> list[str]:
     # Trim noisy tail fragments such as OCR artifacts ("8~", isolated punctuation).
     while len(cleaned) > 1:
         tail = cleaned[-1]
-        if not _is_likely_ocr_noise_line(tail):
+        if not _is_likely_trailing_ocr_artifact_line(tail):
             break
         if has_preview_line and normalize_text(tail) != preview_norm:
             cleaned.pop()
@@ -463,6 +525,8 @@ def _recover_short_inbound_text(*values: str) -> str:
         if re.fullmatch(r"[A-Za-z]", compact):
             return compact
         if compact and len(compact) <= 2:
+            if re.search(r"[\u4e00-\u9fffA-Za-z]", compact):
+                return value
             return "[收到一条超短消息]"
     return ""
 
@@ -620,90 +684,6 @@ def preview_reliable_for_fallback(preview_text: str) -> bool:
     return len(compact) >= 5
 
 
-def _compact_message_text(text: str) -> str:
-    value = normalize_text(text)
-    return re.sub(r"[\s…。,，!！?？~～·•`'\"\\-_/\\\\|]+", "", value)
-
-
-def _messages_overlap(first: str, second: str) -> bool:
-    first_norm = normalize_text(first)
-    second_norm = normalize_text(second)
-    if not first_norm or not second_norm:
-        return False
-    if first_norm == second_norm or first_norm in second_norm or second_norm in first_norm:
-        return True
-    first_compact = _compact_message_text(first_norm)
-    second_compact = _compact_message_text(second_norm)
-    if not first_compact or not second_compact:
-        return False
-    return first_compact in second_compact or second_compact in first_compact
-
-
-def _message_similarity_score(first: str, second: str) -> float:
-    first_compact = _compact_message_text(first)
-    second_compact = _compact_message_text(second)
-    if not first_compact or not second_compact:
-        return 0.0
-    if first_compact == second_compact:
-        return 1.0
-    if first_compact in second_compact or second_compact in first_compact:
-        shorter = min(len(first_compact), len(second_compact))
-        longer = max(len(first_compact), len(second_compact))
-        if longer and (shorter / longer) >= 0.72:
-            return 0.96
-    if len(first_compact) == len(second_compact) and len(first_compact) >= 4:
-        mismatch = sum(1 for left, right in zip(first_compact, second_compact) if left != right)
-        if mismatch <= 1:
-            return 0.97
-    return SequenceMatcher(None, first_compact, second_compact).ratio()
-
-
-def _canonical_reply_text(text: str) -> str:
-    value = normalize_text(text)
-    if not value:
-        return ""
-    # Remove WeChat emoji code tokens like [偷笑] / [旺柴].
-    value = EMOJI_CODE_RE.sub("", value)
-    # Remove rendered emoji glyphs and major separators/punctuations.
-    value = EMOJI_CHAR_RE.sub("", value)
-    value = re.sub(r"[\s…。,，!！?？~～·•`'\"\\\-_/\\\\|:：;；\[\]\(\)（）【】<>{}《》]+", "", value)
-    return value
-
-
-def _draft_match_mode(draft_text: str, outbound_text: str) -> str:
-    draft_norm = normalize_text(draft_text)
-    outbound_norm = normalize_text(outbound_text)
-    if not draft_norm or not outbound_norm:
-        return ""
-    if draft_norm == outbound_norm:
-        return "strict"
-    if draft_norm in outbound_norm or outbound_norm in draft_norm:
-        return "normalized_substring"
-
-    draft_canonical = _canonical_reply_text(draft_norm)
-    outbound_canonical = _canonical_reply_text(outbound_norm)
-    if not draft_canonical or not outbound_canonical:
-        return ""
-    if draft_canonical == outbound_canonical:
-        return "canonical_exact"
-    if draft_canonical in outbound_canonical or outbound_canonical in draft_canonical:
-        return "canonical_substring"
-
-    max_len = max(len(draft_canonical), len(outbound_canonical))
-    if max_len < 6:
-        return ""
-    min_len = min(len(draft_canonical), len(outbound_canonical))
-    if min_len < max(3, int(max_len * 0.55)):
-        return ""
-    draft_counter = Counter(draft_canonical)
-    outbound_counter = Counter(outbound_canonical)
-    overlap = sum((draft_counter & outbound_counter).values())
-    similarity = overlap / max_len if max_len else 0.0
-    if similarity >= 0.82:
-        return "canonical_charbag"
-    return ""
-
-
 def _line_matches_outbound_contamination(line: str, references: list[str]) -> bool:
     value = str(line or "").strip()
     if not value:
@@ -833,6 +813,8 @@ def _manual_reply_signal_is_reliable(
     has_chat_window: bool,
 ) -> tuple[bool, list[str]]:
     blockers: list[str] = []
+    if not current_inbound:
+        blockers.append("no_inbound_text")
     if not current_outbound:
         blockers.append("no_outbound_text")
     if current_outbound_item is None:
@@ -1059,206 +1041,6 @@ def _empty_inbound_debug_payload(
     }
 
 
-def candidate_contact_name(candidate: dict[str, Any]) -> str:
-    return str(candidate.get("matchedContact") or candidate.get("name", "")).strip()
-
-
-def _canonical_contact_match_key(text: str) -> str:
-    value = " ".join(str(text or "").strip().split())
-    if not value:
-        return ""
-    value = CONTACT_TRAILING_COUNT_RE.sub("", value).strip()
-    for _ in range(3):
-        before = value
-        value = CONTACT_DAY_SUFFIX_RE.sub("", value).strip()
-        value = CONTACT_TIME_SUFFIX_RE.sub("", value).strip()
-        if value == before:
-            break
-    value = re.sub(r"^[^0-9A-Za-z\u4e00-\u9fff]+|[^0-9A-Za-z\u4e00-\u9fff]+$", "", value).strip()
-    value = wechat_ui.normalize_name_for_match(value)
-    value = " ".join(value.split())
-    return value
-
-
-def _match_allowed_contact(candidate_name: str, allowed_contacts: list[str]) -> str:
-    candidate_key = _canonical_contact_match_key(candidate_name)
-    if not candidate_key:
-        return ""
-    for allowed in allowed_contacts:
-        if candidate_key == _canonical_contact_match_key(allowed):
-            return allowed
-    # Fallback for OCR-truncated names (e.g. "Dar... Yesterday 16:29").
-    # Reuse UI-level robust matcher that handles ellipsis/prefix semantics.
-    for allowed in allowed_contacts:
-        if wechat_ui.names_match(candidate_name, allowed):
-            return allowed
-    return ""
-
-
-def _has_row_numeric_unread_badge(chat: dict[str, Any]) -> bool:
-    if not isinstance(chat, dict):
-        return False
-    # Strict mode: only numeric badge counts as actionable unread.
-    # This avoids false claims caused by generic unread/red heuristics.
-    if not bool(chat.get("numericBadge", False)):
-        return False
-    digit_pixels = int(chat.get("digitPixelCount", 0) or 0)
-    red_pixels = max(1, int(chat.get("redPixelCount", 0) or 0))
-    if digit_pixels >= 10:
-        return True
-    digit_ratio = digit_pixels / red_pixels
-    if digit_pixels >= 8:
-        return digit_ratio >= 0.045
-    if digit_pixels >= 6 and red_pixels <= 80:
-        return digit_ratio >= 0.11
-    return False
-
-
-def _read_badge_streaks(state: dict[str, Any]) -> dict[str, int]:
-    raw = state.get("badge_streaks")
-    if not isinstance(raw, dict):
-        return {}
-    cleaned: dict[str, int] = {}
-    for key, value in raw.items():
-        token = _canonical_contact_match_key(str(key or ""))
-        if not token:
-            continue
-        try:
-            streak = int(value or 0)
-        except Exception:
-            streak = 0
-        if streak > 0:
-            cleaned[token] = streak
-    return cleaned
-
-
-def _badge_streak_key(contact_name: str, allowed_contacts: list[str]) -> str:
-    matched = _match_allowed_contact(contact_name, allowed_contacts) or str(contact_name or "")
-    return _canonical_contact_match_key(matched)
-
-
-def _update_badge_streaks(
-    state: dict[str, Any],
-    probe_result: dict[str, Any],
-    allowed_contacts: list[str],
-) -> dict[str, int]:
-    previous = _read_badge_streaks(state)
-    updated: dict[str, int] = {}
-    for chat in list(probe_result.get("visibleChats", []) or []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        key = _badge_streak_key(str(chat.get("name", "")), allowed_contacts)
-        if not key:
-            continue
-        updated[key] = min(9, int(previous.get(key, 0) or 0) + 1)
-    state["badge_streaks"] = updated
-    return updated
-
-
-def _contact_badge_streak(state: dict[str, Any], contact_name: str, allowed_contacts: list[str]) -> int:
-    key = _badge_streak_key(contact_name, allowed_contacts)
-    if not key:
-        return 0
-    return int(_read_badge_streaks(state).get(key, 0) or 0)
-
-
-def _filter_candidates_by_badge_streak(
-    candidates: list[dict[str, Any]],
-    *,
-    state: dict[str, Any],
-    allowed_contacts: list[str],
-    min_frames: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if min_frames <= 1:
-        return candidates, []
-    stable: list[dict[str, Any]] = []
-    unstable: list[dict[str, Any]] = []
-    for candidate in candidates:
-        contact = candidate_contact_name(candidate)
-        # Strong numeric badge evidence on an exact whitelist hit is reliable enough
-        # to skip the extra frame of debounce. This reduces missed-feeling delays for
-        # top-of-list contacts like May while keeping weak badges on the safer path.
-        digit_pixels = int(candidate.get("digitPixelCount", 0) or 0)
-        if digit_pixels >= 10:
-            stable.append(candidate)
-            continue
-        streak = _contact_badge_streak(state, contact, allowed_contacts)
-        if streak >= min_frames:
-            stable.append(candidate)
-            continue
-        unstable.append(
-            {
-                "contact": contact,
-                "streak": streak,
-                "required": min_frames,
-                "red": int(candidate.get("redPixelCount", 0) or 0),
-                "digit": int(candidate.get("digitPixelCount", 0) or 0),
-            }
-        )
-    return stable, unstable
-
-
-def choose_whitelist_candidates(probe_result: dict[str, Any], allowed_contacts: list[str]) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for chat in probe_result.get("visibleChats", []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        matched_contact = _match_allowed_contact(str(chat.get("name", "")), allowed_contacts)
-        if matched_contact:
-            candidate = copy.deepcopy(chat)
-            candidate["matchedContact"] = matched_contact
-            candidates.append(candidate)
-    return candidates
-
-
-def choose_non_whitelist_unread(probe_result: dict[str, Any], allowed_contacts: list[str]) -> list[dict[str, Any]]:
-    unread: list[dict[str, Any]] = []
-    for chat in probe_result.get("visibleChats", []):
-        if not _has_row_numeric_unread_badge(chat):
-            continue
-        if _match_allowed_contact(str(chat.get("name", "")), allowed_contacts):
-            continue
-        unread.append(copy.deepcopy(chat))
-    return unread
-
-
-def choose_active_whitelist_candidate(probe_result: dict[str, Any], allowed_contacts: list[str]) -> dict[str, Any]:
-    active_chat = str(probe_result.get("activeChat") or "").strip()
-    if not active_chat:
-        return {}
-    matched_contact = _match_allowed_contact(active_chat, allowed_contacts)
-    if not matched_contact:
-        return {}
-    visible = find_visible_chat(probe_result, matched_contact)
-    if not visible:
-        return {}
-    visible_chats = list(probe_result.get("visibleChats", []) or [])
-    if visible_chats:
-        top_min = min(float(chat.get("ocrTop", 1.0) or 1.0) for chat in visible_chats)
-        active_top = float(visible.get("ocrTop", 1.0) or 1.0)
-        # Only rescue the active chat when it is effectively the top row that just
-        # bubbled up. This keeps the fix scoped to "WeChat auto-selected the unread
-        # chat and cleared its badge on open" instead of reviving broad fallbacks.
-        if active_top > top_min + 0.08:
-            return {}
-    panel = probe_result.get("chatPanel", {}) or {}
-    if not latest_panel_bubble_is_inbound_gray(panel):
-        return {}
-    inbound_text = choose_inbound_text(panel, str(visible.get("preview") or ""))
-    if not inbound_text:
-        return {}
-    latest_outbound = latest_committed_outbound(panel)
-    if _text_matches_outbound(inbound_text, latest_outbound):
-        return {}
-    return {
-        "name": active_chat,
-        "matchedContact": matched_contact,
-        "preview": str(visible.get("preview") or ""),
-        "time": str(visible.get("time") or ""),
-        "source": "active_chat_fallback",
-    }
-
-
 def panel_has_claim_signal(panel: dict[str, Any]) -> bool:
     payload = panel if isinstance(panel, dict) else {}
     return bool(
@@ -1331,26 +1113,58 @@ def find_visible_chat(probe_result: dict[str, Any], contact: str) -> dict[str, A
     return {}
 
 
-def get_pending_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
-    queue = state.get("pending_queue")
-    if isinstance(queue, list):
-        return queue
-    pending = state.get("pending")
-    queue = [pending] if pending else []
-    state["pending_queue"] = queue
-    state["pending"] = queue[0] if queue else None
-    return queue
+def claim_selection_panel_evidence(
+    selected: dict[str, Any],
+    candidate: dict[str, Any],
+    contact: str,
+) -> dict[str, Any]:
+    if selected.get("status") != "ok":
+        return {}
+    if bool(selected.get("selectionConfirmed")):
+        return {"mode": "title", "inbound_text": ""}
+    if not wechat_ui.names_match(str(selected.get("selectedChat") or ""), contact):
+        return {}
+    if not wechat_ui.names_match(str(selected.get("selectedChatRequested") or ""), contact):
+        return {}
+    if not (_has_row_numeric_unread_badge(candidate) or bool(candidate.get("hadNumericUnreadBadge"))):
+        return {}
+    live_visible = find_visible_chat(selected, contact)
+    if not live_visible:
+        return {}
+    preview_text = str(candidate.get("preview") or "").strip()
+    live_preview = str(live_visible.get("preview") or "").strip()
+    if not preview_reliable_for_fallback(preview_text):
+        return {}
+    if live_preview and not preview_panel_equivalent(preview_text, live_preview):
+        return {}
+    panel = selected.get("chatPanel", {}) or {}
+    if not latest_panel_bubble_is_inbound_gray(panel):
+        return {}
+    inbound_text = choose_inbound_text(panel, preview_text)
+    if not inbound_text or not preview_panel_equivalent(preview_text, inbound_text):
+        return {}
+    return {
+        "mode": "panel_preview_match",
+        "inbound_text": inbound_text,
+        "active_chat": str(selected.get("activeChat") or ""),
+    }
 
 
-def sync_pending_state(state: dict[str, Any], queue: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    current = queue if queue is not None else get_pending_queue(state)
-    state["pending_queue"] = current
-    state["pending"] = current[0] if current else None
-    return current
-
-
-def queued_contacts(queue: list[dict[str, Any]]) -> list[str]:
-    return [str(item.get("contact", "")).strip() for item in queue if item.get("contact")]
+def pending_selection_panel_evidence(
+    selected: dict[str, Any],
+    contact: str,
+) -> dict[str, Any]:
+    """Confirm a send-time selection when only the title OCR is unreliable."""
+    if selected.get("status") == "ok" and bool(selected.get("selectionConfirmed")):
+        return {"mode": "title", "inbound_text": ""}
+    live_visible = find_visible_chat(selected, contact)
+    if not live_visible:
+        return {}
+    candidate = copy.deepcopy(live_visible)
+    candidate["matchedContact"] = contact
+    # Pending entries can only exist after a badge-backed claim was accepted.
+    candidate["hadNumericUnreadBadge"] = True
+    return claim_selection_panel_evidence(selected, candidate, contact)
 
 
 def latest_committed_outbound(panel: dict[str, Any], max_top: float = 0.90) -> str:
@@ -1370,6 +1184,27 @@ def latest_committed_outbound_item(panel: dict[str, Any], max_top: float = 0.90)
     if not committed:
         return {}
     return committed[-1]
+
+
+def find_matching_outbound_draft(panel: dict[str, Any], draft_text: str, max_top: float = 0.90) -> dict[str, Any]:
+    outbound_items = list(panel.get("outbound") or [])
+    for item in reversed(_meaningful_outbound_items(panel)):
+        if float(item.get("top", 0.0) or 0.0) > max_top:
+            continue
+        text = str(item.get("text") or "").strip()
+        match_mode = _draft_match_mode(draft_text, text)
+        if not match_mode:
+            continue
+        matched = copy.deepcopy(item)
+        matched["match_mode"] = match_mode
+        return matched
+    if outbound_items:
+        return {}
+    latest = str(panel.get("latestOutbound") or "").strip()
+    match_mode = _draft_match_mode(draft_text, latest)
+    if match_mode:
+        return {"text": latest, "match_mode": match_mode}
+    return {}
 
 
 def latest_meaningful_inbound_top(panel: dict[str, Any]) -> float | None:
@@ -1469,52 +1304,6 @@ def panel_tail_confidence(panel: dict[str, Any], *, max_items_per_side: int = 2)
     if not values:
         return None
     return min(values)
-
-
-def find_queue_index_for_contact(queue: list[dict[str, Any]], contact: str) -> int:
-    for index, item in enumerate(queue):
-        if wechat_ui.names_match(str(item.get("contact", "")).strip(), contact):
-            return index
-    return -1
-
-
-def remove_pending_by_fingerprint(queue: list[dict[str, Any]], pending: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in queue
-        if item.get("inbound_fingerprint") != pending.get("inbound_fingerprint")
-    ]
-
-
-def _pending_anchor_ts(item: dict[str, Any]) -> float:
-    due_at = float(item.get("due_at", 0.0) or 0.0)
-    created_at = float(item.get("created_at", 0.0) or 0.0)
-    if due_at > 0:
-        return due_at
-    return created_at
-
-
-def prune_stale_pending(
-    queue: list[dict[str, Any]],
-    *,
-    now: float,
-    ttl_seconds: float,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if ttl_seconds <= 0:
-        return list(queue), []
-    kept: list[dict[str, Any]] = []
-    removed: list[dict[str, Any]] = []
-    for item in queue:
-        anchor = _pending_anchor_ts(item)
-        if anchor <= 0:
-            kept.append(item)
-            continue
-        age = now - anchor
-        if age > ttl_seconds:
-            removed.append(item)
-            continue
-        kept.append(item)
-    return kept, removed
 
 
 class AutoReplyRunner:
@@ -1635,6 +1424,35 @@ class AutoReplyRunner:
             grace_seconds = max(grace_seconds, sleep_after_click + 1.0)
         return self._run_internal_ui_action(self.ui.probe, *args, grace_seconds=grace_seconds, **kwargs)
 
+    def _probe_roster_background_ui(self) -> dict[str, Any]:
+        probe = getattr(self.ui, "probe_roster_background", None)
+        if not callable(probe):
+            raise RuntimeError("background roster probe unavailable")
+        return dict(probe() or {})
+
+    def _mark_wechat_login_required(
+        self,
+        state: dict[str, Any],
+        *,
+        source: str,
+        screenshot: str = "",
+    ) -> None:
+        now = float(self.now())
+        state["wechat_login_required"] = True
+        state["last_error"] = "wechat_login_required"
+        last_event_at = float(state.get("last_wechat_login_required_event_at", 0.0) or 0.0)
+        if now - last_event_at >= 300.0:
+            state["last_wechat_login_required_event_at"] = now
+            self.append_event(
+                "wechat_login_required",
+                source=source,
+                screenshot=screenshot,
+            )
+
+    @staticmethod
+    def _mark_wechat_available(state: dict[str, Any]) -> None:
+        state["wechat_login_required"] = False
+
     def _focus_input_box_ui(self, selected: dict[str, Any]) -> None:
         self._run_internal_ui_action(self.ui.focus_input_box, selected, grace_seconds=1.0)
 
@@ -1659,6 +1477,47 @@ class AutoReplyRunner:
 
     def _restore_frontmost_app_ui(self, app_name: str) -> None:
         self._run_internal_ui_action(self.ui.restore_frontmost_app, app_name, grace_seconds=0.75)
+
+    def _open_wechat_foreground(self, *, reason: str, **event_payload: Any) -> str:
+        restore_app = ""
+        if hasattr(self.ui, "capture_frontmost_app"):
+            try:
+                restore_app = str(self.ui.capture_frontmost_app() or "")
+            except Exception:
+                restore_app = ""
+        self.append_event(
+            "wechat_window_action",
+            action="open",
+            reason=reason,
+            **event_payload,
+        )
+        self._activate_wechat_ui()
+        return restore_app
+
+    def _close_wechat_foreground(
+        self,
+        *,
+        reason: str,
+        restore_app: str,
+        **event_payload: Any,
+    ) -> None:
+        self.append_event(
+            "wechat_window_action",
+            action="hide",
+            reason=reason,
+            **event_payload,
+        )
+        self._hide_wechat_ui()
+        if restore_app and hasattr(self.ui, "restore_frontmost_app"):
+            try:
+                self._restore_frontmost_app_ui(restore_app)
+            except Exception as exc:
+                self.append_event(
+                    "restore_frontmost_failed",
+                    context=reason,
+                    error=str(exc),
+                    app=restore_app,
+                )
 
     def _claim_abort_user_active(
         self,
@@ -1713,6 +1572,8 @@ class AutoReplyRunner:
         state = self.load_state()
         state["last_run_at"] = utc_now_iso()
         now = float(self.now())
+        recent_outbound_ttl = _recent_auto_outbound_ttl(config)
+        _prune_recent_auto_outbounds(state, now=now, ttl_seconds=recent_outbound_ttl)
         result: dict[str, Any]
 
         try:
@@ -1749,14 +1610,13 @@ class AutoReplyRunner:
                 if has_unread:
                     state["pending_menu_clear_streak"] = 0
                 else:
-                    if not has_pending_snapshot:
+                    # Menu/Dock OCR can briefly read clear between identical unread
+                    # samples. Require two consecutive clear samples before treating
+                    # the same count as claimable again.
+                    streak = int(state.get("pending_menu_clear_streak", 0) or 0) + 1
+                    state["pending_menu_clear_streak"] = streak
+                    if streak >= 2:
                         state["last_claim_menu_signal"] = ""
-                        state["pending_menu_clear_streak"] = 0
-                    else:
-                        streak = int(state.get("pending_menu_clear_streak", 0) or 0) + 1
-                        state["pending_menu_clear_streak"] = streak
-                        if streak >= 2:
-                            state["last_claim_menu_signal"] = ""
                 self.append_event("menu_bar_checked", unread=has_unread, signal=menu_signal, source=source)
 
             menu_checked_now = False
@@ -1770,13 +1630,17 @@ class AutoReplyRunner:
                 _record_menu_signal(self._menu_unread_signal(), source="interval")
                 menu_checked_now = True
 
-            cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 3600))
+            cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 43200))
             if now - float(state.get("last_capture_cleanup_at", 0.0) or 0.0) >= cleanup_interval:
-                cleanup = cleanup_runtime_artifacts_older_than(
-                    older_than_seconds=float(config.get("capture_retention_days", 2)) * 24 * 60 * 60,
-                    now=now,
-                )
                 state["last_capture_cleanup_at"] = now
+                try:
+                    cleanup = cleanup_runtime_artifacts_older_than(
+                        older_than_seconds=float(config.get("capture_retention_days", 1)) * 24 * 60 * 60,
+                        now=now,
+                    )
+                except Exception as exc:
+                    self.append_event("runtime_cleanup_failed", error=str(exc))
+                    cleanup = {}
                 if int(cleanup.get("deleted_count", 0) or 0) > 0:
                     self.append_event(
                         "runtime_cleanup",
@@ -1803,27 +1667,108 @@ class AutoReplyRunner:
                     queue_contacts=queued_contacts(queue),
                 )
             had_queue = bool(queue)
+            next_pending = select_next_pending(queue)
             # If a pending send is already due, do one immediate signal check first.
             # This makes "new unread while pending" go through claim flow before send-time recheck.
             if (
-                queue
+                next_pending is not None
                 and idle_seconds >= idle_threshold
-                and now >= float(queue[0].get("due_at", 0.0) or 0.0)
+                and now >= float(next_pending.get("due_at", 0.0) or 0.0)
                 and not menu_checked_now
             ):
                 _record_menu_signal(self._menu_unread_signal(), source="due_precheck")
                 menu_checked_now = True
             current_menu_signal = str(state.get("last_menu_signal") or "")
             actionable_menu_signal = is_actionable_menu_signal(current_menu_signal)
-            should_sweep = (
-                idle_seconds >= idle_threshold
-                and (
-                    (actionable_menu_signal and menu_checked_now)
-                    or bool(state.get("claim_retry_pending", False))
-                )
+            previous_claim_signal = str(state.get("last_claim_menu_signal") or "")
+            menu_signal_rising_now = menu_signal_rising(current_menu_signal, previous_claim_signal)
+            roster_sweep_interval = float(config.get("roster_sweep_interval_seconds", 60) or 60)
+            roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= roster_sweep_interval
+            passive_sweep_due = bool(config.get("passive_roster_sweep_enabled", False)) and roster_sweep_due
+            passive_claim_ready = False
+            if (
+                passive_sweep_due
+                and not actionable_menu_signal
+                and not bool(state.get("claim_retry_pending", False))
+            ):
+                try:
+                    background_probe = self._probe_roster_background_ui()
+                    if str(background_probe.get("status") or "") == "login_required":
+                        self._mark_wechat_login_required(
+                            state,
+                            source="passive_roster_preflight",
+                            screenshot=str(background_probe.get("screenshot") or ""),
+                        )
+                    elif str(background_probe.get("status") or "") == "ok":
+                        self._mark_wechat_available(state)
+                        state["wechat_window_unavailable"] = False
+                    visible_chats = list(background_probe.get("visibleChats", []) or [])
+                    allowed_contacts = list(config.get("allowed_contacts", []))
+                    preflight = evaluate_passive_preflight(visible_chats, allowed_contacts)
+                    state["last_roster_sweep_at"] = now
+                    def queued_badge_is_same_message(row: dict[str, Any]) -> bool:
+                        chat = find_visible_chat(background_probe, str(row.get("name") or ""))
+                        preview = str(chat.get("preview") or "") if chat else ""
+                        row_time = str(chat.get("time") or "") if chat else ""
+                        for pending_item in queue:
+                            if not wechat_ui.names_match(
+                                str(row.get("name") or ""), str(pending_item.get("contact") or "")
+                            ):
+                                continue
+                            pending_time = str(pending_item.get("message_time") or "")
+                            if row_time and pending_time and row_time != pending_time:
+                                continue
+                            if preview_panel_equivalent(preview, str(pending_item.get("inbound_text") or "")):
+                                return True
+                        return False
+
+                    actionable_badge_rows = [
+                        row
+                        for row in preflight.badge_rows
+                        if not queued_badge_is_same_message(row)
+                    ]
+                    ignored_queued_badge_rows = [
+                        row for row in preflight.badge_rows if row not in actionable_badge_rows
+                    ]
+                    passive_claim_ready = bool(actionable_badge_rows)
+                    self.append_event(
+                        "passive_roster_preflight",
+                        badge_detected=preflight.badge_detected,
+                        badge_rows=list(preflight.badge_rows),
+                        actionable_badge_rows=actionable_badge_rows,
+                        ignored_queued_badge_rows=ignored_queued_badge_rows,
+                        visible_chat_count=preflight.visible_chat_count,
+                        screenshot=str(background_probe.get("screenshot") or ""),
+                    )
+                except Exception as exc:
+                    # A failed background probe should not run again every tick.
+                    state["last_roster_sweep_at"] = now
+                    error = str(exc)
+                    if "APP_NOT_FOUND" in error or "no roster window found" in error:
+                        state["wechat_window_unavailable"] = True
+                    self.append_event(
+                        "passive_roster_preflight_failed",
+                        error=error,
+                        fallback="foreground_claim_scan",
+                    )
+            claim_decision = decide_claim(
+                idle_seconds=idle_seconds,
+                idle_threshold=idle_threshold,
+                has_queue=bool(queue),
+                pending_due=bool(
+                    next_pending is not None
+                    and now >= float(next_pending.get("due_at", 0.0) or 0.0)
+                ),
+                sweep_while_pending=bool(config.get("sweep_while_pending", False)),
+                actionable_menu_signal=actionable_menu_signal,
+                menu_checked_now=menu_checked_now,
+                menu_signal_rising_now=menu_signal_rising_now,
+                roster_sweep_due=roster_sweep_due,
+                claim_retry_pending=bool(state.get("claim_retry_pending", False)),
+                passive_claim_ready=passive_claim_ready,
             )
             claim_result: dict[str, Any] | None = None
-            if should_sweep:
+            if claim_decision.should_claim:
                 state["idle_probe_armed"] = False
                 state["last_claim_menu_signal"] = current_menu_signal
                 claim_result = self._handle_claim(
@@ -1831,13 +1776,15 @@ class AutoReplyRunner:
                     state,
                     idle_seconds,
                     now,
+                    claim_trigger=claim_decision.trigger,
                 )
                 queue = sync_pending_state(state)
+                next_pending = select_next_pending(queue)
 
-            if claim_result and claim_result.get("status") in {"draft_saved", "drafts_saved"}:
+            if claim_result and claim_result.get("status") in {"draft_saved", "drafts_saved"} and not had_queue:
                 result = claim_result
-            elif queue:
-                result = self._handle_pending(config, state, queue[0], idle_seconds, now)
+            elif next_pending is not None:
+                result = self._handle_pending(config, state, next_pending, idle_seconds, now)
             elif claim_result is not None:
                 result = claim_result
             else:
@@ -1846,7 +1793,9 @@ class AutoReplyRunner:
                     "idle_seconds": round(idle_seconds, 2),
                     "menu_unread": bool(state.get("last_menu_unread")),
                 }
-            state["last_error"] = ""
+            state["last_error"] = (
+                "wechat_login_required" if bool(state.get("wechat_login_required")) else ""
+            )
             return result
         except Exception as exc:
             state["last_error"] = str(exc)
@@ -1880,12 +1829,111 @@ class AutoReplyRunner:
             request_timeout_seconds=float(config.get("erge_request_timeout_seconds", 120)),
         )
 
+    def _generate_guarded_reply(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+        client: Any,
+        contact: str,
+        inbound_text: str,
+        *,
+        now: float,
+        conversation_context: list[dict[str, str]] | None,
+        contact_memory: dict[str, Any] | None,
+        screenshot_path: str | None,
+        quoted_message: dict[str, Any] | None,
+    ) -> str:
+        ttl_seconds = _recent_auto_outbound_ttl(config)
+        avoid_replies = _recent_auto_outbound_texts(
+            state,
+            contact,
+            now=now,
+            ttl_seconds=ttl_seconds,
+            limit=3,
+        )
+
+        def generate(blocked_replies: list[str], *, focused: bool = False) -> str:
+            kwargs = {
+                "conversation_context": [] if focused else conversation_context,
+                "contact_memory": None if focused else contact_memory,
+                "screenshot_path": (
+                    screenshot_path
+                    if not focused or inbound_text.lstrip().startswith(("[", "［"))
+                    else None
+                ),
+                "quoted_message": quoted_message,
+            }
+            try:
+                return client.generate_reply(
+                    contact,
+                    inbound_text,
+                    avoid_replies=blocked_replies,
+                    **kwargs,
+                )
+            except TypeError as exc:
+                if "avoid_replies" not in str(exc):
+                    raise
+                return client.generate_reply(contact, inbound_text, **kwargs)
+
+        draft_text = generate(avoid_replies)
+        duplicate = _match_recent_auto_outbound(
+            state,
+            contact,
+            draft_text,
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+        if not duplicate:
+            return draft_text
+
+        reference = str(duplicate.get("reference_text") or "").strip()
+        self.append_event(
+            "duplicate_draft_detected",
+            contact=contact,
+            inbound_text=inbound_text,
+            draft_text=draft_text,
+            reference_text=reference,
+            match_mode=str(duplicate.get("match_mode") or ""),
+        )
+        retry_avoid = list(avoid_replies)
+        if reference and reference not in retry_avoid:
+            retry_avoid.append(reference)
+        retry_text = generate(retry_avoid, focused=True)
+        retry_duplicate = _match_recent_auto_outbound(
+            state,
+            contact,
+            retry_text,
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+        if retry_duplicate:
+            self.append_event(
+                "duplicate_draft_blocked",
+                contact=contact,
+                inbound_text=inbound_text,
+                draft_text=retry_text,
+                reference_text=str(retry_duplicate.get("reference_text") or ""),
+                match_mode=str(retry_duplicate.get("match_mode") or ""),
+            )
+            return ""
+
+        self.append_event(
+            "duplicate_draft_regenerated",
+            contact=contact,
+            inbound_text=inbound_text,
+            previous_draft=draft_text,
+            draft_text=retry_text,
+        )
+        return retry_text
+
     def _handle_claim(
         self,
         config: dict[str, Any],
         state: dict[str, Any],
         idle_seconds: float,
         now: float,
+        *,
+        claim_trigger: str = "menu_signal",
     ) -> dict[str, Any]:
         idle_threshold = float(config.get("idle_threshold_seconds", 30))
         live_idle_seconds = self._live_idle_seconds()
@@ -1895,31 +1943,47 @@ class AutoReplyRunner:
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:
             return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="pre_open_recheck")
-        restore_app = ""
-        if hasattr(self.ui, "capture_frontmost_app"):
-            try:
-                restore_app = str(self.ui.capture_frontmost_app() or "")
-            except Exception:
-                restore_app = ""
         state["last_roster_sweep_at"] = now
-        self.append_event(
-            "wechat_window_action",
-            action="open",
+        restore_app = self._open_wechat_foreground(
             reason="claim_scan",
+            trigger=claim_trigger,
             queue_contacts=queued_contacts(sync_pending_state(state)),
         )
-        self._activate_wechat_ui()
         try:
             if self._live_idle_seconds() < idle_threshold:
                 return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="after_open")
-            state["claim_retry_pending"] = False
             allowed_contacts = list(config.get("allowed_contacts", []))
+            retry_ttl_seconds = max(30.0, float(config.get("claim_selection_retry_ttl_seconds", 300) or 300))
+            stored_retry = state.get("claim_retry_candidate")
+            stored_retry = copy.deepcopy(stored_retry) if isinstance(stored_retry, dict) else {}
+            retry_age_seconds = max(0.0, now - float(stored_retry.get("seen_at", 0.0) or 0.0)) if stored_retry else 0.0
+            if stored_retry and retry_age_seconds > retry_ttl_seconds:
+                self.append_event(
+                    "claim_selection_retry_expired",
+                    contact=str(stored_retry.get("contact") or ""),
+                    age_seconds=round(retry_age_seconds, 2),
+                    ttl_seconds=retry_ttl_seconds,
+                )
+                stored_retry = {}
+            # A stored candidate is consumed by this claim pass. A new failure may
+            # persist it again below, but it cannot create an unbounded open loop.
+            state["claim_retry_candidate"] = None
+            state["claim_retry_pending"] = False
             badge_min_frames = max(1, int(config.get("badge_stability_frames", 2) or 2))
             non_whitelist_badge_min_frames = max(
                 1, int(config.get("non_whitelist_badge_stability_frames", 1) or 1)
             )
             queue = sync_pending_state(state)
             probe_result = self._probe_ui()
+            if str(probe_result.get("status") or "") == "login_required":
+                self._mark_wechat_login_required(
+                    state,
+                    source="claim_scan",
+                    screenshot=str(probe_result.get("screenshot") or ""),
+                )
+                return {"status": "login_required"}
+            if str(probe_result.get("status") or "") == "ok":
+                self._mark_wechat_available(state)
             _update_badge_streaks(state, probe_result, allowed_contacts)
 
             def _clear_non_whitelist_unread(snapshot: dict[str, Any]) -> list[str]:
@@ -2076,37 +2140,71 @@ class AutoReplyRunner:
                 contacts=[chat.get("name", "") for chat in candidates],
                 visible_unread_rows=unread_rows,
                 row_snapshot=row_snapshot,
+                trigger=claim_trigger,
                 queue_contacts=queued_contacts(queue),
             )
             if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
-                active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
-                if active_fallback:
-                    candidates = [active_fallback]
+                preview_fallback = choose_whitelist_preview_fallback_candidate(
+                    probe_result,
+                    allowed_contacts,
+                    queue=queue,
+                    last_seen_inbound=dict(state.get("last_seen_inbound") or {}),
+                )
+                if preview_fallback:
+                    candidates = [preview_fallback]
                     self.append_event(
-                        "claim_active_fallback_candidate",
-                        contact=candidate_contact_name(active_fallback),
-                        source=str(active_fallback.get("source") or "active_chat_fallback"),
-                        preview_text=str(active_fallback.get("preview") or ""),
+                        "claim_preview_fallback_candidate",
+                        contact=candidate_contact_name(preview_fallback),
+                        preview_text=str(preview_fallback.get("preview") or ""),
                         queue_contacts=queued_contacts(queue),
                     )
-            elif not candidates and bool(state.get("claim_retry_pending", False)):
-                active_fallback = choose_active_whitelist_candidate(probe_result, allowed_contacts)
-                if active_fallback:
-                    candidates = [active_fallback]
+            if not candidates and stored_retry:
+                retry_contact = str(stored_retry.get("contact") or "").strip()
+                retry_preview = str(stored_retry.get("preview") or "").strip()
+                retry_visible = find_visible_chat(probe_result, retry_contact)
+                visible_preview = str(retry_visible.get("preview") or "").strip() if retry_visible else ""
+                retry_matches_visible = bool(
+                    retry_visible
+                    and retry_contact
+                    and retry_preview
+                    and preview_panel_equivalent(retry_preview, visible_preview)
+                )
+                if retry_matches_visible:
+                    retry_candidate = copy.deepcopy(retry_visible)
+                    retry_candidate["matchedContact"] = retry_contact
+                    retry_candidate["preview"] = retry_preview
+                    retry_candidate["time"] = str(stored_retry.get("time") or retry_visible.get("time") or "")
+                    retry_candidate["source"] = "claim_selection_retry"
+                    retry_candidate["hadNumericUnreadBadge"] = True
+                    retry_candidate["retryAttempts"] = int(stored_retry.get("attempts", 1) or 1)
+                    candidates = [retry_candidate]
                     self.append_event(
-                        "claim_active_fallback_candidate",
-                        contact=candidate_contact_name(active_fallback),
-                        source=str(active_fallback.get("source") or "active_chat_fallback"),
-                        preview_text=str(active_fallback.get("preview") or ""),
+                        "claim_selection_retry_candidate",
+                        contact=retry_contact,
+                        preview_text=retry_preview,
+                        attempts=int(stored_retry.get("attempts", 1) or 1),
+                        age_seconds=round(retry_age_seconds, 2),
+                        queue_contacts=queued_contacts(queue),
+                    )
+                else:
+                    self.append_event(
+                        "claim_selection_retry_discarded",
+                        contact=retry_contact,
+                        reason="row_missing_or_preview_changed",
+                        stored_preview=retry_preview,
+                        visible_preview=visible_preview,
                         queue_contacts=queued_contacts(queue),
                     )
             if not candidates:
                 state["claim_retry_pending"] = False
-                non_whitelist_cleared = bool(_clear_non_whitelist_unread(probe_result))
+                non_whitelist_cleared = bool(
+                    claim_trigger != "passive_roster_sweep" and _clear_non_whitelist_unread(probe_result)
+                )
                 self.append_event(
                     "claim_opened_no_new_message",
                     reason="no_visible_whitelist_unread",
                     signal=str(state.get("last_menu_signal") or ""),
+                    trigger=claim_trigger,
                     non_whitelist_cleared=non_whitelist_cleared,
                     visible_chat_count=len(visible_chats),
                     visible_unread_rows=unread_rows,
@@ -2131,6 +2229,7 @@ class AutoReplyRunner:
             abort_result: dict[str, Any] | None = None
             queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
             llm = self._build_llm(config)
+            recent_outbound_ttl = _recent_auto_outbound_ttl(config)
 
             def process_candidates(snapshot_candidates: list[dict[str, Any]]) -> None:
                 nonlocal queue
@@ -2152,16 +2251,125 @@ class AutoReplyRunner:
                     contact = candidate_contact_name(candidate)
                     existing_index = find_queue_index_for_contact(queue, contact)
                     selected = self._probe_ui(select_chat=contact, select_chat_click=candidate.get("click"))
-                    if selected.get("status") != "ok" or not selected.get("selectionConfirmed"):
-                        self.append_event("claim_skipped", reason="selection_not_confirmed", contact=contact)
+                    selection_evidence = claim_selection_panel_evidence(selected, candidate, contact)
+                    if not selection_evidence:
+                        if self._live_idle_seconds() < idle_threshold:
+                            abort_result = self._claim_abort_user_active(
+                                state,
+                                idle_threshold=idle_threshold,
+                                phase="claim_selection_retry",
+                            )
+                            return
+                        self.append_event(
+                            "claim_selection_reselect",
+                            contact=contact,
+                            active_chat=str(selected.get("activeChat") or ""),
+                            selected_chat=str(selected.get("selectedChat") or ""),
+                        )
+                        selected_retry = self._probe_ui(
+                            select_chat=contact,
+                            sleep_after_click=0.45,
+                            select_chat_click=candidate.get("click"),
+                        )
+                        retry_evidence = claim_selection_panel_evidence(selected_retry, candidate, contact)
+                        if retry_evidence:
+                            selected = selected_retry
+                            selection_evidence = retry_evidence
+                            self.append_event(
+                                "claim_selection_recovered",
+                                contact=contact,
+                                mode=str(retry_evidence.get("mode") or ""),
+                                active_chat=str(selected_retry.get("activeChat") or ""),
+                            )
+                    if not selection_evidence:
+                        previous_attempts = 0
+                        if stored_retry and wechat_ui.names_match(str(stored_retry.get("contact") or ""), contact):
+                            previous_attempts = int(stored_retry.get("attempts", 0) or 0)
+                        retry_attempts = previous_attempts + 1
+                        max_retry_attempts = max(
+                            1,
+                            int(config.get("claim_selection_retry_max_attempts", 2) or 2),
+                        )
+                        candidate_had_badge = bool(
+                            _has_row_numeric_unread_badge(candidate) or candidate.get("hadNumericUnreadBadge")
+                        )
+                        if candidate_had_badge and retry_attempts < max_retry_attempts:
+                            state["claim_retry_candidate"] = {
+                                "contact": contact,
+                                "preview": str(candidate.get("preview") or "").strip(),
+                                "time": str(candidate.get("time") or "").strip(),
+                                "seen_at": float(stored_retry.get("seen_at", now) or now) if stored_retry else now,
+                                "attempts": retry_attempts,
+                            }
+                            state["claim_retry_pending"] = True
+                        else:
+                            state["claim_retry_candidate"] = None
+                            state["claim_retry_pending"] = False
+                        self.append_event(
+                            "claim_skipped",
+                            reason="selection_not_confirmed",
+                            contact=contact,
+                            active_chat=str(selected.get("activeChat") or ""),
+                            selected_chat=str(selected.get("selectedChat") or ""),
+                            retry_attempts=retry_attempts,
+                            retry_persisted=bool(state.get("claim_retry_candidate")),
+                        )
                         continue
+                    if not bool(selected.get("selectionConfirmed")):
+                        self.append_event(
+                            "claim_selection_confirmed_by_panel_evidence",
+                            contact=contact,
+                            mode=str(selection_evidence.get("mode") or ""),
+                            active_chat=str(selected.get("activeChat") or ""),
+                            inbound_text=str(selection_evidence.get("inbound_text") or ""),
+                        )
+
+                    live_visible = find_visible_chat(selected, contact)
+                    if live_visible:
+                        if not str(candidate.get("preview") or "").strip():
+                            candidate["preview"] = str(live_visible.get("preview") or "")
+                        if not str(candidate.get("time") or "").strip():
+                            candidate["time"] = str(live_visible.get("time") or "")
+                        if bool(live_visible.get("unread")):
+                            candidate["unread"] = True
+                        for badge_key in ("redPixelCount", "digitPixelCount", "numericBadge", "click"):
+                            if badge_key in live_visible and not candidate.get(badge_key):
+                                candidate[badge_key] = live_visible.get(badge_key)
 
                     panel = selected.get("chatPanel", {}) or {}
                     preview_text = str(candidate.get("preview") or "")
-                    candidate_source = str(candidate.get("source") or "")
-                    allow_preview_fallback = candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
                     outbound_snapshot = latest_committed_outbound(panel)
-                    if _text_matches_outbound(preview_text, outbound_snapshot):
+                    badge_panel_confirms_inbound = bool(
+                        _has_row_numeric_unread_badge(candidate)
+                        and latest_panel_bubble_is_inbound_gray(panel)
+                    )
+                    preview_recent_match = _match_recent_auto_outbound(
+                        state,
+                        contact,
+                        preview_text,
+                        now=now,
+                        ttl_seconds=recent_outbound_ttl,
+                    )
+                    preview_matches_outbound = _text_matches_outbound(preview_text, outbound_snapshot)
+                    if badge_panel_confirms_inbound and (preview_recent_match or preview_matches_outbound):
+                        self.append_event(
+                            "claim_self_match_overridden_by_inbound_badge",
+                            contact=contact,
+                            preview_text=preview_text,
+                            panel_outbound=outbound_snapshot,
+                            recent_auto_match=bool(preview_recent_match),
+                        )
+                    if preview_recent_match and not badge_panel_confirms_inbound:
+                        self.append_event(
+                            "claim_skipped_recent_self_preview",
+                            contact=contact,
+                            preview_text=preview_text,
+                            match_mode=str(preview_recent_match.get("match_mode") or ""),
+                            source=str(preview_recent_match.get("source") or ""),
+                            age_seconds=preview_recent_match.get("age_seconds"),
+                        )
+                        continue
+                    if preview_matches_outbound and not badge_panel_confirms_inbound:
                         if existing_index >= 0:
                             pending_existing = queue[existing_index]
                             self._cancel_pending(
@@ -2234,17 +2442,11 @@ class AutoReplyRunner:
                     if not inbound_text:
                         inbound_payload = extract_inbound_payload(
                             panel,
-                            str(candidate.get("preview") or "") if allow_preview_fallback else "",
+                            str(candidate.get("preview") or ""),
                         )
                         inbound_text = str(inbound_payload.get("text") or "").strip()
                     empty_inbound_debug: dict[str, Any] = {}
                     if not inbound_text:
-                        if candidate_source == "active_chat_fallback" and not panel_has_claim_signal(panel):
-                            self.append_event(
-                                "claim_active_fallback_empty_panel",
-                                contact=contact,
-                                preview_text=preview_text,
-                            )
                         # One more hard reselect before giving up; some chat windows
                         # render late and first OCR pass comes back empty.
                         selected_retry = self._probe_ui(
@@ -2257,12 +2459,9 @@ class AutoReplyRunner:
                             panel = selected.get("chatPanel", {}) or {}
                             outbound_snapshot = latest_committed_outbound(panel)
                             live_visible = find_visible_chat(selected, contact)
-                            allow_retry_preview_fallback = (
-                                candidate_source != "active_chat_fallback" or panel_has_claim_signal(panel)
-                            )
                             inbound_payload = extract_inbound_payload(
                                 panel,
-                                str(live_visible.get("preview") or "") if allow_retry_preview_fallback else "",
+                                str(live_visible.get("preview") or ""),
                             )
                             inbound_text = str(inbound_payload.get("text") or "").strip()
                             self.append_event(
@@ -2310,6 +2509,24 @@ class AutoReplyRunner:
                         )
                         continue
                     preview_text = str(candidate.get("preview") or "").strip()
+                    inbound_recent_match = _match_recent_auto_outbound(
+                        state,
+                        contact,
+                        inbound_text,
+                        now=now,
+                        ttl_seconds=recent_outbound_ttl,
+                    )
+                    if inbound_recent_match and not badge_panel_confirms_inbound:
+                        self.append_event(
+                            "claim_skipped_recent_self_echo",
+                            contact=contact,
+                            inbound_text=inbound_text,
+                            preview_text=preview_text,
+                            match_mode=str(inbound_recent_match.get("match_mode") or ""),
+                            source=str(inbound_recent_match.get("source") or ""),
+                            age_seconds=inbound_recent_match.get("age_seconds"),
+                        )
+                        continue
                     if bool(candidate.get("unread")) and is_stale_system_inbound_text(inbound_text):
                         replacement_text = ""
                         if wechat_ui.is_nontext_message(preview_text):
@@ -2345,7 +2562,11 @@ class AutoReplyRunner:
                             panel_inbound=inbound_text,
                         )
                         inbound_text = preview_text
-                    if outbound_snapshot and normalize_text(inbound_text) == normalize_text(outbound_snapshot):
+                    if (
+                        outbound_snapshot
+                        and normalize_text(inbound_text) == normalize_text(outbound_snapshot)
+                        and not badge_panel_confirms_inbound
+                    ):
                         preview_fallback = preview_text
                         if (
                             wechat_ui.has_meaningful_text(preview_fallback)
@@ -2408,6 +2629,8 @@ class AutoReplyRunner:
                             inbound_payload=inbound_payload,
                         )
                         queue_fingerprints.discard(str(existing.get("inbound_fingerprint", "")))
+                        if updated is None:
+                            continue
                         queue_fingerprints.add(str(updated.get("inbound_fingerprint", "")))
                         refreshed.append(contact)
                         continue
@@ -2419,14 +2642,26 @@ class AutoReplyRunner:
                         continue
 
                     contact_memory = self._load_contact_memory(config, contact)
-                    draft_text = llm.generate_reply(
+                    draft_text = self._generate_guarded_reply(
+                        config,
+                        state,
+                        llm,
                         contact,
                         inbound_text,
+                        now=now,
                         conversation_context=context_messages,
                         contact_memory=contact_memory,
                         screenshot_path=_preferred_chat_screenshot(selected),
                         quoted_message=inbound_payload,
                     )
+                    if not draft_text:
+                        self.append_event(
+                            "draft_retry_scheduled",
+                            contact=contact,
+                            reason="duplicate_draft_blocked",
+                            inbound_text=inbound_text,
+                            retry_seconds=120,
+                        )
                     pending = {
                         "contact": contact,
                         "inbound_text": inbound_text,
@@ -2437,7 +2672,8 @@ class AutoReplyRunner:
                         "inbound_fingerprint": inbound_fingerprint,
                         "draft_text": draft_text,
                         "created_at": now,
-                        "due_at": now + float(config.get("send_delay_seconds", 300)),
+                        "due_at": now + (120 if not draft_text else float(config.get("send_delay_seconds", 300))),
+                        "draft_retry_count": 0,
                         "low_confidence_retries": 0,
                         "outbound_snapshot": outbound_snapshot,
                         "active_chat_title": selected.get("activeChat", ""),
@@ -2447,24 +2683,26 @@ class AutoReplyRunner:
                     queue_fingerprints.add(inbound_fingerprint)
                     state.setdefault("last_seen_inbound", {})[contact] = inbound_fingerprint
                     sync_pending_state(state, queue)
+                    self.save_state(state)
                     added.append(contact)
-                    self.append_event(
-                        "draft_saved_locally",
-                        contact=contact,
-                        inbound_text=inbound_text,
-                        draft_text=draft_text,
-                        due_at=pending["due_at"],
-                        idle_seconds=round(idle_seconds, 2),
-                        context_turns=len(context_messages),
-                        queue_length=len(queue),
-                        queue_contacts=queued_contacts(queue),
-                    )
+                    if draft_text:
+                        self.append_event(
+                            "draft_saved_locally",
+                            contact=contact,
+                            inbound_text=inbound_text,
+                            draft_text=draft_text,
+                            due_at=pending["due_at"],
+                            idle_seconds=round(idle_seconds, 2),
+                            context_turns=len(context_messages),
+                            queue_length=len(queue),
+                            queue_contacts=queued_contacts(queue),
+                        )
                     self._remember_contact_memory(
                         config,
                         contact,
                         context_messages=context_messages,
                         inbound_text=inbound_text,
-                        source="draft_saved",
+                        source="draft_saved" if draft_text else "draft_retry_scheduled",
                     )
 
             process_candidates(candidates)
@@ -2524,26 +2762,29 @@ class AutoReplyRunner:
                 if abort_result is not None:
                     return abort_result
 
-            try:
-                _clear_non_whitelist_unread(follow_up_probe)
-            except Exception as exc:
-                self.append_event("non_whitelist_clear_failed", error=str(exc), queue_contacts=queued_contacts(queue))
+            if claim_trigger != "passive_roster_sweep":
+                try:
+                    _clear_non_whitelist_unread(follow_up_probe)
+                except Exception as exc:
+                    self.append_event(
+                        "non_whitelist_clear_failed",
+                        error=str(exc),
+                        queue_contacts=queued_contacts(queue),
+                    )
 
             changed = added + refreshed
-            state["claim_retry_pending"] = False
+            state["claim_retry_pending"] = bool(state.get("claim_retry_candidate"))
             if not changed:
                 return {"status": "no_candidate"}
             if len(changed) == 1:
                 return {"status": "draft_saved", "contact": changed[0], "queue_length": len(queue)}
             return {"status": "drafts_saved", "contacts": changed, "queue_length": len(queue)}
         finally:
-            self.append_event("wechat_window_action", action="hide", reason="claim_scan")
-            self._hide_wechat_ui()
-            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
-                try:
-                    self._restore_frontmost_app_ui(restore_app)
-                except Exception as exc:
-                    self.append_event("restore_frontmost_failed", context="claim_scan", error=str(exc), app=restore_app)
+            self._close_wechat_foreground(
+                reason="claim_scan",
+                restore_app=restore_app,
+                trigger=claim_trigger,
+            )
 
     def _refresh_pending(
         self,
@@ -2563,7 +2804,7 @@ class AutoReplyRunner:
         refresh_delay_seconds: float | None = None,
         context_messages: list[dict[str, str]] | None = None,
         inbound_payload: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         existing = queue[pending_index]
         contact = str(existing.get("contact", "")).strip()
         client = llm or self._build_llm(config)
@@ -2576,18 +2817,24 @@ class AutoReplyRunner:
                 quoted_message=inbound_payload,
             )
         contact_memory = self._load_contact_memory(config, contact)
-        draft_text = client.generate_reply(
+        draft_text = self._generate_guarded_reply(
+            config,
+            state,
+            client,
             contact,
             inbound_text,
+            now=now,
             conversation_context=context_messages,
             contact_memory=contact_memory,
             screenshot_path=_preferred_chat_screenshot(selected),
             quoted_message=inbound_payload,
         )
         delay_seconds = float(
-            refresh_delay_seconds
-            if refresh_delay_seconds is not None
-            else config.get("send_delay_seconds", 300)
+            120 if not draft_text else (
+                refresh_delay_seconds
+                if refresh_delay_seconds is not None
+                else config.get("send_delay_seconds", 300)
+            )
         )
         updated = copy.deepcopy(existing)
         updated.update(
@@ -2599,6 +2846,7 @@ class AutoReplyRunner:
                 "message_time": message_time,
                 "inbound_fingerprint": fingerprint(contact, inbound_text, message_time),
                 "draft_text": draft_text,
+                "draft_retry_count": 0,
                 "created_at": now,
                 "due_at": now + delay_seconds,
                 "low_confidence_retries": 0,
@@ -2610,6 +2858,15 @@ class AutoReplyRunner:
         queue[pending_index] = updated
         sync_pending_state(state, queue)
         state.setdefault("last_seen_inbound", {})[contact] = str(updated.get("inbound_fingerprint", ""))
+        self.save_state(state)
+        if not draft_text:
+            self.append_event(
+                "draft_retry_scheduled",
+                contact=contact,
+                reason="duplicate_draft_blocked",
+                inbound_text=inbound_text,
+                retry_seconds=delay_seconds,
+            )
         self.append_event(
             "pending_refreshed_latest",
             reason=reason,
@@ -2630,7 +2887,7 @@ class AutoReplyRunner:
             contact,
             context_messages=context_messages,
             inbound_text=inbound_text,
-            source="pending_refreshed",
+            source="pending_refreshed" if draft_text else "draft_retry_scheduled",
         )
         return updated
 
@@ -2638,6 +2895,13 @@ class AutoReplyRunner:
         queue = sync_pending_state(state)
         filtered = remove_pending_by_fingerprint(queue, pending)
         sync_pending_state(state, filtered)
+        if reason == "selection_not_confirmed":
+            contact = str(pending.get("contact", "")).strip()
+            pending_fp = str(pending.get("inbound_fingerprint", "") or "")
+            last_seen = state.get("last_seen_inbound")
+            if contact and pending_fp and isinstance(last_seen, dict) and str(last_seen.get(contact) or "") == pending_fp:
+                last_seen.pop(contact, None)
+            state["claim_retry_pending"] = True
         self.append_event(
             "pending_cancelled",
             reason=reason,
@@ -2648,6 +2912,51 @@ class AutoReplyRunner:
         )
         return {"status": "cancelled", "reason": reason, "contact": pending.get("contact"), "queue_length": len(filtered)}
 
+    def _finalize_unconfirmed_send(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+        pending: dict[str, Any],
+        *,
+        confirmation: str,
+        send_age_seconds: float,
+        confirmation_attempts: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        queue = sync_pending_state(state)
+        remaining = remove_pending_by_fingerprint(queue, pending)
+        sync_pending_state(state, remaining)
+        contact = str(pending.get("contact", "")).strip()
+        draft_text = str(pending.get("draft_text", "")).strip()
+        self._remember_contact_memory(
+            config,
+            contact,
+            context_messages=list(pending.get("chat_context") or []),
+            inbound_text=str(pending.get("inbound_text") or ""),
+            outbound_text=draft_text,
+            source="auto_sent_unconfirmed_ui",
+        )
+        self.append_event(
+            "auto_sent",
+            contact=contact,
+            draft_text=draft_text,
+            remaining_queue=len(remaining),
+            queue_contacts=queued_contacts(remaining),
+            confirmation=confirmation,
+            inferred=True,
+            reason=reason,
+            send_attempts=int(pending.get("send_attempts", 0) or 0),
+            confirmation_attempts=confirmation_attempts,
+            send_age_seconds=round(max(0.0, send_age_seconds), 2),
+        )
+        return {
+            "status": "sent",
+            "contact": contact,
+            "queue_length": len(remaining),
+            "confirmation": confirmation,
+            "inferred": True,
+        }
+
     def _handle_pending(
         self,
         config: dict[str, Any],
@@ -2657,6 +2966,35 @@ class AutoReplyRunner:
         now: float,
     ) -> dict[str, Any]:
         queue = sync_pending_state(state)
+        send_attempts = int(pending.get("send_attempts", 0) or 0)
+        confirmation_attempts = int(pending.get("send_confirmation_attempts", 0) or 0)
+        max_confirmation_attempts = max(1, int(config.get("send_confirmation_max_attempts", 3) or 3))
+        confirmation_timeout_seconds = max(
+            float(config.get("send_verify_retry_seconds", 45) or 45),
+            float(config.get("send_confirmation_timeout_seconds", 180) or 180),
+        )
+        last_send_attempt_at = float(pending.get("last_send_attempt_at", 0.0) or 0.0)
+        send_age_seconds = max(0.0, now - last_send_attempt_at) if last_send_attempt_at > 0 else 0.0
+        if send_attempts > 0 and last_send_attempt_at > 0 and send_age_seconds >= confirmation_timeout_seconds:
+            return self._finalize_unconfirmed_send(
+                config,
+                state,
+                pending,
+                confirmation="send_action_timeout",
+                send_age_seconds=send_age_seconds,
+                confirmation_attempts=confirmation_attempts,
+                reason="confirmation_window_expired",
+            )
+        if send_attempts > 0 and confirmation_attempts >= max_confirmation_attempts:
+            return self._finalize_unconfirmed_send(
+                config,
+                state,
+                pending,
+                confirmation="send_confirmation_exhausted",
+                send_age_seconds=send_age_seconds,
+                confirmation_attempts=confirmation_attempts,
+                reason="confirmation_attempt_budget_exhausted",
+            )
         idle_threshold = float(config.get("idle_threshold_seconds", 30))
         if idle_seconds < idle_threshold:
             return {
@@ -2688,6 +3026,67 @@ class AutoReplyRunner:
                 "contact": pending.get("contact"),
                 "queue_length": len(queue),
             }
+        if not str(pending.get("draft_text") or "").strip():
+            contact = str(pending.get("contact") or "").strip()
+            created_at = float(pending.get("created_at", now) or now)
+            if now - created_at >= 3600:
+                sync_pending_state(state, remove_pending_by_fingerprint(queue, pending))
+                self.save_state(state)
+                self.append_event(
+                    "draft_retry_expired",
+                    contact=contact,
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    retry_count=int(pending.get("draft_retry_count", 0) or 0),
+                )
+                return {"status": "draft_retry_expired", "contact": contact, "queue_length": len(sync_pending_state(state))}
+            retry_count = int(pending.get("draft_retry_count", 0) or 0) + 1
+            quoted_message = {
+                "quoted_text": str(pending.get("quoted_text") or ""),
+                "quoted_role": str(pending.get("quoted_role") or ""),
+                "quoted_sender": str(pending.get("quoted_sender") or ""),
+            }
+            try:
+                draft_text = self._generate_guarded_reply(
+                    config,
+                    state,
+                    self._build_llm(config),
+                    contact,
+                    str(pending.get("inbound_text") or ""),
+                    now=now,
+                    conversation_context=[],
+                    contact_memory=None,
+                    screenshot_path=None,
+                    quoted_message=quoted_message,
+                )
+            except Exception as exc:
+                draft_text = ""
+                self.append_event("draft_retry_failed", contact=contact, error=str(exc))
+            pending["draft_retry_count"] = retry_count
+            if draft_text:
+                pending["draft_text"] = draft_text
+                pending["due_at"] = now + float(config.get("send_delay_seconds", 300))
+                self.append_event(
+                    "draft_retry_recovered",
+                    contact=contact,
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    draft_text=draft_text,
+                    retry_count=retry_count,
+                )
+                status = "draft_retry_recovered"
+            else:
+                retry_seconds = min(120 * (2 ** min(retry_count - 1, 4)), 1800)
+                pending["due_at"] = now + retry_seconds
+                self.append_event(
+                    "draft_retry_scheduled",
+                    contact=contact,
+                    reason="duplicate_or_generation_failed",
+                    retry_count=retry_count,
+                    retry_seconds=retry_seconds,
+                )
+                status = "draft_retry_wait"
+            sync_pending_state(state, queue)
+            self.save_state(state)
+            return {"status": status, "contact": contact, "queue_length": len(queue)}
         # Recheck right before foreground UI action to avoid stale idle snapshots.
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:
@@ -2708,15 +3107,98 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
-        restore_app = ""
-        if hasattr(self.ui, "capture_frontmost_app"):
-            try:
-                restore_app = str(self.ui.capture_frontmost_app() or "")
-            except Exception:
-                restore_app = ""
-        self.append_event("wechat_window_action", action="open", reason="pending_send_due", contact=contact)
-        self._activate_wechat_ui()
+        restore_app = self._open_wechat_foreground(reason="pending_send_due", contact=contact)
         try:
+            def _schedule_selection_retry(reason: str) -> dict[str, Any]:
+                if send_attempts > 0:
+                    next_confirmation_attempt = int(pending.get("send_confirmation_attempts", 0) or 0) + 1
+                    pending["send_confirmation_attempts"] = next_confirmation_attempt
+                    if next_confirmation_attempt >= max_confirmation_attempts:
+                        return self._finalize_unconfirmed_send(
+                            config,
+                            state,
+                            pending,
+                            confirmation="send_confirmation_exhausted",
+                            send_age_seconds=max(0.0, now - last_send_attempt_at),
+                            confirmation_attempts=next_confirmation_attempt,
+                            reason=reason,
+                        )
+                    retry_delay = max(5.0, float(config.get("send_verify_retry_seconds", 45) or 45))
+                    pending["due_at"] = now + retry_delay
+                    sync_pending_state(state, queue)
+                    self.save_state(state)
+                    self.append_event(
+                        "send_confirmation_retry_scheduled",
+                        contact=contact,
+                        reason=reason,
+                        confirmation_attempts=next_confirmation_attempt,
+                        max_confirmation_attempts=max_confirmation_attempts,
+                        due_at=pending["due_at"],
+                        queue_length=len(queue),
+                        queue_contacts=queued_contacts(queue),
+                    )
+                    return {
+                        "status": "send_confirmation_retry",
+                        "contact": contact,
+                        "reason": reason,
+                        "confirmation_attempts": next_confirmation_attempt,
+                        "queue_length": len(queue),
+                    }
+                retry_count = int(pending.get("selection_retry_count", 0) or 0) + 1
+                max_retries = max(1, int(config.get("pending_selection_retry_max_attempts", 6) or 6))
+                if retry_count > max_retries:
+                    snooze_seconds = max(
+                        float(config.get("pending_selection_retry_seconds", 60) or 60),
+                        float(config.get("pending_selection_snooze_seconds", 1800) or 1800),
+                    )
+                    pending["selection_retry_count"] = 0
+                    pending["selection_snooze_count"] = int(pending.get("selection_snooze_count", 0) or 0) + 1
+                    pending["due_at"] = now + snooze_seconds
+                    sync_pending_state(state, queue)
+                    self.save_state(state)
+                    self.append_event(
+                        "pending_selection_snoozed",
+                        contact=contact,
+                        reason=reason,
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        snooze_count=pending["selection_snooze_count"],
+                        snooze_seconds=snooze_seconds,
+                        due_at=pending["due_at"],
+                        queue_length=len(queue),
+                        queue_contacts=queued_contacts(queue),
+                    )
+                    return {
+                        "status": "pending_selection_snoozed",
+                        "contact": contact,
+                        "reason": reason,
+                        "retry_count": retry_count,
+                        "queue_length": len(queue),
+                        "seconds_remaining": round(snooze_seconds, 2),
+                    }
+                retry_delay = max(5.0, float(config.get("pending_selection_retry_seconds", 60) or 60))
+                pending["selection_retry_count"] = retry_count
+                pending["due_at"] = now + retry_delay
+                sync_pending_state(state, queue)
+                self.save_state(state)
+                self.append_event(
+                    "pending_selection_retry_scheduled",
+                    contact=contact,
+                    reason=reason,
+                    retry_count=retry_count,
+                    max_retries=max_retries,
+                    due_at=pending["due_at"],
+                    queue_length=len(queue),
+                    queue_contacts=queued_contacts(queue),
+                )
+                return {
+                    "status": "pending_retry_selection_not_confirmed",
+                    "contact": contact,
+                    "reason": reason,
+                    "retry_count": retry_count,
+                    "queue_length": len(queue),
+                }
+
             if self._live_idle_seconds() < idle_threshold:
                 return self._pending_abort_user_active(
                     state,
@@ -2725,10 +3207,85 @@ class AutoReplyRunner:
                     phase="after_open",
                 )
             selected = self._probe_ui(select_chat=contact)
-            if selected.get("status") != "ok" or not selected.get("selectionConfirmed"):
-                return self._cancel_pending(state, "selection_not_confirmed", pending)
+            if str(selected.get("status") or "") == "login_required":
+                self._mark_wechat_login_required(
+                    state,
+                    source="pending_send_due",
+                    screenshot=str(selected.get("screenshot") or ""),
+                )
+                pending["due_at"] = now + 300.0
+                sync_pending_state(state, queue)
+                self.save_state(state)
+                return {
+                    "status": "pending_wait_login_required",
+                    "contact": contact,
+                    "queue_length": len(queue),
+                }
+            if str(selected.get("status") or "") == "ok":
+                self._mark_wechat_available(state)
+            selection_evidence = pending_selection_panel_evidence(selected, contact)
+            if not selection_evidence:
+                requested_contact_matches = bool(
+                    selected.get("status") == "ok"
+                    and wechat_ui.names_match(str(selected.get("selectedChat") or ""), contact)
+                    and wechat_ui.names_match(str(selected.get("selectedChatRequested") or ""), contact)
+                )
+                if requested_contact_matches:
+                    self.append_event(
+                        "pending_selection_reselect",
+                        contact=contact,
+                        active_chat=str(selected.get("activeChat") or ""),
+                    )
+                    if self._live_idle_seconds() < idle_threshold:
+                        return self._pending_abort_user_active(
+                            state,
+                            pending,
+                            idle_threshold=idle_threshold,
+                            phase="selection_reselect",
+                        )
+                    selected_retry = self._probe_ui(select_chat=contact, sleep_after_click=0.65)
+                    retry_evidence = pending_selection_panel_evidence(selected_retry, contact)
+                    if retry_evidence:
+                        selected = selected_retry
+                        selection_evidence = retry_evidence
+                        self.append_event(
+                            "pending_selection_recovered",
+                            contact=contact,
+                            method="second_click",
+                            mode=str(retry_evidence.get("mode") or ""),
+                        )
+            if not selection_evidence:
+                return _schedule_selection_retry("selection_not_confirmed")
+            if not bool(selected.get("selectionConfirmed")):
+                selected["panelSelectionConfirmed"] = True
+                self.append_event(
+                    "pending_selection_confirmed_by_panel_evidence",
+                    contact=contact,
+                    mode=str(selection_evidence.get("mode") or ""),
+                    active_chat=str(selected.get("activeChat") or ""),
+                    inbound_text=str(selection_evidence.get("inbound_text") or ""),
+                )
 
             draft_text = str(pending.get("draft_text", ""))
+            recent_outbound_ttl = _recent_auto_outbound_ttl(config)
+
+            def _record_recent_auto_outbound(source: str) -> None:
+                entry = _remember_recent_auto_outbound(
+                    state,
+                    contact,
+                    draft_text,
+                    now=now,
+                    source=source,
+                    ttl_seconds=recent_outbound_ttl,
+                )
+                if entry:
+                    self.append_event(
+                        "recent_auto_outbound_recorded",
+                        contact=contact,
+                        source=source,
+                        text=draft_text,
+                    )
+
             # For send-time recheck, trust only the right chat panel content.
             # Left roster previews are truncated and can cause false "message changed".
             current_time = str(pending.get("message_time", "") or "")
@@ -2777,6 +3334,7 @@ class AutoReplyRunner:
                 outbound_top_value = (
                     float(outbound_item_value.get("top", 0.0) or 0.0) if outbound_item_value else None
                 )
+                draft_outbound_item_value = find_matching_outbound_draft(panel_full, draft_text)
                 inbound_top_value = latest_meaningful_inbound_top(panel_value)
                 latest_outbound_flag = latest_message_is_outbound(panel_value)
                 if outbound_value and (
@@ -2792,9 +3350,16 @@ class AutoReplyRunner:
                     "outbound_item": outbound_item_value,
                     "outbound": outbound_value,
                     "outbound_top": outbound_top_value,
+                    "draft_outbound_item": draft_outbound_item_value,
+                    "draft_outbound": str(draft_outbound_item_value.get("text") or "").strip(),
+                    "draft_match_mode": str(draft_outbound_item_value.get("match_mode") or "").strip(),
                     "inbound_top": inbound_top_value,
                     "latest_outbound": latest_outbound_flag,
-                    "chat_window": bool(selected_value.get("chatWindow")),
+                    "chat_window": bool(
+                        selected_value.get("chatWindow")
+                        or selected_value.get("selectionConfirmed")
+                        or selected_value.get("panelSelectionConfirmed")
+                    ),
                     "panel_confidence": panel_tail_confidence(panel_value),
                 }
 
@@ -2826,7 +3391,36 @@ class AutoReplyRunner:
                         phase="reselect_empty_panel",
                     )
                 selected_retry = self._probe_ui(select_chat=contact, sleep_after_click=0.45)
-                if selected_retry.get("status") == "ok" and selected_retry.get("selectionConfirmed"):
+                retry_evidence = pending_selection_panel_evidence(selected_retry, contact)
+                if not retry_evidence:
+                    self.append_event(
+                        "pending_reselect_empty_panel_second_click",
+                        contact=contact,
+                        status=str(selected_retry.get("status") or ""),
+                        selection_confirmed=bool(selected_retry.get("selectionConfirmed")),
+                    )
+                    if self._live_idle_seconds() < idle_threshold:
+                        return self._pending_abort_user_active(
+                            state,
+                            pending,
+                            idle_threshold=idle_threshold,
+                            phase="reselect_second_click",
+                        )
+                    selected_retry_second = self._probe_ui(select_chat=contact, sleep_after_click=0.65)
+                    second_retry_evidence = pending_selection_panel_evidence(selected_retry_second, contact)
+                    if second_retry_evidence:
+                        selected_retry = selected_retry_second
+                        retry_evidence = second_retry_evidence
+                        self.append_event(
+                            "pending_reselect_empty_panel_recovered",
+                            contact=contact,
+                            method="second_click",
+                        )
+                    else:
+                        selected_retry = selected_retry_second
+                if retry_evidence:
+                    if not bool(selected_retry.get("selectionConfirmed")):
+                        selected_retry["panelSelectionConfirmed"] = True
                     selected = selected_retry
                     retry_snapshot = _read_recheck_snapshot(selected)
                     if _snapshot_has_recheck_signal(prior_snapshot) and not _snapshot_has_recheck_signal(retry_snapshot):
@@ -2866,10 +3460,10 @@ class AutoReplyRunner:
                         status=str(selected_retry.get("status") or ""),
                         selection_confirmed=bool(selected_retry.get("selectionConfirmed")),
                     )
+                    return _schedule_selection_retry("empty_panel_reselect_not_confirmed")
 
             pending_inbound = str(pending.get("inbound_text", ""))
             pending_time = str(pending.get("message_time", ""))
-            send_attempts = int(pending.get("send_attempts", 0) or 0)
             pending_outbound_snapshot = str(pending.get("outbound_snapshot", "") or "")
 
             def _sanitize_recheck_sample(sample_value: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -2915,8 +3509,11 @@ class AutoReplyRunner:
                         error=str(exc),
                     )
                     break
-                if voted_probe.get("status") != "ok" or not voted_probe.get("selectionConfirmed"):
+                voted_evidence = pending_selection_panel_evidence(voted_probe, contact)
+                if not voted_evidence:
                     continue
+                if not bool(voted_probe.get("selectionConfirmed")):
+                    voted_probe["panelSelectionConfirmed"] = True
                 samples.append(_read_recheck_snapshot(voted_probe))
 
             contamination_events: list[dict[str, Any]] = []
@@ -2943,63 +3540,108 @@ class AutoReplyRunner:
                     events=contamination_events,
                 )
 
-            def _vote_text(values: list[str], *, allow_empty: bool = True) -> str:
-                raws = [str(value or "").strip() for value in values]
-                if not allow_empty:
-                    raws = [value for value in raws if value]
-                if not raws:
-                    return ""
-                normed = [normalize_text(value) for value in raws if allow_empty or value]
-                if not normed:
-                    return ""
-                winner_norm, _ = Counter(normed).most_common(1)[0]
-                winner_raws = [value for value in raws if normalize_text(value) == winner_norm]
-                if not winner_raws:
-                    return ""
-                return max(winner_raws, key=len)
-
-            def _vote_bool(values: list[bool]) -> bool:
-                if not values:
-                    return False
-                needed = (len(values) // 2) + 1
-                return sum(1 for value in values if value) >= needed
-
-            voted_inbound = _vote_text([str(item.get("inbound") or "") for item in samples], allow_empty=True)
-            voted_raw_inbound = _vote_text([str(item.get("raw_inbound") or "") for item in samples], allow_empty=True)
-            voted_outbound = _vote_text([str(item.get("outbound") or "") for item in samples], allow_empty=True)
-            voted_latest_outbound = _vote_bool([bool(item.get("latest_outbound")) for item in samples])
-
-            anchor_snapshot = samples[-1]
-            if voted_outbound:
-                for item in reversed(samples):
-                    if normalize_text(str(item.get("outbound") or "")) == normalize_text(voted_outbound):
-                        anchor_snapshot = item
-                        break
+            consensus = build_recheck_consensus(samples)
+            anchor_snapshot = consensus.anchor_snapshot
             panel = anchor_snapshot.get("panel", {}) or {}
             current_outbound_item = (
                 anchor_snapshot.get("outbound_item") if isinstance(anchor_snapshot.get("outbound_item"), dict) else None
             )
             current_outbound_top = anchor_snapshot.get("outbound_top")
             latest_inbound_top = anchor_snapshot.get("inbound_top")
-            raw_current_inbound = voted_raw_inbound
-            current_inbound = voted_inbound
-            current_outbound = voted_outbound
-            latest_bubble_outbound = voted_latest_outbound
-            has_chat_window = any(bool(item.get("chat_window")) for item in samples)
+            raw_current_inbound = consensus.raw_inbound
+            current_inbound = consensus.inbound
+            current_outbound = consensus.outbound
+            latest_bubble_outbound = consensus.latest_outbound
+            has_chat_window = consensus.has_chat_window
             self.append_event(
                 "pending_recheck_voted",
                 contact=contact,
-                frames=len(samples),
+                frames=consensus.frame_count,
                 voted_inbound=current_inbound,
                 voted_outbound=current_outbound,
                 latest_outbound=latest_bubble_outbound,
             )
+
+            draft_outbound_match: dict[str, Any] = {}
+            if send_attempts > 0:
+                for sample in reversed(samples):
+                    candidate = sample.get("draft_outbound_item")
+                    if isinstance(candidate, dict) and str(candidate.get("text") or "").strip():
+                        draft_outbound_match = candidate
+                        break
+            if draft_outbound_match:
+                remaining = remove_pending_by_fingerprint(queue, pending)
+                sync_pending_state(state, remaining)
+                _record_recent_auto_outbound("auto_sent_historical_outbound")
+                final_outbound = str(draft_outbound_match.get("text") or draft_text or "").strip()
+                self._remember_contact_memory(
+                    config,
+                    contact,
+                    context_messages=list(pending.get("chat_context") or []),
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    outbound_text=final_outbound,
+                    source="auto_sent_historical_outbound",
+                )
+                self.append_event(
+                    "auto_sent",
+                    contact=contact,
+                    draft_text=draft_text,
+                    remaining_queue=len(remaining),
+                    queue_contacts=queued_contacts(remaining),
+                    confirmation="historical_outbound",
+                    match_mode=str(draft_outbound_match.get("match_mode") or ""),
+                    matched_outbound=final_outbound,
+                )
+                return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
+
+            self_echo_match = _match_recent_auto_outbound(
+                state,
+                contact,
+                current_inbound,
+                now=now,
+                ttl_seconds=recent_outbound_ttl,
+                extra_texts=[draft_text] if send_attempts > 0 else None,
+            )
+            if self_echo_match:
+                if send_attempts > 0:
+                    remaining = remove_pending_by_fingerprint(queue, pending)
+                    sync_pending_state(state, remaining)
+                    _record_recent_auto_outbound("auto_sent_self_echo_late")
+                    self._remember_contact_memory(
+                        config,
+                        contact,
+                        context_messages=list(pending.get("chat_context") or []),
+                        inbound_text=str(pending.get("inbound_text") or ""),
+                        outbound_text=draft_text,
+                        source="auto_sent_self_echo_late",
+                    )
+                    self.append_event(
+                        "auto_sent",
+                        contact=contact,
+                        draft_text=draft_text,
+                        remaining_queue=len(remaining),
+                        queue_contacts=queued_contacts(remaining),
+                        confirmation="late_self_echo",
+                        match_mode=str(self_echo_match.get("match_mode") or ""),
+                        self_echo_inbound=current_inbound,
+                    )
+                    return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
+                return self._cancel_pending(
+                    state,
+                    "current_inbound_matches_recent_auto_outbound",
+                    pending,
+                    current_inbound=current_inbound,
+                    match_mode=str(self_echo_match.get("match_mode") or ""),
+                    source=str(self_echo_match.get("source") or ""),
+                    age_seconds=self_echo_match.get("age_seconds"),
+                )
 
             draft_match_mode = _draft_match_mode(draft_text, current_outbound)
             if draft_match_mode and current_outbound:
                 if int(pending.get("send_attempts", 0) or 0) > 0:
                     remaining = remove_pending_by_fingerprint(queue, pending)
                     sync_pending_state(state, remaining)
+                    _record_recent_auto_outbound("auto_sent_late")
                     final_outbound = str(current_outbound or draft_text or "").strip()
                     self._remember_contact_memory(
                         config,
@@ -3021,43 +3663,23 @@ class AutoReplyRunner:
                     return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
                 return self._cancel_pending(state, "reply_already_present", pending)
 
-            snapshot_outbound = normalize_text(pending_outbound_snapshot)
-            manual_reply_trigger = ""
-            if (
-                not current_inbound
-                and current_outbound
-                and normalize_text(current_outbound) != snapshot_outbound
-            ):
-                manual_reply_trigger = "outbound_without_inbound"
-            outbound_after_latest_inbound = bool(
-                current_outbound
-                and current_outbound_top is not None
-                and latest_inbound_top is not None
-                and current_outbound_top > latest_inbound_top + 0.01
+            ultra_short_inbound_tail = bool(current_inbound and _is_ultra_short_fragment(current_inbound))
+            manual_reply = detect_manual_reply_trigger(
+                current_inbound=current_inbound,
+                current_outbound=current_outbound,
+                pending_outbound_snapshot=pending_outbound_snapshot,
+                current_outbound_top=current_outbound_top,
+                latest_inbound_top=latest_inbound_top,
+                latest_bubble_outbound=latest_bubble_outbound,
+                ultra_short_inbound_tail=ultra_short_inbound_tail,
             )
-            manual_reply_has_inbound_evidence = bool(current_inbound) or latest_inbound_top is not None
-            if (
-                not manual_reply_trigger
-                and latest_bubble_outbound
-                and manual_reply_has_inbound_evidence
-                and current_outbound
-            ):
-                manual_reply_trigger = "latest_bubble_outbound"
-            if (
-                not manual_reply_trigger
-                and current_outbound
-                and normalize_text(current_outbound) != snapshot_outbound
-                and manual_reply_has_inbound_evidence
-                and outbound_after_latest_inbound
-            ):
-                manual_reply_trigger = "outbound_after_latest_inbound"
-            if manual_reply_trigger:
+            if manual_reply.detected:
                 reliable_signal, blockers = _manual_reply_signal_is_reliable(
                     current_outbound=current_outbound,
-                    current_inbound=current_inbound,
+                    current_inbound="" if ultra_short_inbound_tail else current_inbound,
                     current_outbound_item=current_outbound_item,
                     current_outbound_top=current_outbound_top,
-                    latest_inbound_top=latest_inbound_top,
+                    latest_inbound_top=None if ultra_short_inbound_tail else latest_inbound_top,
                     latest_bubble_outbound=latest_bubble_outbound,
                     has_chat_window=has_chat_window,
                 )
@@ -3071,7 +3693,7 @@ class AutoReplyRunner:
                 self.append_event(
                     "pending_manual_reply_ambiguous",
                     contact=contact,
-                    trigger=manual_reply_trigger,
+                    trigger=manual_reply.trigger,
                     blockers=blockers,
                     current_inbound=current_inbound,
                     current_outbound=current_outbound,
@@ -3095,6 +3717,8 @@ class AutoReplyRunner:
             if len(samples) >= 2 and inbound_norms:
                 top_hits = Counter(inbound_norms).most_common(1)[0][1]
                 unstable_vote = top_hits < ((len(samples) // 2) + 1)
+            if (low_confidence or unstable_vote) and send_attempts > 0:
+                return _schedule_selection_retry("low_confidence_send_confirmation")
             if low_confidence or unstable_vote:
                 base_delay = float(config.get("recheck_low_confidence_delay_seconds", 60) or 60)
                 base_delay = max(180.0, base_delay)
@@ -3107,7 +3731,8 @@ class AutoReplyRunner:
                 updated["low_confidence_retries"] = retries
                 if retries >= max_retries:
                     updated["due_at"] = now + snooze_seconds
-                    queue[0] = updated
+                    if replace_pending(queue, pending, updated) < 0:
+                        raise RuntimeError(f"pending queue item disappeared during recheck: {contact}")
                     sync_pending_state(state, queue)
                     self.append_event(
                         "pending_recheck_snoozed",
@@ -3128,7 +3753,8 @@ class AutoReplyRunner:
                         "seconds_remaining": round(float(updated["due_at"]) - now, 2),
                     }
                 updated["due_at"] = now + delay_seconds
-                queue[0] = updated
+                if replace_pending(queue, pending, updated) < 0:
+                    raise RuntimeError(f"pending queue item disappeared during recheck: {contact}")
                 sync_pending_state(state, queue)
                 self.append_event(
                     "pending_recheck_low_confidence",
@@ -3150,7 +3776,7 @@ class AutoReplyRunner:
                 }
 
             if not current_inbound:
-                return self._cancel_pending(state, "empty_inbound_recheck", pending)
+                return _schedule_selection_retry("empty_inbound_recheck")
 
             if inbound_variant_equivalent(
                 pending_inbound,
@@ -3309,6 +3935,13 @@ class AutoReplyRunner:
                     refresh_delay_seconds=refresh_delay_seconds,
                     inbound_payload=current_inbound_payload,
                 )
+                if updated is None:
+                    return {
+                        "status": "pending_cancelled",
+                        "reason": "duplicate_draft_blocked",
+                        "contact": contact,
+                        "queue_length": len(queue),
+                    }
                 return {
                     "status": "pending_refreshed",
                     "contact": contact,
@@ -3361,6 +3994,7 @@ class AutoReplyRunner:
                 )
             confirmed = None
             confirmation_probe_reason = "initial_send"
+            send_action_performed = False
             if send_attempts > 0:
                 if retry_input_match_mode:
                     self.append_event(
@@ -3380,6 +4014,8 @@ class AutoReplyRunner:
                             phase="retry_after_focus_input",
                         )
                     self._send_message_ui()
+                    send_action_performed = True
+                    _record_recent_auto_outbound("send_attempt_retry")
                     confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
                     confirmation_probe_reason = "retry_resend"
                 else:
@@ -3409,6 +4045,8 @@ class AutoReplyRunner:
                         phase="after_paste",
                     )
                 self._send_message_ui()
+                send_action_performed = True
+                _record_recent_auto_outbound("send_attempt")
                 confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
             confirmed_panel = confirmed.get("chatPanel", {}) or {}
             confirmed_outbound = latest_committed_outbound(confirmed_panel)
@@ -3416,6 +4054,7 @@ class AutoReplyRunner:
             if confirmed_match_mode and confirmed_outbound:
                 remaining = remove_pending_by_fingerprint(queue, pending)
                 sync_pending_state(state, remaining)
+                _record_recent_auto_outbound("auto_sent_immediate")
                 final_outbound = str(confirmed_outbound or draft_text or "").strip()
                 self._remember_contact_memory(
                     config,
@@ -3436,13 +4075,57 @@ class AutoReplyRunner:
                 )
                 return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
 
+            confirmed_inbound_item = latest_meaningful_inbound_item(confirmed_panel)
+            confirmed_inbound = str(
+                confirmed_inbound_item.get("text")
+                or confirmed_panel.get("latestInbound")
+                or ""
+            ).strip()
+            confirmed_self_echo_match = _match_recent_auto_outbound(
+                state,
+                contact,
+                confirmed_inbound,
+                now=now,
+                ttl_seconds=recent_outbound_ttl,
+                extra_texts=[draft_text],
+            )
+            if confirmed_self_echo_match:
+                remaining = remove_pending_by_fingerprint(queue, pending)
+                sync_pending_state(state, remaining)
+                _record_recent_auto_outbound("auto_sent_self_echo_immediate")
+                self._remember_contact_memory(
+                    config,
+                    contact,
+                    context_messages=list(pending.get("chat_context") or []),
+                    inbound_text=str(pending.get("inbound_text") or ""),
+                    outbound_text=draft_text,
+                    source="auto_sent_self_echo_immediate",
+                )
+                self.append_event(
+                    "auto_sent",
+                    contact=contact,
+                    draft_text=draft_text,
+                    remaining_queue=len(remaining),
+                    queue_contacts=queued_contacts(remaining),
+                    confirmation="self_echo_after_send",
+                    match_mode=str(confirmed_self_echo_match.get("match_mode") or ""),
+                    self_echo_inbound=confirmed_inbound,
+                    current_outbound=confirmed_outbound,
+                )
+                return {"status": "sent", "contact": contact, "queue_length": len(remaining)}
+
             updated = copy.deepcopy(pending)
-            updated["send_attempts"] = int(pending.get("send_attempts", 0) or 0) + 1
-            updated["last_send_attempt_at"] = now
+            updated["send_attempts"] = send_attempts + (1 if send_action_performed else 0)
+            updated["send_confirmation_attempts"] = int(
+                pending.get("send_confirmation_attempts", 0) or 0
+            ) + 1
+            if send_action_performed:
+                updated["last_send_attempt_at"] = now
             updated["due_at"] = now + float(config.get("send_verify_retry_seconds", 45))
-            queue[0] = updated
+            if replace_pending(queue, pending, updated) < 0:
+                raise RuntimeError(f"pending queue item disappeared during send confirmation: {contact}")
             sync_pending_state(state, queue)
-            if updated["send_attempts"] >= int(config.get("send_max_attempts", 2)):
+            if send_action_performed and updated["send_attempts"] >= int(config.get("send_max_attempts", 2)):
                 return self._cancel_pending(
                     state,
                     "send_not_confirmed",
@@ -3450,12 +4133,23 @@ class AutoReplyRunner:
                     current_outbound=confirmed_outbound,
                     send_attempts=updated["send_attempts"],
                 )
+            if updated["send_confirmation_attempts"] >= max_confirmation_attempts:
+                return self._finalize_unconfirmed_send(
+                    config,
+                    state,
+                    updated,
+                    confirmation="send_confirmation_exhausted",
+                    send_age_seconds=0.0 if send_action_performed else max(0.0, now - last_send_attempt_at),
+                    confirmation_attempts=updated["send_confirmation_attempts"],
+                    reason="post_send_probe_empty",
+                )
             self.append_event(
                 "send_unconfirmed_retry_scheduled",
                 contact=contact,
                 draft_text=draft_text,
                 current_outbound=confirmed_outbound,
                 send_attempts=updated["send_attempts"],
+                confirmation_attempts=updated["send_confirmation_attempts"],
                 due_at=updated["due_at"],
                 queue_length=len(queue),
                 queue_contacts=queued_contacts(queue),
@@ -3465,20 +4159,14 @@ class AutoReplyRunner:
                 "contact": contact,
                 "queue_length": len(queue),
                 "send_attempts": updated["send_attempts"],
+                "confirmation_attempts": updated["send_confirmation_attempts"],
             }
         finally:
-            self.append_event("wechat_window_action", action="hide", reason="pending_send_due", contact=contact)
-            self._hide_wechat_ui()
-            if restore_app and hasattr(self.ui, "restore_frontmost_app"):
-                try:
-                    self._restore_frontmost_app_ui(restore_app)
-                except Exception as exc:
-                    self.append_event(
-                        "restore_frontmost_failed",
-                        context="pending_send_due",
-                        error=str(exc),
-                        app=restore_app,
-                    )
+            self._close_wechat_foreground(
+                reason="pending_send_due",
+                restore_app=restore_app,
+                contact=contact,
+            )
 
 
 class _VisionSensor:

@@ -27,6 +27,13 @@ _NEGATIVE_HINT_RE = re.compile(
 _POSITIVE_HINT_RE = re.compile(r"(哈哈|开心|好耶|太棒|稳了|nice|great|awesome|congrats|good job)", re.IGNORECASE)
 _CASUAL_DEFAULT_EMOJI_NAMES = ["微笑", "旺柴", "机智", "捂脸", "嘿哈", "呲牙", "让我看看", "耶"]
 
+_ROLE_GROUNDING_INSTRUCTIONS = (
+    "Conversation roles are authoritative:\n"
+    "- [CONTACT_SENT] was sent by the contact to you.\n"
+    "- [YOU_SENT] was sent by you to the contact and is history only. Never answer a [YOU_SENT] line.\n"
+    "- Reply only to [LATEST_CONTACT_SENT], using older lines only to understand the exchange.\n"
+)
+
 
 def _same_language_hint(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", text or ""):
@@ -136,23 +143,32 @@ def _format_context_block(conversation_context: list[dict[str, str]] | None) -> 
         text = _clean_context_line(str(item.get("text", "")))
         if not text:
             continue
-        speaker = "Me" if role in {"self", "me", "outbound", "assistant"} else "Them"
-        lines.append(f"{speaker}: {text}")
+        if role in {"self", "me", "outbound", "assistant"}:
+            speaker = "YOU_SENT"
+        elif role in {"contact", "them", "inbound", "user"}:
+            speaker = "CONTACT_SENT"
+        else:
+            # A missing/unknown role must not silently become an incoming message.
+            continue
+        lines.append(f"[{speaker}] {text}")
     if not lines:
         return ""
-    return "Recent chat context (oldest to latest):\n" + "\n".join(lines[-8:]) + "\n\n"
+    return "Recent chat history (oldest to latest; role labels are authoritative):\n" + "\n".join(lines[-8:]) + "\n\n"
 
 
 def _format_contact_memory_block(contact_memory: dict[str, Any] | None) -> str:
     if not isinstance(contact_memory, dict):
         return ""
     profile = _clean_context_line(str(contact_memory.get("profile", "")), max_chars=160)
-    recent_summary = _clean_context_line(str(contact_memory.get("recent_summary", "")), max_chars=320)
+    recent_summary = _clean_context_line(str(contact_memory.get("recent_summary", "")), max_chars=220)
     lines: list[str] = []
     if profile:
         lines.append(f"Contact profile: {profile}")
     if recent_summary:
-        lines.append(f"Longer-term memory with this contact: {recent_summary}")
+        lines.append(
+            "Light recent memory with this contact "
+            f"(weak signal; do not revive old jokes/topics unless the latest message clearly continues them): {recent_summary}"
+        )
     if not lines:
         return ""
     return "\n".join(lines) + "\n\n"
@@ -172,6 +188,22 @@ def _format_quoted_message_block(quoted_message: dict[str, Any] | None) -> str:
     else:
         label = "Quoted earlier message in this chat"
     return f"{label}: {quoted_text}\n\n"
+
+
+def _format_avoid_replies_block(avoid_replies: list[str] | None) -> str:
+    lines: list[str] = []
+    for value in list(avoid_replies or []):
+        text = _clean_context_line(value, max_chars=180)
+        if text and text not in lines:
+            lines.append(text)
+    if not lines:
+        return ""
+    tagged = "\n".join(f"[ALREADY_SENT_DO_NOT_REPEAT] {text}" for text in lines[-3:])
+    return (
+        "Replies already sent to this contact are listed below. "
+        "Do not repeat, substantially copy, or merely append to them. Write a genuinely new reply.\n"
+        f"{tagged}\n\n"
+    )
 
 
 class OllamaClient:
@@ -204,6 +236,7 @@ class OllamaClient:
         contact_memory: dict[str, Any] | None = None,
         screenshot_path: str | None = None,
         quoted_message: dict[str, Any] | None = None,
+        avoid_replies: list[str] | None = None,
     ) -> str:
         del screenshot_path
         num_predict = max(12, min(48, self.max_reply_chars // 2))
@@ -212,6 +245,7 @@ class OllamaClient:
         context_block = _format_context_block(conversation_context)
         memory_block = _format_contact_memory_block(contact_memory)
         quoted_block = _format_quoted_message_block(quoted_message)
+        avoid_block = _format_avoid_replies_block(avoid_replies)
         if self.emoji_enabled and self.emoji_codes:
             sampled = " ".join(self.emoji_codes[:20])
             emoji_prompt_block = (
@@ -223,6 +257,7 @@ class OllamaClient:
         prompt = (
             "You write short, natural WeChat replies.\n"
             f"{_same_language_hint(inbound_text)}\n"
+            f"{_ROLE_GROUNDING_INSTRUCTIONS}"
             f"{style_block}"
             f"{emoji_prompt_block}"
             "Keep it colloquial and human.\n"
@@ -236,7 +271,8 @@ class OllamaClient:
             f"{memory_block}"
             f"{context_block}"
             f"{quoted_block}"
-            f"Latest incoming message: {inbound_text}\n\n"
+            f"{avoid_block}"
+            f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply:"
         )
         response = requests.post(

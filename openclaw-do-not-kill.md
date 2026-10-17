@@ -9,12 +9,12 @@ If you want OpenClaw to keep working, do not kill these:
    `launchctl` label: `ai.openclaw.gateway`
    process name: `openclaw-gateway`
 
-2. `wechat-autoreply-v1 [DO NOT KILL]`
-   This is the Terminal-hosted WeChat auto-reply V1 runner.
-   If you kill it, WeChat auto-reply pauses until the launcher recreates it.
+2. `ai.openclaw.wechat.autoreply.v6`
+   This is the launchd-managed WeChat auto-reply V6 runner.
+   If you kill its Python process, launchd restarts it automatically.
    How to identify it:
-   Terminal tab title: `wechat-autoreply-v1 [DO NOT KILL]`
-   child command: `/Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v1-terminal-host.sh`
+   `launchctl` label: `ai.openclaw.wechat.autoreply.v6`
+   child command: `/Users/shawnwang/.openclaw/workspace/scripts/wechat-autoreply-v6-run.sh`
 
 These are not as critical for the main chat path:
 

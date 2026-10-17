@@ -1,591 +1,498 @@
-# WeChat Auto-Reply (OpenClaw)
+# WeChat Auto-Reply V7
 
-This repository contains a local macOS WeChat auto-reply agent built with UI automation + OCR.
+A local WeChat auto-reply system for macOS. It detects messages, generates drafts, and sends delayed replies through screen capture, optical character recognition (OCR), window control, and keyboard simulation. It does not use the official WeChat API.
 
-It does not use any official WeChat API.  
-All behaviors are executed by visual detection, window control, keyboard simulation, and a local LLM.
+Stable V7 makes every window action, message claim, draft cancellation, and send decision traceable and testable. See the [V7 stable baseline](docs/V7_BASELINE.md) for release branches and rollback rules.
 
-This branch also includes the current image-aware reply path:
+> This application operates a real WeChat window and sends real messages. Keep auto-reply off during initial setup, verify permissions and the allowlist, and run the tests and dry run first.
 
-- plain text messages still use the normal OCR + context flow
-- image / sticker / photo-like messages can be routed through `brother` (the local multimodal gateway)
-- visual debug crops are preserved under `runtime/captures/` for later inspection
+## Current status
 
-## Why This Project Exists
+- Stable version: V7.
+- Stable development branch: `feature/v7_iteration`.
+- Platform: macOS on Apple Silicon.
+- Process model: one Python runner managed by launchd.
+- Default send delay: 180 seconds.
+- Local fallback model: `qwen3.5:9b`.
+- Optional primary: a PC-hosted model, with local fallback when unavailable.
+- Image messages: supported through the local `brother` multimodal gateway.
+- Existing launchd label: `ai.openclaw.wechat.autoreply.v6`. The historical label does not indicate the current code version.
 
-The main goal is reliable delayed auto-reply with strong guardrails:
+## Recent fixes
 
-- Trigger only when there is a clear unread signal.
-- Never hijack keyboard/mouse while the user is active.
-- Keep a visible FIFO pending queue.
-- Cancel safely when manual reply is detected.
-- Expose everything with Gateway commands + event logs.
+### 2026-10-17: stable V7 baseline
 
-## Scope and Safety Model
+- Freeze the code currently running on this Mac, based on `1d2f044`.
+- Resolve the allowlist and switch relative to the application root, so independent runtime copies use their own control files.
+- Validate the baseline with 43 unit tests and the complete fake-UI selftest.
+- Keep machine configuration, private runtime data, and unrelated cleanup files outside the release commit.
 
-What it does:
+### 2026-09-24
 
-- Watches for unread signals.
-- Claims whitelist inbound messages.
-- Generates draft replies.
-- Sends after delay when safe.
+- Report unavailable WeChat windows in `status`; retry background preflight at the normal scan interval instead of flooding error logs.
+- Limit badge scans to the avatar's upper edge, excluding orange/red emoji in contact previews. Real false-positive captures and synthetic badges cover the regression.
+- Keep repeatedly duplicated drafts pending for delayed regeneration. Empty drafts never enter the send path.
+- Reclaim new unread messages with changed previews or timestamps even when that contact already has a pending item.
 
-What it does not do:
+### 2026-09-19
 
-- No official messaging API integration.
-- No silent background processing without macOS permissions.
-- No forced send when manual activity is detected.
+- Prevent identical replies to different inbound messages by excluding the previous six hours of automatically sent replies from generation and regenerating duplicates.
+- Preserve recent send-safety history during `reset` and `restart`, while clearing pending items.
+- Isolate selftest allowlists from this Mac's live allowlist.
 
-Safety-first principles:
+### 2026-09-17
 
-- `idle >= 30s` is required before any UI automation opens WeChat.
-- Sending path includes re-check before paste/send.
-- Pending items are cancellable on multiple safety signals.
-- Runtime state is restartable and inspectable.
+- Recover OCR helpers and event logs that macOS cloud storage replaces with `dataless` placeholders. Restore helpers from Git and archive/recreate unavailable event files.
+- Preserve explicit sender roles with `[CONTACT_SENT]`, `[YOU_SENT]`, and `[LATEST_CONTACT_SENT]`.
+- Exclude unknown sender roles instead of treating them as contact messages.
+- Apply the same role constraints to the primary and fallback models. Only the latest contact message is a reply target.
+- Add context-ordering, sender-role, unknown-role, and dataless-recovery regressions.
+- Clear the affected contacts' short-term automatic memories while preserving their manually maintained, locked profiles.
 
-## Repository Layout
+### 2026-07-23
+
+- Schedule the earliest `due_at` item so a sleeping queue head cannot block other due contacts. Preserve insertion order in storage.
+- Update pending items by object or inbound fingerprint, never by an assumed `queue[0]` position.
+- Exclude older share-card metadata when newer plain messages follow it.
+- Include titles near the panel edge in OCR, normalize `10ck` to the existing `1ock` alias, and avoid reopening an already selected contact.
+- Add incident regressions for blocked contacts, non-head updates, share-card contamination, and edge-positioned titles.
+- Validate that release with the complete selftest and its then-current 29 unit tests.
+
+## Reliability inherited from V6
+
+Incidents observed in V3–V5 became release requirements retained by V7:
+
+- Repeatedly opening WeChat without an actionable unread badge.
+- Mistaking warm/red avatars for badges, or letting avatar pixels dilute a genuine white digit `1`.
+- Missing messages when the Dock unread signal fails.
+- Losing a message after a click clears its badge but title OCR remains uncertain.
+- Reporting a healthy runner while WeChat is on the `Enter Weixin` login screen.
+- Treating our own sent messages as new inbound messages or as questions for the model.
+- Ignoring genuine contact messages because they resemble a previous outbound reply.
+- Cancelling or sending based on unstable single-frame OCR.
+- Sending after a manual reply, or removing the wrong pending item.
+- Blocking due items behind a sleeping head, or overwriting the head during a non-head retry.
+- Combining old share-card content with newer messages.
+- Losing an edge-positioned contact title or confusing card text with that title.
+- Crashing on event-log/cleanup contention with `Resource deadlock avoided`.
+- Failing to parse native output with trailing diagnostics or repeated JSON.
+
+See [incident-derived invariants](docs/INCIDENT_INVARIANTS.md) for the rules and regression entry points.
+
+## Safety invariants
+
+- Only a verified numeric badge can enter the claim flow. Red pixels alone are insufficient, and warm avatar colors cannot override confirmed digit evidence.
+- Background roster preflight must find an allowlisted unread message before bringing WeChat forward.
+- Global unread activity without a visible numeric allowlist badge is treated as non-allowlisted activity. Clear only visible non-allowlist badges; do not search through allowlisted contacts.
+- UI automation requires sufficient system idle time: 30 seconds by default.
+- Persist drafts in insertion order, schedule the earliest due item, and re-read the chat with multi-frame consensus before sending.
+- Cancel or postpone on reliable manual-reply evidence, input-box content, or changed messages.
+- Identify pending items by inbound fingerprint, not contact name or queue position.
+- Preserve uncertain sends for bounded verification instead of blindly sending again.
+- Preserve message order and sender roles. Never infer an unknown sender as the contact.
+- If a click clears a badge, continue only when contact-row evidence, preview text, and the gray inbound bubble agree. Retry uncertainty within a finite budget.
+- Report the login screen as `wechat_login_required`, not an empty healthy roster.
+- Logging and cleanup failures must not stop the reply state machine.
+- Restore the previously active application after a foreground WeChat session whenever possible.
+
+## Runtime flow
+
+```text
+Dock/menu signal ─┐
+                  ├─> claim policy ─> hidden roster preflight
+periodic sweep ───┘                         │
+                                   numeric allowlist badge?
+                                      no │        │ yes
+                                         │        v
+                                      stay hidden  foreground claim
+                                                     │
+                                             OCR + context + model
+                                                     │
+                                                pending queue
+                                                     │
+                                      earliest due + multi-frame recheck
+                                                     │
+                                      cancel / refresh / verify and send
+```
+
+Normal operation has two reasons to bring WeChat forward:
+
+- `claim_scan`: read and claim a message after actionable unread evidence.
+- `pending_send_due`: recheck the earliest due draft before sending.
+
+Any unexplained foreground opening is a defect.
+
+## Modules
 
 ```text
 apps/
-  gateway/                   # Gateway command interface
-  runner/                    # Runner entry (main loop / one-shot)
-docs/
-  ARCHITECTURE.md
-  OPERATIONS.md
-tools/
-  wechat_row_badges.swift    # Red unread-dot detection in list rows
-  wechat_bubble_roles.swift  # Inbound vs outbound bubble role helper
+  gateway/                     Operational command entry point
+  runner/                      Runner loop and process lock
+
 wechat_autoreply/
-  contact_memory_seed.json   # Versioned default long-term profiles tracked in git
-  erge_client.py             # Brother multimodal client (image-aware reply path)
-  orchestrator.py            # Core state machine
-  wechat_ui.py               # WeChat probing, OCR extraction, UI actions
-  vision.py                  # Menu signal detection (icon + digit context)
-  idle.py                    # System idle detection via Quartz
-  state_store.py             # Runtime state persistence
-  config_store.py            # Config read/write and toggles
+  orchestrator.py              Sensors, policies, state, models, and UI actions
+  claim_policy.py              Allowlist, numeric badges, stable frames, claiming
+  badge_detection.py           Pixel-level badges and warm-avatar overlap recovery
+  pending_queue.py             Pending queue, due scheduling, compatibility mirror
+  recheck_policy.py            Multi-frame pre-send OCR consensus
+  manual_reply_policy.py       Manual-reply evidence classification
+  outbound_history.py          Send confirmation and recent self-echo suppression
+  wechat_ui.py                 Window capture, OCR observations, UI actions
+  event_log.py                 Locked event logging, retries, fallback
+  capture_cleanup.py           Capture and event retention
+  state_store.py               Atomic state persistence
+  erge_client.py               Brother multimodal client
+
 erge_gateway/
-  server.py                  # OpenAI-compatible Brother gateway
-  router.py                  # Attachment / vision / logic routing
-  clients/                   # Vision + logic backend clients
-  preprocess/                # PDF / DOCX / XLSX ingest helpers
-runtime/
-  config.json                # Runtime config
-  state.json                 # Runtime state snapshot
-  contact_memory.json        # Per-contact long-term profile + short-term compressed memory
-  events.jsonl               # Append-only event timeline
-  captures/                  # Debug captures
+  server.py                    OpenAI-compatible brother gateway
+  router.py                    Text, image, and attachment routing
+
+tools/
+  wechat_ocr.swift             macOS Vision OCR helper
+  wechat_row_badges.swift      Roster badge helper
+  wechat_bubble_roles.swift    Inbound/outbound bubble-role helper
+
+tests/                         Fast policy and concurrency regressions
+selftest.py                    Fake-UI integration scenarios
 ```
 
-Compatibility entrypoints:
+See [Architecture](docs/ARCHITECTURE.md) for boundaries and invariants.
 
-- `main.py` -> `apps.runner.cli`
-- `gateway_control.py` -> `apps.gateway.cli`
+## Requirements
 
-## Runner Process Model
+- macOS with the desktop WeChat application installed and signed in.
+- Python 3.10 or later.
+- Ollama with at least the local fallback model installed.
+- Accessibility and Screen Recording permissions for the actual runner environment.
+- Dependencies in `requirements.txt`.
 
-The auto-reply daemon now runs as a single launchd-managed Python process.
-
-- launchd label: `ai.openclaw.wechat.autoreply.v1`
-- runtime process: `python /Users/shawnwang/Documents/Playground/main.py`
-- there is no longer a separate Terminal host loop that respawns the runner
-
-Notes:
-
-- the launch agent plist under `~/Library/LaunchAgents/` is machine-local and is not versioned in this repository
-- `gateway_control.py runner` reports the actual Python runner state
-- `gateway_control.py runner-start` asks launchd to bootstrap or kickstart the single runner process
-
-## Prerequisites
-
-- macOS (Apple Silicon supported).
-- WeChat desktop app installed and signed in.
-- Python 3.10+ (tested with local `wechat_env` venv).
-- Local Ollama service running.
-- Terminal permissions:
-  - Accessibility
-  - Screen Recording
-
-## Quick Start
-
-### 1) Environment
+Initialize a development environment:
 
 ```bash
 cd /Users/shawnwang/Documents/Playground
 python3 -m venv wechat_env
 ./wechat_env/bin/pip install -r requirements.txt
+ollama pull qwen3.5:9b
 ```
 
-### 2) Configure Runtime
+For local image understanding:
 
-Runtime config file:
+```bash
+ollama pull qwen3-vl:4b
+```
 
-- `/Users/shawnwang/Documents/Playground/runtime/config.json`
+## Local configuration
 
-Whitelist and switch files used by operational flow:
+These files hold machine-specific configuration. Inspect them before replacing them:
 
-- `/Users/shawnwang/Documents/Playground/wechat-whitelist.txt`
-- `/Users/shawnwang/Documents/Playground/wechat-auto-reply-switch.txt`
+| Path | Purpose |
+| --- | --- |
+| `runtime/config.json` | Runtime options, model endpoints, reply style |
+| `wechat-whitelist.txt` | Allowlisted contacts, one per line |
+| `wechat-auto-reply-switch.txt` | `on` or `off` |
+| `runtime/contact_memory.json` | Short-term summaries and local contact profiles |
+| `wechat_autoreply/contact_memory_seed.json` | Versioned default profiles |
+| `~/.openclaw/workspace/wechat-auto-reply-state.json` | Authoritative queue and runner state |
 
-### 3) Start Runner
+Paths under `runtime/`, the switch, and the allowlist belong to the current application root. `allowed_contacts` in `runtime/config.json` is a compatibility field; `wechat-whitelist.txt` takes precedence.
 
-Long-running loop:
+Before the first live run:
+
+1. Set `wechat-auto-reply-switch.txt` to `off`.
+2. Review `wechat-whitelist.txt` and keep only approved contacts.
+3. Verify the WeChat layout and macOS permissions.
+4. Run the tests and a dry run.
+5. Enable auto-reply through the gateway's `on` command.
+
+## Starting the runner
+
+### Development
+
+Long-running foreground process:
 
 ```bash
 ./wechat_env/bin/python main.py
 ```
 
-One-shot tick (debug):
+One tick:
 
 ```bash
-./wechat_env/bin/python apps/runner/cli.py --once --json
+./wechat_env/bin/python main.py --once --json
 ```
 
-Dry-run one-shot (no real paste/send):
+Without real pasting or sending:
 
 ```bash
-./wechat_env/bin/python apps/runner/cli.py --once --dry-run --json
+./wechat_env/bin/python main.py --once --dry-run --json
 ```
 
-## Brother Image-Aware Reply Path
+Use root-level `main.py`; do not execute `apps/runner/cli.py` directly.
 
-The current image-aware path is designed to be additive and low-risk:
+### launchd service on this Mac
 
-- text messages stay on the normal OCR-first flow
-- image-like messages can use the `brother` gateway when enabled and healthy
-- if `brother` is unhealthy, the system falls back to the local small model
+```text
+label:   ai.openclaw.wechat.autoreply.v6
+plist:   ~/Library/LaunchAgents/ai.openclaw.wechat.autoreply.v6.plist
+entry:   ~/.openclaw/workspace/scripts/wechat-autoreply-v6-run.sh
+V7 root: /Users/shawnwang/.openclaw/runtime/wechat-autoreply-v7-app
+```
 
-Current default routing:
+Inspect or reload the service:
 
-- `brother` health endpoint: `http://127.0.0.1:4010/health`
-- `brother` chat endpoint: `http://127.0.0.1:4010/v1/chat/completions`
-- model alias: `brother`
+```bash
+launchctl print gui/$(id -u)/ai.openclaw.wechat.autoreply.v6
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.wechat.autoreply.v6
+```
 
-### How Image Routing Works
+`runtime/runner.lock` prevents two runners in the same application directory. Separate V7/V8 directories have separate locks: never start both against the same WeChat account and shared queue. Use the single existing launchd service when switching versions.
 
-When a reply generation call includes a WeChat screenshot:
+A running process does not reload Python changes automatically. Restart the job after changing the deployed code.
 
-1. The runner chooses a preferred chat screenshot from the current probe.
-2. `wechat_autoreply/erge_client.py` builds a visual focus image.
-3. If the inbound looks like a photo / picture / sticker placeholder:
-   - it crops toward the newest incoming media area
-   - attempts to isolate the likely media block
-   - upscales the crop before sending it to `brother`
-4. If the inbound is normal text:
-   - it still crops away the left roster sidebar
-   - keeps only the right chat panel as supporting evidence
+## Gateway operations
 
-This is intentionally conservative:
-
-- normal text should not accidentally fall into the image path
-- image routing is an enhancement, not a replacement for text handling
-
-### Debug Images Saved To `runtime/captures`
-
-The system preserves generated debug crops so we can inspect what `brother` actually saw.
-
-Common file patterns:
-
-- `*-chat-focus-*.png`
-  - right chat panel only
-- `*-vision-focus-*.png`
-  - generic image-oriented focus crop
-- `*-vision-media-focus-*.png`
-  - media block isolated and upscaled for image-heavy replies
-
-These captures are useful for debugging:
-
-- image message not understood
-- wrong reply grounded in the wrong part of the UI
-- text vs image routing mistakes
-- OCR jitter around mixed image + caption messages
-
-Cleanup keeps only recent captures; older artifacts are pruned by the capture cleanup flow.
-
-## Gateway Command Reference
-
-All control commands go through:
+Run commands from the same application root as the active runner. The development checkout and deployed copy have separate switches, allowlists, configuration, and event files.
 
 ```bash
 ./wechat_env/bin/python gateway_control.py <command>
 ```
 
-Supported commands:
+The examples use the development virtual environment. For a deployed copy, use `/Users/shawnwang/.openclaw/runtime/wechat-autoreply-v6-venv/bin/python` and its `gateway_control.py`.
 
-- `on` -> enable auto-reply runner.
-- `off` -> disable claim/send execution.
-- `status` -> show switch + recent trace lines.
-- `runner` -> show auto-reply process health.
-- `runner-start` -> start runner immediately if offline.
-- `queue` -> show pending queue.
-- `since` -> show how many auto replies were sent since the last `since` check.
-- `diagnose` -> detailed diagnostics and recent events.
-- `reset` -> clear runtime state and restart cleanly.
-- `restart` -> same behavior as reset.
-- `style-show` -> show current reply style instructions.
-- `style-set "<text>"` -> update style instructions.
-- `memory-show <contact>` -> inspect that contact's long-term profile + short-term memory.
-- `memory-set <contact> "<profile>"` -> manually set that contact's long-term profile.
-- `memory-clear <contact>` -> clear short-term memory drift while keeping the profile.
-- `memory-lock <contact>` -> lock that contact's long-term profile.
-- `memory-unlock <contact>` -> unlock that contact's long-term profile.
-- `command` or `/command` -> show command help.
+| Command | Action |
+| --- | --- |
+| `on` / `off` | Enable or disable auto-reply |
+| `status` | Show switch, queue count, recent important events |
+| `runner` | Check runner health |
+| `runner-start` | Start an offline runner |
+| `queue` | Show pending items and due times |
+| `since` | Count automatic sends since the last query |
+| `diagnose` | Detailed diagnostics and recent events |
+| `restart` / `reset` | Clear pending state and restart |
+| `style-show` | Show reply style |
+| `style-set "<rule>"` | Update reply style |
+| `memory-show <contact>` | Show profile and short-term summary |
+| `memory-set <contact> "<profile>"` | Set a long-term profile |
+| `memory-clear <contact>` | Clear short-term memory, retain profile |
+| `memory-clear-all` | Clear all short-term memories, retain profiles |
+| `memory-lock <contact>` | Lock a long-term profile |
+| `memory-unlock <contact>` | Unlock a long-term profile |
+| `command` | Show complete help |
 
 Examples:
 
 ```bash
 ./wechat_env/bin/python gateway_control.py status
-./wechat_env/bin/python gateway_control.py runner
-./wechat_env/bin/python gateway_control.py runner-start
 ./wechat_env/bin/python gateway_control.py queue
-./wechat_env/bin/python gateway_control.py since
 ./wechat_env/bin/python gateway_control.py diagnose
-./wechat_env/bin/python gateway_control.py style-set "Natural, short, conversational, no sentence-final periods"
-./wechat_env/bin/python gateway_control.py memory-show May
-./wechat_env/bin/python gateway_control.py memory-set May "Close friend, casual tone, can tease lightly, avoid sounding oily"
-./wechat_env/bin/python gateway_control.py memory-set "一条正直的咸鱼" "Normal friend tone, stay natural, do not oversell familiarity"
-```
-
-## Per-Contact Memory Model
-
-The current reply stack now has three separate layers:
-
-1. Global style rules
-   - Stored in `runtime/config.json`
-   - Controls how Shawn generally sounds on WeChat
-   - Updated with `style-set`
-
-2. Long-term contact profile
-   - Stored per contact in `runtime/contact_memory.json`
-   - Seeded from `wechat_autoreply/contact_memory_seed.json`
-   - Intended for stable traits:
-     - relationship
-     - preferred tone
-     - common topics
-     - boundaries / things to avoid
-   - Updated manually with `memory-set`
-
-3. Short-term compressed memory
-   - Also stored per contact in `runtime/contact_memory.json`
-   - Automatically refreshed from recent valid chats and successful replies
-   - Used to preserve continuity without stuffing the full history into prompt context
-
-### Why the Memory Is Split This Way
-
-This separation is deliberate.
-
-We do **not** want:
-
-- OCR mistakes to become permanent facts
-- one accidental conversation to define a person's long-term profile
-- the system to "self-train" into a distorted persona over time
-
-So the rule is:
-
-- automatic logic may update **short-term compressed memory**
-- automatic logic may **not** rewrite the **long-term profile**
-
-Long-term profile is treated as a human-owned control surface.
-
-### Drift Safeguards
-
-To reduce memory drift:
-
-- long-term profile is manual-first
-- short-term memory has retention limits and event caps
-- repeated duplicate fragments are de-duplicated
-- obvious OCR noise is filtered before memory write
-- `memory-clear <contact>` lets you wipe short-term drift without deleting the stable profile
-- `memory-lock <contact>` lets you freeze the profile deliberately
-
-### What Gets Injected Into Reply Generation
-
-Before generating a draft, the prompt now contains:
-
-- global style instructions
-- `Contact profile: ...`
-- `Longer-term memory with this contact: ...`
-- recent chat context
-- latest inbound message
-
-This applies to:
-
-- local small-model generation
-- `brother` / multimodal generation
-
-### Recommended Workflow
-
-Use automatic short-term memory for continuity, and only manually author long-term profile when needed.
-
-Examples:
-
-- `May`: "Close friend, casual tone, can tease lightly, avoid sounding too eager"
-- `Darren`: "Bro tone, direct, no long explanations"
-- `Ted Liu`: "Friendly but normal, do not sound dismissive"
-
-If a reply starts feeling "off" because of recent OCR or transient context, do:
-
-```bash
-./wechat_env/bin/python gateway_control.py memory-clear May
-```
-
-If a profile feels good and you do not want it accidentally changed later:
-
-```bash
-./wechat_env/bin/python gateway_control.py memory-lock May
-```
-
-### Default Long-Term Profiles
-
-This branch also supports seeding a baseline long-term profile for each whitelist contact.
-
-The intended use is:
-
-- write a safe default once
-- lock it
-- let the system only evolve the short-term summary
-- keep the baseline versioned in git via `wechat_autoreply/contact_memory_seed.json`
-
-Example patterns:
-
-- family -> warmer, steadier, less teasing
-- customer / work contact -> clearer and slightly more polite
-- close friends -> more casual, more playful, more shorthand
-- sibling -> natural and close, but not greasy or overly dramatic
-
-This gives the model a stable relationship frame without letting OCR accidents rewrite identity-level facts.
-
-### Notes About Contacts With Spaces
-
-For local CLI usage, quote contact names with spaces:
-
-```bash
+./wechat_env/bin/python gateway_control.py style-set "Natural, brief, conversational; omit sentence-final periods"
 ./wechat_env/bin/python gateway_control.py memory-show "Ted Liu"
-./wechat_env/bin/python gateway_control.py memory-set "一条正直的咸鱼" "Normal friend tone, stay natural, lightly playful"
+./wechat_env/bin/python gateway_control.py memory-clear-all
 ```
 
-For OpenClaw chat commands, either quote the contact name or use the `::` separator:
+`restart` and `reset` clear pending items while preserving recent send-safety history. Use them for stuck state, not routine code reloads. Prefer `launchctl kickstart -k` to reload code without clearing the queue.
+
+## Model routing
 
 ```text
-memory-show "Ted Liu"
-memory-set "一条正直的咸鱼" Normal friend tone, stay natural, lightly playful
-memory-set 一条正直的咸鱼 :: Normal friend tone, stay natural, lightly playful
+runner
+  └─ brother gateway: http://127.0.0.1:4010
+       ├─ PC logic primary: qwen3.8:27b @ http://192.168.50.83:11434
+       ├─ local logic fallback: qwen3.5:9b @ http://127.0.0.1:11434
+       └─ local vision: qwen3-vl:4b @ http://127.0.0.1:11434
 ```
 
-## Core Runtime Logic
+Gateway health alone does not establish primary-model availability:
 
-### Tick Gate
+```bash
+curl -s http://127.0.0.1:4010/health
+```
 
-- Runner polls every `poll_interval_seconds` (default `5`).
-- UI actions require idle gate (`idle_threshold_seconds`, default `30`).
+Important fields:
 
-### Unread Trigger
+- `logic_probe.status=healthy`: PC primary is available.
+- `logic_probe.reason=pc_unreachable`: replies fall back to local `qwen3.5:9b`.
+- `logic_probe.reason=pc_model_missing`: PC is reachable, but the configured model tag is missing.
 
-- Menu signal check runs on interval (`menubar_check_interval_seconds`, default `15`).
-- Signal must be actionable before claim flow starts.
+The PC communicates with this Mac over the home LAN. Its DHCP-assigned address must be reflected in the gateway configuration if it changes. Game mode is controlled at `http://192.168.50.83:4011/game-mode`; when enabled, new requests fall back locally. A model unloaded after inactivity needs extra time to cold-start.
 
-### Allowed WeChat Auto-Open Reasons
+When the PC is online and game mode is off, the gateway waits for primary inference, including cold start. An offline PC or active game mode falls back immediately. After the PC accepts a request, 90 seconds without response content triggers fallback (`ERGE_PRIMARY_START_TIMEOUT_SECONDS`). A response that has started streaming does not fall back merely because its total duration exceeds 90 seconds.
 
-Only these are valid:
+Override model names and endpoints with `ERGE_*` environment variables. Defaults are in `erge_gateway/config.py`.
 
-- `claim_scan` -> unread claim scan path.
-- `pending_send_due` -> due-send path.
+Text replies primarily use OCR and chat context. Image/photo/sticker messages can produce focused crops for `brother`; debug images are stored under `runtime/captures/` with `*-chat-focus-*.png`, `*-vision-focus-*.png`, and `*-vision-media-focus-*.png` names.
 
-Any other unexpected open path should be treated as a bug.
+## Important options
 
-### Claim Flow (`claim_scan`)
+| Option | Default | Purpose |
+| --- | ---: | --- |
+| `idle_threshold_seconds` | `30` | Minimum idle time before UI automation |
+| `send_delay_seconds` | `180` | Delay after a draft is queued |
+| `poll_interval_seconds` | `5` | Runner tick interval |
+| `menubar_check_interval_seconds` | `15` | Dock/menu sampling interval |
+| `passive_roster_sweep_enabled` | `true` | Recover from missed Dock signals |
+| `roster_sweep_interval_seconds` | `60` | Background roster preflight interval |
+| `badge_stability_frames` | `2` | Required stable numeric badge frames |
+| `claim_selection_retry_max_attempts` | `2` | Maximum uncertain-selection claim rounds |
+| `claim_selection_retry_ttl_seconds` | `300` | Claim candidate lifetime after a click clears its badge |
+| `pending_stale_ttl_seconds` | `86400` | Maximum pending lifetime |
+| `recent_auto_outbound_ttl_seconds` | `21600` | Recent send/self-echo history lifetime |
+| `send_verify_retry_seconds` | `45` | Delay before verifying an uncertain send |
+| `send_confirmation_max_attempts` | `3` | Maximum UI confirmations, including the immediate check |
+| `send_confirmation_timeout_seconds` | `180` | Stop reopening and infer sent after a successful action without a visible bubble |
+| `send_max_attempts` | `2` | Maximum send actions while the draft remains in the input box |
+| `capture_cleanup_interval_seconds` | `43200` | Capture/event cleanup interval: 12 hours |
+| `capture_retention_days` | `1` | Capture/event retention in days |
+| `ollama_model` | `qwen3.5:9b` | Local text model |
+| `erge_enabled` | `true` | Enable brother routing |
+| `reply_context_messages` | `4` | Recent messages supplied to the model |
+| `contact_memory_max_events` | `6` | Maximum short-term events per contact |
+| `contact_memory_retention_days` | `3` | Short-term memory lifetime |
+| `max_reply_chars` | `90` | Reply length limit |
 
-When triggered:
+## State, logs, and captures
 
-1. Open WeChat.
-2. Scan list rows for unread red-dot candidates.
-3. For each unread row:
-   - Whitelist contact: open chat, extract inbound + recent context, draft reply, enqueue pending.
-   - Non-whitelist contact: open row to clear unread only.
-4. Hide WeChat and restore previous front app.
+| Path | Contents |
+| --- | --- |
+| `runtime/events.jsonl` | Primary structured events |
+| `~/.openclaw/logs/wechat-autoreply-events-fallback.jsonl` | Fallback when primary event logging fails |
+| `~/.openclaw/logs/wechat-autoreply-v6.log` | launchd stdout |
+| `~/.openclaw/logs/wechat-autoreply-v6.err.log` | launchd stderr |
+| `runtime/captures/` | Roster, chat-panel, model-focus captures |
+| `~/.openclaw/workspace/wechat-auto-reply-state.json` | Authoritative pending queue and runner state |
 
-For image-like inbound messages:
-
-- the claim step may preserve placeholder text such as `表情包` or `[Photo]`
-- if a richer screenshot path is available, reply generation can use visual evidence through `brother`
-- this means image message handling currently depends on both OCR text and the saved chat screenshot
-
-### Pending Queue Model
-
-- Queue is FIFO.
-- Due time: `send_delay_seconds` (default `180` seconds).
-- Message-change debounce: `pending_change_debounce_frames` (default `3`) + `pending_change_min_votes` (default `2`) with similarity guard `pending_change_similarity_threshold` (default `0.9`).
-- Stale cleanup: `pending_stale_ttl_seconds` (default `86400` seconds).
-- Queue state is persisted under runtime state.
-
-### Due-Send Flow (`pending_send_due`)
-
-When queue head is due and idle gate passes:
-
-1. Open WeChat and select target contact.
-2. Re-read chat panel for latest inbound/outbound.
-3. Run cancellation checks.
-4. If safe, focus input, paste draft, send.
-5. Verify send result; retry if needed.
-6. Hide WeChat and restore foreground app.
-
-## Cancellation Rules
-
-A pending item is cancelled when any of the following is detected:
-
-- Manual reply already exists (`manual_reply_detected`).
-- Input box has manual content (`input_box_modified`).
-- Inbound becomes empty or invalid during recheck.
-- Message fingerprint changes and flow requires refresh/cancel.
-- Probe/read failures exceed retry policy.
-
-## OCR and UI Reliability Notes
-
-The system includes protections against OCR jitter and UI ambiguity:
-
-- Row red-dot detection uses constrained ROI + morphology thresholding.
-- Row red-dot detection is resolution/HDR adaptive (dynamic scan window + strict/relaxed color passes).
-- Row unread now requires numeric badge evidence near avatar (red badge + white digit strokes), not just red pixels.
-- Bubble role helper distinguishes inbound/outbound by visual structure.
-- Inbound text is normalized and fingerprinted.
-- Recheck voting path (`recheck_vote_frames`) stabilizes noisy reads.
-- Empty panel path triggers reselect attempt before cancel.
-- Dock badge OCR uses dynamic upscaling + adaptive threshold offset for display-scale changes.
-- Pending recheck now suppresses some short tail-fragment regressions (for example when a long sentence is re-read as only the last few characters).
-
-Image-path specific reliability notes:
-
-- WeChat roster screenshots are cropped to remove the left contact list before multimodal analysis.
-- Photo / sticker-like messages can trigger a media-focused crop instead of sending the full UI image.
-- Media-focused crops are upscaled before being sent to `brother`.
-- The current system is better at "image classification + coarse semantic grounding" than exact OCR from inside images.
-- If image meaning is unclear, the model should answer conservatively rather than hallucinate details.
-
-Recent hardening included input-box probe sentinel behavior:
-
-- Clipboard sentinel is written before `Cmd+A/C`.
-- If copy fails and sentinel remains, it is treated as empty input.
-- This avoids stale clipboard false positives for `input_box_modified`.
-
-## Config Reference
-
-Primary runtime keys in `runtime/config.json`:
-
-- `enabled`: master switch.
-- `idle_threshold_seconds`: minimum idle before UI automation.
-- `send_delay_seconds`: draft delay before send.
-- `pending_refresh_delay_seconds`: delay when message changed.
-- `send_verify_retry_seconds`: delay before send verification retry.
-- `send_max_attempts`: retry budget for unconfirmed sends.
-- `menubar_check_interval_seconds`: unread signal sampling interval.
-- `pending_stale_ttl_seconds`: stale pending GC TTL.
-- `allowed_contacts`: whitelist contacts.
-- `ollama_url`, `ollama_model`: local LLM endpoint/model.
-- `reply_context_messages`: number of recent chat lines provided to LLM context window.
-- `reply_style_instructions`: reply tone instructions.
-- `emoji_pack_zip_path`: emoji pack zip path.
-- `reply_emoji_enabled`, `reply_emoji_min_count`, `reply_emoji_max_count`: emoji policy.
-- `erge_enabled`: enable multimodal brother routing.
-- `erge_model`: model alias used by the brother gateway.
-- `erge_gateway_url`: multimodal generation endpoint.
-- `erge_health_url`: health check endpoint for brother availability.
-- `erge_health_timeout_seconds`, `erge_health_cache_seconds`: brother health probing controls.
-- `erge_request_timeout_seconds`: brother request timeout.
-
-## Runtime Files and Meanings
-
-- `runtime/config.json`: mutable runtime config.
-- `runtime/state.json`: latest state snapshot.
-- `runtime/events.jsonl`: event timeline for diagnostics.
-- `runtime/captures/`: OCR/debug images for investigation.
-- `runtime/runner.lock`: single-runner process lock.
-
-State file path used in OpenClaw workflow:
-
-- `/Users/shawnwang/.openclaw/workspace/wechat-auto-reply-state.json`
-
-## Event Log Cheatsheet
-
-High-signal events:
-
-- `menu_bar_checked`
-- `wechat_window_action` (`reason=claim_scan|pending_send_due`)
-- `claim_candidates`
-- `draft_saved_locally`
-- `pending_recheck_voted`
-- `pending_message_changed_recheck`
-- `auto_sent`
-- `pending_cancelled`
-- `claim_logic_bug`
+| Event | Meaning |
+| --- | --- |
+| `menu_bar_checked` | Dock/menu unread sample |
+| `passive_roster_preflight` | Roster check without focusing WeChat |
+| `wechat_login_required` | Runner alive, WeChat login required |
+| `wechat_window_action` | Foreground enter/leave and its reason |
+| `claim_candidates` | Candidate rows detected this tick |
+| `draft_saved_locally` | Draft queued |
+| `pending_recheck_voted` | Multi-frame pre-send result |
+| `pending_message_changed_recheck` | Message changed; defer judgment |
+| `auto_sent` | Confirmed send |
+| `pending_cancelled` | Pending item cancelled by safety rules |
+| `runtime_cleanup_failed` | Cleanup failed; runner continues |
+| `runner_error` | Tick failed |
 
 Typical successful sequence:
 
-1. `menu_bar_checked signal=<n>`
-2. `wechat_window_action reason=claim_scan`
-3. `claim_candidates`
-4. `draft_saved_locally`
-5. `wechat_window_action reason=pending_send_due`
-6. `pending_recheck_voted`
-7. `auto_sent`
+```text
+menu_bar_checked
+-> claim_candidates
+-> draft_saved_locally
+-> pending_recheck_voted
+-> auto_sent
+```
 
 ## Troubleshooting
 
-### WeChat opens but does not send
-
-Check `diagnose` and `events.jsonl` for:
-
-- `pending_cancelled reason=input_box_modified`
-- `pending_cancelled reason=manual_reply_detected`
-- `pending_message_changed_recheck`
-
-### Queue is not empty but nothing sends
-
-Confirm:
-
-- `enabled` is true.
-- Idle gate is actually satisfied.
-- No repeated cancellation events are firing.
-- WeChat panel selection is correct for the contact.
-
-### Unread exists but claim does not trigger
-
-Check:
-
-- Menu signal sampling events (`menu_bar_checked`).
-- macOS permissions (Screen Recording, Accessibility).
-- Current display/scale changes that may impact OCR.
-
-### Repeated empty scans
-
-Investigate:
-
-- `pending_reselect_empty_panel` and its result.
-- Unexpected UI layout changes (window size, split chat windows).
-
-## Maintenance Workflow
-
-Recommended operational loop:
-
-1. Before testing, run `restart`.
-2. Trigger a known whitelist message.
-3. Inspect `queue`.
-4. Wait due time and inspect `diagnose`.
-5. Verify `auto_sent` or explicit cancellation reason.
-
-Useful checks:
+### New message, no reply
 
 ```bash
-./wechat_env/bin/python -m py_compile wechat_autoreply/orchestrator.py wechat_autoreply/wechat_ui.py
+./wechat_env/bin/python gateway_control.py status
+./wechat_env/bin/python gateway_control.py runner
+./wechat_env/bin/python gateway_control.py queue
 ./wechat_env/bin/python gateway_control.py diagnose
+tail -n 100 runtime/events.jsonl
 ```
 
-## Development and Git Notes
+Check, in order: the switch, runner health, login status, allowlist membership, numeric-badge evidence, draft creation, sufficient idle time, and cancellation or message-change events.
 
-- Keep switch/whitelist local files out of commits when they include private data.
-- Prefer committing deterministic logic changes and docs separately.
-- For release snapshots, push both feature branch and release branch as needed.
+### Runner alive, WeChat login required
 
-## Legal and Privacy Reminder
+`status` may display the literal UI warning `微信需要登录`; diagnostics report `last_error: wechat_login_required`. Sign into WeChat. The next successful background preflight clears the warning. Restarting the runner does not bypass login.
 
-This project automates personal messaging behavior.  
-Use responsibly, comply with local laws/platform policies, and avoid sending sensitive data through logs or prompts.
+### WeChat opens without a new message
+
+Inspect `wechat_window_action`. Normal reasons are `claim_scan` and `pending_send_due`. If `claim_scan` follows `badge_detected=false`, retain the events and capture as a regression sample.
+
+### Red avatar mistaken for unread
+
+Inspect `claim_candidates` and its roster capture. Detection requires badge shape and white digit strokes. Warm avatar color alone is insufficient, and confirmed digits cannot be rejected by the whole row's red-pixel ratio. See `badge_detection.py` and `claim_policy.py`.
+
+### Pending items do not send
+
+Check idle time, the earliest `due_at`, repeated message-change or selection-retry events, manual replies, input-box content, and the selected contact. Sleeping items must not block due contacts; approximate OCR titles should normalize without repeatedly clicking the active chat.
+
+### Slow model replies
+
+Check the brother gateway's `logic_probe`. Local fallback on the M4 Mac mini has different speed and reply quality from the PC primary.
+
+### Event log stops growing
+
+```bash
+tail -n 50 runtime/events.jsonl
+tail -n 50 ~/.openclaw/logs/wechat-autoreply-events-fallback.jsonl
+tail -n 50 ~/.openclaw/logs/wechat-autoreply-v6.err.log
+```
+
+Event writes and retention share a file lock and briefly retry macOS `EAGAIN`/`EDEADLK`. Primary logging failures must not stop the runner.
+
+## Validation
+
+Before committing or reloading deployed code:
+
+```bash
+./wechat_env/bin/python -m unittest discover -s tests -v
+./wechat_env/bin/python selftest.py
+./wechat_env/bin/python -m py_compile wechat_autoreply/*.py tests/*.py
+git diff --check
+```
+
+Check the live service:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.wechat.autoreply.v6
+launchctl print gui/$(id -u)/ai.openclaw.wechat.autoreply.v6 | grep -E 'state =|pid =|runs ='
+tail -n 30 runtime/events.jsonl
+```
+
+Coverage includes unread/preflight policies, warm-avatar badges, queue scheduling and fingerprints, OCR consensus, manual-reply evidence, send confirmation, recent self-echo history, concurrent event logging/cleanup, context ordering, and known/unknown sender roles.
+
+## Contact memory
+
+Reply context has three layers:
+
+1. Global style rules in `runtime/config.json`.
+2. Manually maintained long-term contact profiles.
+3. Automatically summarized, bounded short-term chat memory.
+
+Automatic logic updates short-term summaries, never long-term profiles. OCR errors or a one-off conversation must not permanently redefine a relationship.
+
+Only the newest inbound message and the actual reply become fresh short-term memory. Historical screen context is used for the current generation without being recorded again as new memory. If old jokes or unrelated situations keep resurfacing:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-clear-all
+```
+
+Clear an individual contact while retaining the long-term profile:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-clear May
+./wechat_env/bin/python gateway_control.py memory-clear "Ted Liu"
+```
+
+Screen context is ordered by position. `[CONTACT_SENT]` marks contact history, `[YOU_SENT]` marks our history, and `[LATEST_CONTACT_SENT]` is the only reply target. Unknown sender roles are excluded.
+
+Quote contact names containing spaces:
+
+```bash
+./wechat_env/bin/python gateway_control.py memory-show "Ted Liu"
+./wechat_env/bin/python gateway_control.py memory-set "Ted Liu" "Friend; natural conversation, not overly enthusiastic"
+```
+
+## Maintenance documentation
+
+- [V7 Stable Baseline](docs/V7_BASELINE.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Operations Runbook](docs/OPERATIONS.md)
+- [Incident-Derived Invariants](docs/INCIDENT_INVARIANTS.md)
+
+## Privacy and operating boundaries
+
+- Allowlists, contact memories, captures, and event logs can contain private information.
+- Check that runtime data, local control files, captures, and logs are not tracked before committing.
+- Do not publish real conversations, endpoint credentials, or private contact information.
+- WeChat updates, display scaling, and window layouts can change recognition behavior.
+- Respect applicable laws, platform rules, and recipients' reasonable expectations.
