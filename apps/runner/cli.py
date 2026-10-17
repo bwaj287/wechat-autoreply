@@ -26,7 +26,7 @@ def acquire_lock() -> tuple[Path, object]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the WeChat auto-reply V1 runner.")
+    parser = argparse.ArgumentParser(description="Run the WeChat auto-reply V6 runner.")
     parser.add_argument("--once", action="store_true", help="run a single tick and exit")
     parser.add_argument("--dry-run", action="store_true", help="never paste or send a real reply")
     parser.add_argument("--json", action="store_true", help="print the tick result as JSON")
@@ -54,4 +54,3 @@ def main() -> int:
             time.sleep(max(interval, 1.0))
     finally:
         lock_handle.close()
-

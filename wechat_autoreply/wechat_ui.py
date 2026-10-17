@@ -12,7 +12,9 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
+from .badge_detection import fallback_row_badge_detection as _fallback_row_badge_detection
 from .config_store import load_config, save_config
+from .json_output import load_first_json_object
 from .ocr import ocr_image
 from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, PEEKABOO, WECHAT_APP
 from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
@@ -21,6 +23,7 @@ IGNORE_TEXTS = {
     "Search",
     "Hold to Fn to use voice input",
 }
+LOGIN_ENTRY_TEXTS = {"enter weixin", "enter wechat"}
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 DOCK_WECHAT_NAMES = ["WeChat", "Weixin"]
 TEXT_SIGNAL_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
@@ -60,6 +63,13 @@ TARGET_ROSTER_WINDOW_HEIGHT = 820
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def wechat_login_required(obs_list: list[dict[str, Any]]) -> bool:
+    texts = {normalize_text(str(item.get("text") or "")) for item in obs_list}
+    if texts & LOGIN_ENTRY_TEXTS:
+        return True
+    return "switch account" in texts and "transfer files only" in texts
 
 
 def normalize_name_for_match(text: str) -> str:
@@ -322,7 +332,7 @@ def _write_clipboard_text(text: str) -> None:
 
 
 def list_wechat_windows() -> list[dict[str, Any]]:
-    payload = json.loads(
+    payload = load_first_json_object(
         run_peekaboo_variants(
             peekaboo_commands(["list", "windows", "--app", WECHAT_APP, "--json"]),
             timeout=120,
@@ -547,6 +557,33 @@ def capture_window(path: Path, info: dict[str, Any]) -> Path:
     return path
 
 
+def probe_roster_background() -> dict[str, Any]:
+    """Inspect roster badges without activating or focusing WeChat."""
+    windows = list_wechat_windows()
+    roster_info = choose_roster_window(windows)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    roster_path = CAPTURE_DIR / f"wechat-roster-background-{timestamp}.png"
+    capture_window(roster_path, roster_info)
+    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    if wechat_login_required(roster_obs):
+        return {
+            "status": "login_required",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "visibleChats": [],
+        }
+    chats = annotate_unread_chats(
+        extract_visible_chats(roster_obs, roster_info),
+        roster_path,
+    )
+    return {
+        "status": "ok",
+        "window": roster_info,
+        "screenshot": str(roster_path),
+        "visibleChats": chats,
+    }
+
+
 def _is_time(text: str) -> bool:
     return bool(TIME_RE.fullmatch(text.strip().rstrip(".")))
 
@@ -735,7 +772,7 @@ def _annotate_bubble_roles(items: list[dict[str, Any]], image_path: Path) -> Non
             timeout=120,
             check=True,
         )
-        role_payload = json.loads(proc.stdout)
+        role_payload = load_first_json_object(proc.stdout)
     except Exception:
         return
     finally:
@@ -884,6 +921,7 @@ def annotate_unread_chats(
                 "name": chat["name"],
                 "rowTop": round(prev_mid, 4),
                 "rowBottom": round(next_mid, 4),
+                "nameTop": float(chat.get("ocrTop", 0.0) or 0.0),
                 "nameLeft": float(chat.get("ocrLeft", 0.15) or 0.15),
             }
         )
@@ -911,177 +949,6 @@ def annotate_unread_chats(
     return chats
 
 
-def _is_red_badge_pixel(rgb: tuple[int, int, int]) -> bool:
-    r, g, b = rgb
-    max_v = max(r, g, b)
-    min_v = min(r, g, b)
-    if max_v <= 92:
-        return False
-    saturation = (max_v - min_v) / max_v if max_v else 0.0
-    return saturation > 0.20 and r > g + 28 and r > b + 28
-
-
-def _is_white_digit_pixel(rgb: tuple[int, int, int]) -> bool:
-    r, g, b = rgb
-    max_v = max(r, g, b)
-    min_v = min(r, g, b)
-    luminance = (r + g + b) / 3.0
-    saturation = (max_v - min_v) / max_v if max_v else 0.0
-    return luminance > 205 and saturation < 0.34
-
-
-def _count_light_pixels(image: Image.Image, threshold: int) -> int:
-    pixels = image.load()
-    width, height = image.size
-    count = 0
-    for y in range(height):
-        for x in range(width):
-            if int(pixels[x, y]) >= threshold:
-                count += 1
-    return count
-
-
-def _count_dark_pixels(image: Image.Image, threshold: int) -> int:
-    pixels = image.load()
-    width, height = image.size
-    count = 0
-    for y in range(height):
-        for x in range(width):
-            if int(pixels[x, y]) <= threshold:
-                count += 1
-    return count
-
-
-def _enhanced_digit_equivalent(crop: Image.Image) -> int:
-    grayscale = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=2)
-    inverted = ImageOps.invert(grayscale)
-    scale = 8
-    gray_up = grayscale.resize((grayscale.width * scale, grayscale.height * scale), Image.Resampling.BICUBIC)
-    inverted_up = inverted.resize((inverted.width * scale, inverted.height * scale), Image.Resampling.BICUBIC)
-    # Use a high threshold so we only keep the brightest digit strokes after
-    # enhancement. Red-heavy avatars produce much larger bright regions here and
-    # will be rejected by the upper bound in the caller.
-    light_equivalent = _count_light_pixels(gray_up, 220) // (scale * scale)
-    dark_equivalent = _count_dark_pixels(inverted_up, 35) // (scale * scale)
-    return min(light_equivalent, dark_equivalent)
-
-
-def _connected_components(mask: list[list[bool]]) -> list[dict[str, int]]:
-    if not mask or not mask[0]:
-        return []
-    height = len(mask)
-    width = len(mask[0])
-    visited = [[False] * width for _ in range(height)]
-    components: list[dict[str, int]] = []
-    for y in range(height):
-        for x in range(width):
-            if visited[y][x] or not mask[y][x]:
-                continue
-            stack = [(x, y)]
-            visited[y][x] = True
-            count = 0
-            min_x = max_x = x
-            min_y = max_y = y
-            while stack:
-                cx, cy = stack.pop()
-                count += 1
-                min_x = min(min_x, cx)
-                max_x = max(max_x, cx)
-                min_y = min(min_y, cy)
-                max_y = max(max_y, cy)
-                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nx = cx + dx
-                    ny = cy + dy
-                    if 0 <= nx < width and 0 <= ny < height and not visited[ny][nx] and mask[ny][nx]:
-                        visited[ny][nx] = True
-                        stack.append((nx, ny))
-            components.append(
-                {
-                    "count": count,
-                    "minX": min_x,
-                    "maxX": max_x,
-                    "minY": min_y,
-                    "maxY": max_y,
-                    "width": max_x - min_x + 1,
-                    "height": max_y - min_y + 1,
-                }
-            )
-    return components
-
-
-def _fallback_row_badge_detection(image: Image.Image, row: dict[str, Any]) -> dict[str, Any] | None:
-    width, height = image.size
-    row_top = float(row.get("rowTop", 0.0) or 0.0)
-    row_bottom = float(row.get("rowBottom", 0.0) or 0.0)
-    name_left = float(row.get("nameLeft", 0.15) or 0.15)
-    row_span = max(0.02, row_bottom - row_top)
-    # Tight badge window: right beside the contact name, only across the upper
-    # portion of the row. This avoids merging the badge with red-heavy avatars.
-    scan_pad_left = max(0.018, min(0.022, row_span * 0.16))
-    scan_pad_right = max(0.018, min(0.024, row_span * 0.18))
-    x0 = max(0, int(round((name_left - scan_pad_left) * width)))
-    x1 = min(width, int(round((name_left + scan_pad_right) * width)))
-    y0 = max(0, int(round(max(0.0, row_top - 0.012) * height)))
-    y1 = min(height, int(round(min(1.0, row_top + max(0.085, min(0.135, row_span * 0.78))) * height)))
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return None
-    region_h = max(1, y1 - y0)
-    mask: list[list[bool]] = []
-    for py in range(y0, y1):
-        row_mask: list[bool] = []
-        for px in range(x0, x1):
-            row_mask.append(_is_red_badge_pixel(image.getpixel((px, py))))
-        mask.append(row_mask)
-    best: dict[str, int] | None = None
-    for component in _connected_components(mask):
-        comp_w = int(component["width"])
-        comp_h = int(component["height"])
-        count = int(component["count"])
-        if count < 20 or count > 320:
-            continue
-        if comp_w < 9 or comp_w > 20 or comp_h < 9 or comp_h > 28:
-            continue
-        fill_ratio = count / max(1, comp_w * comp_h)
-        aspect = comp_w / max(1, comp_h)
-        center_y = ((component["minY"] + component["maxY"]) / 2.0) / region_h
-        if fill_ratio < 0.16 or fill_ratio > 0.86:
-            continue
-        if aspect < 0.45 or aspect > 1.70:
-            continue
-        if center_y < 0.08 or center_y > 0.92:
-            continue
-        if best is None or count > int(best["count"]):
-            best = component
-    if best is None:
-        return None
-    pad_x = max(1, int(best["width"] * 0.16))
-    pad_y = max(1, int(best["height"] * 0.16))
-    ix0 = x0 + int(best["minX"]) + pad_x
-    ix1 = x0 + int(best["maxX"]) - pad_x + 1
-    iy0 = y0 + int(best["minY"]) + pad_y
-    iy1 = y0 + int(best["maxY"]) - pad_y + 1
-    if ix1 <= ix0 or iy1 <= iy0:
-        return None
-    digit_pixels = 0
-    for py in range(iy0, iy1):
-        for px in range(ix0, ix1):
-            if _is_white_digit_pixel(image.getpixel((px, py))):
-                digit_pixels += 1
-    if digit_pixels < 10:
-        crop = image.crop((ix0, iy0, ix1, iy1))
-        enhanced_equivalent = _enhanced_digit_equivalent(crop)
-        if digit_pixels >= 8 and 3 <= enhanced_equivalent <= 10:
-            digit_pixels = max(digit_pixels, enhanced_equivalent)
-        else:
-            return None
-    return {
-        "redPixelCount": int(best["count"]),
-        "digitPixelCount": int(digit_pixels),
-        "numericBadge": True,
-        "unread": True,
-    }
-
-
 def find_chat(chats: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
     target_key = _canonical_name_key(target)
     if target_key:
@@ -1092,6 +959,101 @@ def find_chat(chats: list[dict[str, Any]], target: str) -> dict[str, Any] | None
         if names_match(chat["name"], target):
             return chat
     return None
+
+
+def _system_events(script: str) -> None:
+    try:
+        run(["osascript", "-e", script], check=False, timeout=10)
+    except Exception:
+        pass
+
+
+def _press_escape() -> None:
+    _system_events('tell application "System Events" to key code 53')
+
+
+def _command_a() -> None:
+    _system_events('tell application "System Events" to keystroke "a" using {command down}')
+
+
+def _command_v() -> None:
+    _system_events('tell application "System Events" to keystroke "v" using {command down}')
+
+
+def _roster_search_coords(window_info: dict[str, Any]) -> tuple[int, int]:
+    width = int(window_info.get("width", 0) or 0)
+    height = int(window_info.get("height", 0) or 0)
+    x_offset = min(220, max(135, int(width * 0.17)))
+    y_offset = min(42, max(26, int(height * 0.04)))
+    return int(window_info.get("x", 0) or 0) + x_offset, int(window_info.get("y", 0) or 0) + y_offset
+
+
+def _select_chat_via_search(
+    target: str,
+    roster_info: dict[str, Any],
+    roster_path: Path,
+    *,
+    sleep_after_click: float,
+    badge_rescue_targets: list[str] | None,
+) -> dict[str, Any]:
+    previous_clipboard = _read_clipboard_text()
+    try:
+        current_window_id = int(roster_info.get("window_id", 0) or 0)
+        search_x, search_y = _roster_search_coords(roster_info)
+        click_coords(search_x, search_y, window_id=current_window_id, auto_focus=False)
+        time.sleep(0.15)
+        _command_a()
+        time.sleep(0.05)
+        _write_clipboard_text(target)
+        time.sleep(0.05)
+        _command_v()
+        time.sleep(max(0.45, min(1.0, sleep_after_click)))
+
+        roster_info = ensure_main_roster_window()
+        capture_window(roster_path, roster_info)
+        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+        chats = annotate_unread_chats(
+            extract_visible_chats(roster_obs, roster_info),
+            roster_path,
+            fallback_target_names=badge_rescue_targets,
+        )
+        match = find_chat(chats, target)
+        if not match:
+            _press_escape()
+            return {
+                "selectedChat": "",
+                "window": roster_info,
+                "rosterObs": roster_obs,
+                "visibleChats": chats,
+            }
+
+        current_window_id = int(roster_info.get("window_id", 0) or 0)
+        click_coords(
+            match["click"]["x"],
+            match["click"]["y"],
+            window_id=current_window_id,
+            auto_focus=False,
+        )
+        selected_chat = str(match.get("name") or target)
+        time.sleep(0.2)
+        _press_escape()
+        time.sleep(max(sleep_after_click, 0.2))
+        roster_info = ensure_main_roster_window()
+        capture_window(roster_path, roster_info)
+        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+        chats = annotate_unread_chats(
+            extract_visible_chats(roster_obs, roster_info),
+            roster_path,
+            fallback_target_names=badge_rescue_targets,
+        )
+        return {
+            "selectedChat": selected_chat,
+            "window": roster_info,
+            "rosterObs": roster_obs,
+            "visibleChats": chats,
+        }
+    finally:
+        _write_clipboard_text(previous_clipboard)
 
 
 def click_coords(
@@ -1120,7 +1082,7 @@ def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
         width = obs["bbox"]["w"]
         # Only trust the actual chat-title strip at the upper-left of the right panel.
         # This excludes the green "new message(s)" banner on the upper-right.
-        if left < 0.33 or left > 0.62 or top > 0.09 or width < 0.02:
+        if left < 0.25 or left > 0.62 or top > 0.06 or width < 0.02:
             continue
         if _is_time(text):
             continue
@@ -1243,6 +1205,8 @@ def _resolve_text_bubble_role(
         fallback_inbound_right = 0.66
 
     if role == "inbound" and (left >= force_outbound_left or right >= force_outbound_right):
+        if panel_kind != "roster":
+            return "outbound"
         return "unknown"
     elif role == "outbound" and left <= force_inbound_left and right <= force_inbound_right:
         return "unknown"
@@ -1320,7 +1284,7 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
         width = obs["bbox"]["w"]
         if top < 0.11 or top > 0.90:
             continue
-        if left < 0.38 or width < 0.02:
+        if left < 0.30 or width < 0.02:
             continue
         if _is_time(text) or text == selected_title:
             continue
@@ -1346,7 +1310,7 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
             width=float(width),
             green_pixels=int(obs.get("greenPixels", 0) or 0),
             gray_pixels=int(obs.get("grayPixels", 0) or 0),
-            panel_kind="roster",
+            panel_kind="chat",
         )
         if bubble_role == "outbound":
             outbound_raw.append(bucket)
@@ -1560,6 +1524,19 @@ def probe(
     roster_path = CAPTURE_DIR / f"wechat-roster-{timestamp}.png"
     capture_window(roster_path, roster_info)
     roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    if wechat_login_required(roster_obs):
+        return {
+            "status": "login_required",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "screenshots": {"roster": str(roster_path), "chat": ""},
+            "visibleChats": [],
+            "selectedChat": "",
+            "selectedChatRequested": select_chat or "",
+            "activeChat": "",
+            "selectionConfirmed": False,
+            "chatPanel": {},
+        }
     chats = annotate_unread_chats(
         extract_visible_chats(roster_obs, roster_info),
         roster_path,
@@ -1582,44 +1559,61 @@ def probe(
             click_x = int(click_hint.get("x", 0) or 0)
             click_y = int(click_hint.get("y", 0) or 0)
             use_click_hint = click_x > 0 and click_y > 0
+            selected_via_search = False
             # Always prefer a fresh click target from the current roster snapshot.
             # Stale coordinates from an older probe can drift into the search-row
             # action area (such as the "+" quick-actions button) after window
             # focus/resize/list movement.
             if not match and not use_click_hint:
-                return {
-                    "status": "chat_not_visible",
-                    "target": select_chat,
-                    "window": roster_info,
-                    "screenshot": str(roster_path),
-                    "visibleChats": chats,
-                }
+                search_result = _select_chat_via_search(
+                    select_chat,
+                    roster_info,
+                    roster_path,
+                    sleep_after_click=sleep_after_click,
+                    badge_rescue_targets=badge_rescue_targets,
+                )
+                selected_chat = str(search_result.get("selectedChat") or "")
+                roster_info = dict(search_result.get("window") or roster_info)
+                roster_obs = list(search_result.get("rosterObs") or roster_obs)
+                chats = list(search_result.get("visibleChats") or chats)
+                if not selected_chat:
+                    return {
+                        "status": "chat_not_visible",
+                        "target": select_chat,
+                        "window": roster_info,
+                        "screenshot": str(roster_path),
+                        "visibleChats": chats,
+                    }
+                match = find_chat(chats, select_chat)
+                use_click_hint = False
+                selected_via_search = True
             current_window_id = int(roster_info.get("window_id", 0) or 0)
-            if match:
-                click_coords(
-                    match["click"]["x"],
-                    match["click"]["y"],
-                    window_id=current_window_id,
-                    auto_focus=False,
+            if not selected_via_search:
+                if match:
+                    click_coords(
+                        match["click"]["x"],
+                        match["click"]["y"],
+                        window_id=current_window_id,
+                        auto_focus=False,
+                    )
+                    selected_chat = match["name"]
+                else:
+                    click_coords(
+                        click_x,
+                        click_y,
+                        window_id=current_window_id,
+                        auto_focus=False,
+                    )
+                    selected_chat = select_chat
+                time.sleep(max(sleep_after_click, 0.2))
+                roster_info = ensure_main_roster_window()
+                capture_window(roster_path, roster_info)
+                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+                chats = annotate_unread_chats(
+                    extract_visible_chats(roster_obs, roster_info),
+                    roster_path,
+                    fallback_target_names=badge_rescue_targets,
                 )
-                selected_chat = match["name"]
-            else:
-                click_coords(
-                    click_x,
-                    click_y,
-                    window_id=current_window_id,
-                    auto_focus=False,
-                )
-                selected_chat = select_chat
-            time.sleep(max(sleep_after_click, 0.2))
-            roster_info = ensure_main_roster_window()
-            capture_window(roster_path, roster_info)
-            roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
-            chats = annotate_unread_chats(
-                extract_visible_chats(roster_obs, roster_info),
-                roster_path,
-                fallback_target_names=badge_rescue_targets,
-            )
 
     windows = list_wechat_windows()
     chat_window = choose_chat_window(windows)

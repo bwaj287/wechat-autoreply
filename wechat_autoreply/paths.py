@@ -9,11 +9,12 @@ TOOLS_DIR = PROJECT_ROOT / "tools"
 
 CONFIG_PATH = RUNTIME_DIR / "config.json"
 EVENTS_PATH = RUNTIME_DIR / "events.jsonl"
+EVENTS_LOCK_PATH = RUNTIME_DIR / "events.lock"
 CONTACT_MEMORY_PATH = RUNTIME_DIR / "contact_memory.json"
 CONTACT_MEMORY_SEED_PATH = PROJECT_ROOT / "wechat_autoreply" / "contact_memory_seed.json"
 LOCK_PATH = RUNTIME_DIR / "runner.lock"
-WHITELIST_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-whitelist.txt")
-SWITCH_PATH = Path("/Users/shawnwang/Documents/Playground/wechat-auto-reply-switch.txt")
+WHITELIST_PATH = PROJECT_ROOT / "wechat-whitelist.txt"
+SWITCH_PATH = PROJECT_ROOT / "wechat-auto-reply-switch.txt"
 STATE_PATH = Path("/Users/shawnwang/.openclaw/workspace/wechat-auto-reply-state.json")
 
 PEEKABOO = Path("/opt/homebrew/bin/peekaboo")
@@ -30,6 +31,7 @@ def ensure_runtime_dirs() -> None:
         CAPTURE_DIR,
         DEBUG_DIR,
         LOG_DIR,
+        EVENTS_LOCK_PATH.parent,
         STATE_PATH.parent,
         WHITELIST_PATH.parent,
         SWITCH_PATH.parent,
