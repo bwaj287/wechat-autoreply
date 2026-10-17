@@ -3,7 +3,7 @@
 Freeze the V7 code running on this Mac on 2026-10-17 as the comparison and rollback baseline for V8 simplification.
 
 - Previously deployed code: `1d2f044` (`fix: keep runtime control files project-relative`).
-- Stable development branch: `feature/v7_iteration`; release branch: `release`; stable mainline: `main`.
+- Stable development branch: `feature/v7_iteration`; release branch: `release/wechat-autoreply-v7`; stable mainline: `main`.
 - Stable tag: `v7-stable-20261017`; next development branch: `feature/v8`.
 - Preserved V7 application: `/Users/shawnwang/.openclaw/runtime/wechat-autoreply-v7-app`.
 - Service label remains `ai.openclaw.wechat.autoreply.v6`; this historical name does not indicate the code version.
