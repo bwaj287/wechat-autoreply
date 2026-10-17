@@ -1,8 +1,8 @@
-# WeChat Auto-Reply V7
+# WeChat Auto-Reply V8 — Mac Trial
 
 A local WeChat auto-reply system for macOS. It detects messages, generates drafts, and sends delayed replies through screen capture, optical character recognition (OCR), window control, and keyboard simulation. It does not use the official WeChat API.
 
-Stable V7 makes every window action, message claim, draft cancellation, and send decision traceable and testable. See the [V7 stable baseline](docs/V7_BASELINE.md) for release branches and rollback rules.
+V8 starts from stable V7 and removes duplicated code without changing reply policies. See the [V7 stable baseline](docs/V7_BASELINE.md) and [V8 Mac trial](docs/V8_TRIAL.md) for validation, deployment, and rollback.
 
 > This application operates a real WeChat window and sends real messages. Keep auto-reply off during initial setup, verify permissions and the allowlist, and run the tests and dry run first.
 
@@ -10,6 +10,7 @@ Stable V7 makes every window action, message claim, draft cancellation, and send
 
 - Stable version: V7.
 - Stable development branch: `feature/v7_iteration`.
+- Trial branch: `feature/v8`, based on `v7-stable-20261017`.
 - Platform: macOS on Apple Silicon.
 - Process model: one Python runner managed by launchd.
 - Default send delay: 180 seconds.
@@ -19,6 +20,13 @@ Stable V7 makes every window action, message claim, draft cancellation, and send
 - Existing launchd label: `ai.openclaw.wechat.autoreply.v6`. The historical label does not indicate the current code version.
 
 ## Recent fixes
+
+### 2026-10-17: V8 simplification trial
+
+- Reuse one atomic JSON writer for configuration, state, and contact memory, retaining the existing file format and replace behavior.
+- Reuse one bubble-filtering function for inbound and outbound messages, retaining sender separation, sorting, and independent copies.
+- Pass 46 unit tests and the complete fake-UI selftest. No dependencies, reply policies, or state formats were added or changed.
+- Keep V7 code in its original directory and use one service and shared runtime data for the V8 trial. See the trial runbook for switching versions.
 
 ### 2026-10-17: stable V7 baseline
 
@@ -484,6 +492,7 @@ Quote contact names containing spaces:
 
 ## Maintenance documentation
 
+- [V8 Mac Trial](docs/V8_TRIAL.md)
 - [V7 Stable Baseline](docs/V7_BASELINE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations Runbook](docs/OPERATIONS.md)

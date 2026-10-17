@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 import math
 import re
-import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
+from .json_output import write_json_atomically as _atomic_write
 from .paths import CONTACT_MEMORY_PATH, CONTACT_MEMORY_SEED_PATH, ensure_runtime_dirs
 
 _SHORT_NOISE_RE = re.compile(r"^[~～`'\"!！?？.,，。…·•\\-_/|]{1,6}$")
@@ -15,21 +14,6 @@ MEMORY_DECAY_HOURS = 18.0
 MEMORY_SUMMARY_MAX_CHARS = 220
 MEMORY_CONTEXT_TAIL_LIMIT = 4
 MEMORY_MIN_EVENTS = 4
-
-
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        tmp_path = Path(handle.name)
-    tmp_path.replace(path)
 
 
 def _normalize_text(text: str) -> str:

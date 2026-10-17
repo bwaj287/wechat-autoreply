@@ -41,7 +41,7 @@
 - `wechat_ui.py`: WeChat window capture, OCR preparation, row extraction, bubble extraction, and UI actions.
 - `vision.py`: Dock/menu unread signal detection.
 - `ocr.py`: native Vision helper adapter.
-- `json_output.py`: first-complete-JSON parsing for noisy native output.
+- `json_output.py`: first-complete-JSON parsing and shared atomic JSON writes.
 
 ### Persistence And Observability
 

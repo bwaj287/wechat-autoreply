@@ -1,9 +1,8 @@
 import json
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
+from .json_output import write_json_atomically as _atomic_write
 from .paths import RUNTIME_DIR, STATE_PATH, ensure_runtime_dirs
 from .pending_queue import sync_pending_state
 
@@ -36,21 +35,6 @@ def default_state() -> dict[str, Any]:
         "pending_queue": [],
         "pending": None,
     }
-
-
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        tmp_path = Path(handle.name)
-    tmp_path.replace(path)
 
 
 def _migrate_legacy_state_if_needed() -> None:

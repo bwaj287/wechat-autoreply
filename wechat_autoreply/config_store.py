@@ -1,8 +1,8 @@
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 
+from .json_output import write_json_atomically as _atomic_write
 from .paths import CONFIG_PATH, SWITCH_PATH, WHITELIST_PATH, ensure_runtime_dirs
 
 
@@ -189,21 +189,6 @@ def default_config() -> dict[str, Any]:
             "If the incoming message is in Chinese, reply in natural spoken Chinese."
         ),
     }
-
-
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        tmp_path = Path(handle.name)
-    tmp_path.replace(path)
 
 
 def load_config() -> dict[str, Any]:

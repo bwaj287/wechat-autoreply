@@ -127,25 +127,9 @@ def is_stale_system_inbound_text(text: str) -> bool:
     return bool(STALE_SYSTEM_INBOUND_RE.search(compact))
 
 
-def _meaningful_inbound_items(panel: dict[str, Any]) -> list[dict[str, Any]]:
+def _meaningful_items(panel: dict[str, Any], direction: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for item in list(panel.get("inbound") or []):
-        text = str(item.get("text") or "").strip()
-        if not wechat_ui.has_meaningful_text(text) or is_history_marker(text):
-            continue
-        if _is_likely_ocr_noise_line(text):
-            continue
-        enriched = copy.deepcopy(item) if isinstance(item, dict) else {}
-        enriched["text"] = text
-        enriched["top"] = float(item.get("top", 0.0) or 0.0)
-        items.append(enriched)
-    items.sort(key=lambda item: float(item.get("top", 0.0) or 0.0))
-    return items
-
-
-def _meaningful_outbound_items(panel: dict[str, Any]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for item in list(panel.get("outbound") or []):
+    for item in list(panel.get(direction) or []):
         text = str(item.get("text") or "").strip()
         if not wechat_ui.has_meaningful_text(text) or is_history_marker(text):
             continue
@@ -231,7 +215,7 @@ def _find_outbound_quote_match(panel: dict[str, Any], text: str) -> dict[str, st
     if not value:
         return {}
     quoted_sender, stripped = _strip_quote_sender_prefix(value)
-    outbound_items = _meaningful_outbound_items(panel)
+    outbound_items = _meaningful_items(panel, "outbound")
     if not outbound_items:
         return {}
     candidates = [value]
@@ -299,7 +283,7 @@ def extract_inbound_payload(panel: dict[str, Any], fallback_preview: str = "") -
         "quoted_role": "",
         "quoted_sender": "",
     }
-    inbound_items = _meaningful_inbound_items(panel)
+    inbound_items = _meaningful_items(panel, "inbound")
     raw_inbound_items = [
         copy.deepcopy(item)
         for item in list(panel.get("inbound") or [])
@@ -1188,7 +1172,7 @@ def latest_committed_outbound_item(panel: dict[str, Any], max_top: float = 0.90)
 
 def find_matching_outbound_draft(panel: dict[str, Any], draft_text: str, max_top: float = 0.90) -> dict[str, Any]:
     outbound_items = list(panel.get("outbound") or [])
-    for item in reversed(_meaningful_outbound_items(panel)):
+    for item in reversed(_meaningful_items(panel, "outbound")):
         if float(item.get("top", 0.0) or 0.0) > max_top:
             continue
         text = str(item.get("text") or "").strip()
@@ -1208,14 +1192,14 @@ def find_matching_outbound_draft(panel: dict[str, Any], draft_text: str, max_top
 
 
 def latest_meaningful_inbound_top(panel: dict[str, Any]) -> float | None:
-    inbound_items = _meaningful_inbound_items(panel)
+    inbound_items = _meaningful_items(panel, "inbound")
     if not inbound_items:
         return None
     return max(float(item.get("top", 0.0) or 0.0) for item in inbound_items)
 
 
 def latest_meaningful_inbound_item(panel: dict[str, Any]) -> dict[str, Any]:
-    inbound_items = _meaningful_inbound_items(panel)
+    inbound_items = _meaningful_items(panel, "inbound")
     if not inbound_items:
         return {}
     return inbound_items[-1]
