@@ -20,13 +20,14 @@ def load_first_json_object(raw: str) -> dict[str, Any]:
 def write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
         dir=path.parent,
         prefix=f".{path.name}.",
         suffix=".tmp",
         delete=False,
     ) as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         tmp_path = Path(handle.name)
-    tmp_path.replace(path)
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)

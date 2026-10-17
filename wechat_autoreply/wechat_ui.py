@@ -1272,7 +1272,12 @@ def _resolve_chat_item_role(
     )
 
 
-def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
+def _extract_chat_panel(
+    obs_list: list[dict[str, Any]],
+    selected_title: str = "",
+    *,
+    standalone_window: bool = False,
+) -> dict[str, Any]:
     inbound_raw: list[dict[str, Any]] = []
     outbound_raw: list[dict[str, Any]] = []
     misc_raw: list[dict[str, Any]] = []
@@ -1282,13 +1287,16 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
         left = obs["bbox"]["left"]
         top = obs["bbox"]["top"]
         width = obs["bbox"]["w"]
-        if top < 0.11 or top > 0.90:
-            continue
-        if left < 0.30 or width < 0.02:
+        if standalone_window:
+            if top < 0.12 or top > 0.92 or width < 0.025:
+                continue
+        elif top < 0.11 or top > 0.90 or left < 0.30 or width < 0.02:
             continue
         if _is_time(text) or text == selected_title:
             continue
         if normalize_text(text) in ignored or text.startswith("Hold to Fn"):
+            continue
+        if standalone_window and top > 0.82 and left < 0.40 and width < 0.15:
             continue
         if not has_signal_text(text):
             continue
@@ -1332,62 +1340,7 @@ def _extract_chat_panel(obs_list: list[dict[str, Any]], selected_title: str = ""
 
 
 def _extract_chat_window_panel(obs_list: list[dict[str, Any]], selected_title: str = "") -> dict[str, Any]:
-    inbound_raw: list[dict[str, Any]] = []
-    outbound_raw: list[dict[str, Any]] = []
-    misc_raw: list[dict[str, Any]] = []
-    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
-    for obs in sorted(obs_list, key=lambda item: item["bbox"]["top"]):
-        text = obs["text"]
-        left = obs["bbox"]["left"]
-        top = obs["bbox"]["top"]
-        width = obs["bbox"]["w"]
-        if top < 0.12 or top > 0.92 or width < 0.025:
-            continue
-        if _is_time(text) or text == selected_title:
-            continue
-        if normalize_text(text) in ignored or text.startswith("Hold to Fn"):
-            continue
-        if top > 0.82 and left < 0.40 and width < 0.15:
-            continue
-        if not has_signal_text(text):
-            continue
-        bucket = {
-            "text": text,
-            "top": round(top, 4),
-            "left": round(left, 4),
-            "width": round(width, 4),
-            "confidence": round(float(obs.get("confidence", 0.0) or 0.0), 4),
-            "bubbleRole": str(obs.get("bubbleRole", "unknown")),
-            "greenPixels": int(obs.get("greenPixels", 0) or 0),
-            "grayPixels": int(obs.get("grayPixels", 0) or 0),
-            "messageKind": _message_kind_for_chat_text(text),
-        }
-        bubble_role = _resolve_chat_item_role(
-            text=text,
-            bubble_role=str(obs.get("bubbleRole", "unknown")),
-            left=float(left),
-            width=float(width),
-            green_pixels=int(obs.get("greenPixels", 0) or 0),
-            gray_pixels=int(obs.get("grayPixels", 0) or 0),
-            panel_kind="chat",
-        )
-        if bubble_role == "outbound":
-            outbound_raw.append(bucket)
-        elif bubble_role == "inbound":
-            inbound_raw.append(bucket)
-        else:
-            misc_raw.append(bucket)
-    inbound = _collapse_panel_lines(inbound_raw)
-    outbound = _collapse_panel_lines(outbound_raw)
-    misc = _collapse_panel_lines(misc_raw)
-    return {
-        "title": selected_title,
-        "latestInbound": inbound[-1]["text"] if inbound else "",
-        "latestOutbound": outbound[-1]["text"] if outbound else "",
-        "inbound": inbound,
-        "outbound": outbound,
-        "misc": misc,
-    }
+    return _extract_chat_panel(obs_list, selected_title, standalone_window=True)
 
 
 def _panel_has_content(panel: dict[str, Any]) -> bool:

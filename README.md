@@ -21,6 +21,12 @@ V8 starts from stable V7 and removes duplicated code without changing reply poli
 
 ## Recent fixes
 
+### 2026-10-17: second Ponytail pass
+
+- Share OCR panel extraction between the main roster and standalone chat windows. Keep each window's calibrated geometry limits and toolbar exclusions.
+- Remove temporary JSON files after serialization, write, or replacement failures while preserving the previous state file.
+- Pass 50 unit tests, the full fake-UI selftest, and 400 old/new extractor comparisons on synthetic OCR inputs. Production code is 46 lines smaller in this pass.
+
 ### 2026-10-17: V8 simplification trial
 
 - Reuse one atomic JSON writer for configuration, state, and contact memory, retaining the existing file format and replace behavior.

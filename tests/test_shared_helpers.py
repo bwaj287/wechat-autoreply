@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from wechat_autoreply.json_output import write_json_atomically
 from wechat_autoreply.orchestrator import _meaningful_items
@@ -27,6 +28,27 @@ class SharedHelperTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 write_json_atomically(path, {"invalid": object()})
             self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_failed_replace_preserves_state_and_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            write_json_atomically(path, {"previous": True})
+            with patch.object(Path, "replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(OSError):
+                    write_json_atomically(path, {"next": True})
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_failed_write_preserves_state_and_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            write_json_atomically(path, {"previous": True})
+            with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    write_json_atomically(path, {"next": True})
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_bubble_selection_keeps_roles_order_and_independent_copies(self) -> None:
         panel = {

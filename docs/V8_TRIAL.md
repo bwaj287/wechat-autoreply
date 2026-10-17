@@ -2,7 +2,9 @@
 
 V8 is based on `v7-stable-20261017`. The first change consolidates three identical atomic JSON writers and two identical message-filtering functions. It retains validation, message roles, OCR filtering, queue behavior, manual-reply protection, duplicate suppression, model routing, and persistence formats.
 
-Validation: 46 unit tests and the complete fake-UI selftest pass. Tests include JSON formatting and replacement, preserving existing state on serialization failure, and independent inbound/outbound filtering with ordering and deep copies.
+The second Ponytail pass shares OCR panel extraction between the roster and standalone chat windows, preserving their separate geometry thresholds. Failed JSON writes now clean up temporary files without replacing the previous state.
+
+Validation: 50 unit tests and the complete fake-UI selftest pass. Tests cover JSON formatting and replacement, serialization/write/replace failures, sender separation, deep copies, and 13 calibrated window-boundary cases. All 400 old/new extractor comparisons on synthetic OCR inputs matched. See the [second-pass review](V8_PONYTAIL_REVIEW.md) for scope and limits.
 
 ## Runtime layout
 
