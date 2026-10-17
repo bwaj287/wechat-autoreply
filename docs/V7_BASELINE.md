@@ -1,22 +1,22 @@
-# V7 稳定基线
+# V7 Stable Baseline
 
-2026-10-17 固定当前 Mac 后台运行的 V7，作为 V8 精简代码和试运行的对照。
+Freeze the V7 code running on this Mac on 2026-10-17 as the comparison and rollback baseline for V8 simplification.
 
-- 已在后台运行的代码提交：`1d2f044`（`fix: keep runtime control files project-relative`）。
-- 稳定开发分支：`feature/v7_iteration`；发布分支：`release`；稳定主线：`main`。
-- 稳定标签：`v7-stable-20261017`；后续开发分支：`feature/v8`。
-- 当前 V7 程序目录：`/Users/shawnwang/.openclaw/runtime/wechat-autoreply-v7-app`。
-- 服务标签沿用 `ai.openclaw.wechat.autoreply.v6`，不代表代码仍为 V6。
-- 稳定基线验证：43 个单元测试及完整 `selftest.py` 通过。
+- Previously deployed code: `1d2f044` (`fix: keep runtime control files project-relative`).
+- Stable development branch: `feature/v7_iteration`; release branch: `release`; stable mainline: `main`.
+- Stable tag: `v7-stable-20261017`; next development branch: `feature/v8`.
+- Preserved V7 application: `/Users/shawnwang/.openclaw/runtime/wechat-autoreply-v7-app`.
+- Service label remains `ai.openclaw.wechat.autoreply.v6`; this historical name does not indicate the code version.
+- Baseline checks: 43 unit tests and the complete `selftest.py` passed.
 
-V7 已把白名单与开关路径改为相对程序根目录，后续部署必须保留该修复。清理产生的报告、维护脚本、本地环境、聊天记录、联系人资料、开关和白名单不包含在本次发布提交中。
+V7 resolves the allowlist and switch relative to the application root. Keep that fix in later deployments. Cleanup reports, maintenance scripts, local environments, conversation data, contact records, switches, and allowlists are excluded from this release commit.
 
-## V8 验证顺序
+## V8 validation and rollback
 
-1. 从稳定标签创建 `feature/v8`，只做保持行为一致的精简。
-2. 先运行全部单元测试和 fake UI selftest，再准备独立的 V8 程序目录。
-3. 本机试运行继续使用现有单一 launchd 服务，不能同时启动 V7 和 V8 自动发送。
-4. 切换时保留现有开关、白名单、配置、联系人记忆及共享状态；不得重置 pending 队列或近期发送历史。
-5. 出现异常时，把同一服务的程序目录切回保留的 V7 副本，再比较稳定标签与 V8 差异。
+1. Create `feature/v8` from the stable tag. Start with changes that preserve behavior.
+2. Run all unit tests and the fake-UI selftest before preparing a separate V8 application directory.
+3. Use the existing single launchd job for the Mac trial. Never run V7 and V8 senders simultaneously.
+4. Preserve the current switch, allowlist, configuration, contact memory, and shared state. Do not reset pending items or recent send history.
+5. On failure, point the same service back to the preserved V7 application and compare V8 with the stable tag.
 
-V7/V8 沿用同一状态格式。回退代码时继续使用最新状态，不能恢复旧队列快照，否则可能重复发送已处理的消息。现场真实消息是否正确识别和发送，仍需要本机试运行确认。
+V7 and V8 retain the same state format. Roll back code while keeping the latest state; restoring an older queue snapshot can repeat already processed sends. Recognition and delivery with real messages still require a live trial on this Mac.
