@@ -99,6 +99,16 @@ def _looks_truncated_name(text: str) -> bool:
     return "..." in value or "…" in value
 
 
+def _is_service_chat_name(text: str) -> bool:
+    name = normalize_text(text)
+    stem = name.rstrip(".…")
+    return (
+        name == "service"
+        or name.startswith("service ")
+        or (name.endswith(("...", "…")) and len(stem) >= 4 and "service".startswith(stem))
+    )
+
+
 def names_match(a: str, b: str) -> bool:
     an = _canonical_name_key(a)
     bn = _canonical_name_key(b)
@@ -870,7 +880,8 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
                     cleaned[-1] = chat
                     continue
             cleaned.append(chat)
-        return cleaned
+        # The Service entry opens a non-chat panel and must never be selected.
+        return [chat for chat in cleaned if not _is_service_chat_name(chat["name"])]
 
     for min_left, max_left, min_width in _roster_band_profiles(window_info):
         candidates: list[dict[str, Any]] = []
