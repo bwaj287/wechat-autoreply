@@ -1476,6 +1476,32 @@ def _vote_panel_frames(frames: list[dict[str, Any]], fallback_title: str = "") -
     }
 
 
+def _panel_read_is_stable(frames: list[dict[str, Any]], requested_title: str) -> bool:
+    if len(frames) != 2:
+        return False
+    first, second = frames
+    first_title = str(first.get("title") or "").strip()
+    second_title = str(second.get("title") or "").strip()
+    title_key = normalize_name_for_match(first_title)
+    if not title_key or title_key != normalize_name_for_match(second_title):
+        return False
+    if requested_title and title_key != normalize_name_for_match(requested_title):
+        return False
+
+    def messages(frame: dict[str, Any]) -> tuple[tuple[tuple[str, str], ...], ...]:
+        panel = frame.get("panel") or {}
+        return tuple(
+            tuple(
+                (normalize_text(str(item.get("text") or "")), str(item.get("messageKind") or "text"))
+                for item in panel.get(side) or []
+            )
+            for side in ("inbound", "outbound", "misc")
+        )
+
+    first_messages = messages(first)
+    return any(first_messages) and first_messages == messages(second)
+
+
 def probe(
     select_chat: str | None = None,
     sleep_after_click: float = 1.0,
@@ -1592,6 +1618,8 @@ def probe(
             title = _pick_chat_window_title(chat_obs)
             panel = _extract_chat_window_panel(chat_obs, selected_title=title)
             chat_frames.append({"panel": panel, "title": title, "path": str(chat_path)})
+            if _panel_read_is_stable(chat_frames, selected_requested):
+                break
             if index + 1 < panel_vote_frames and panel_vote_interval > 0:
                 time.sleep(panel_vote_interval)
         voted = _vote_panel_frames(chat_frames, fallback_title=fallback_title)
@@ -1618,6 +1646,8 @@ def probe(
                         "path": str(roster_path),
                     }
                 )
+                if _panel_read_is_stable(roster_frames, selected_requested):
+                    break
                 if index + 1 < panel_vote_frames and panel_vote_interval > 0:
                     time.sleep(panel_vote_interval)
             panel = (_vote_panel_frames(roster_frames, fallback_title=title).get("panel") or {})
@@ -1644,6 +1674,8 @@ def probe(
                     "path": str(roster_path),
                 }
             )
+            if _panel_read_is_stable(roster_frames, selected_requested):
+                break
             if index + 1 < panel_vote_frames and panel_vote_interval > 0:
                 time.sleep(panel_vote_interval)
         voted = _vote_panel_frames(roster_frames, fallback_title=fallback_title)

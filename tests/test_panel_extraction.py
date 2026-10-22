@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from wechat_autoreply.wechat_ui import _extract_chat_panel, _extract_chat_window_panel
+from wechat_autoreply.wechat_ui import _extract_chat_panel, _extract_chat_window_panel, _panel_read_is_stable
 
 
 def observation(text: str, top: float, left: float, width: float, role: str = "inbound") -> dict:
@@ -16,6 +16,17 @@ def observation(text: str, top: float, left: float, width: float, role: str = "i
 
 
 class PanelExtractionTests(unittest.TestCase):
+    def test_stable_panel_read_can_skip_third_frame(self) -> None:
+        first = {"title": "May", "panel": {"inbound": [{"text": "到了", "confidence": 0.8}]}}
+        second = {"title": "May", "panel": {"inbound": [{"text": "到了", "confidence": 0.9}]}}
+        self.assertTrue(_panel_read_is_stable([first, second], "May"))
+        self.assertFalse(_panel_read_is_stable([first], "May"))
+        self.assertFalse(_panel_read_is_stable([first, {"title": "Ted Liu", "panel": second["panel"]}], "May"))
+        self.assertFalse(_panel_read_is_stable([first, {"title": "May...", "panel": second["panel"]}], "May"))
+        self.assertFalse(_panel_read_is_stable([first, {"title": "May", "panel": {"outbound": second["panel"]["inbound"]}}], "May"))
+        self.assertFalse(_panel_read_is_stable([first, second], "Ted Liu"))
+        self.assertFalse(_panel_read_is_stable([{"title": "May", "panel": {}}, {"title": "May", "panel": {}}], "May"))
+
     def test_each_window_keeps_its_calibrated_boundaries(self) -> None:
         # top, left, width, included in roster panel, included in standalone chat
         cases = [
