@@ -63,7 +63,8 @@ func clamp(_ value: Int, min minValue: Int, max maxValue: Int) -> Int {
 
 func bubbleRect(for item: ItemSpec) -> (x0: Int, x1: Int, y0: Int, y1: Int) {
     let px = Int(item.x * Double(width))
-    let py = Int(item.y * Double(height))
+    // Vision boxes start at bottom-left; bitmap pixels start at top-left.
+    let py = Int((1.0 - item.y - item.h) * Double(height))
     let pw = Int(item.w * Double(width))
     let ph = Int(item.h * Double(height))
     let minPadX = Swift.max(8, Int(Double(width) * 0.012))

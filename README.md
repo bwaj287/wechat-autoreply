@@ -96,45 +96,35 @@ See [incident-derived invariants](docs/INCIDENT_INVARIANTS.md) for the rules and
 ## Safety invariants
 
 - Only a verified numeric badge can enter the claim flow. Red pixels alone are insufficient, and warm avatar colors cannot override confirmed digit evidence.
-- Background roster preflight must find an allowlisted unread message before bringing WeChat forward.
+- The runner reads the roster in the background. Selecting a chat or sending requires WeChat to already be frontmost and the user to be idle.
 - Global unread activity without a visible numeric allowlist badge is treated as non-allowlisted activity. Clear only visible non-allowlist badges; do not search through allowlisted contacts.
-- UI automation requires sufficient system idle time: 30 seconds by default.
+- UI automation pauses when keyboard or mouse activity is detected and resumes after 20 seconds of inactivity by default.
 - Persist drafts in insertion order, schedule the earliest due item, and re-read the chat with multi-frame consensus before sending.
 - Cancel or postpone on reliable manual-reply evidence, input-box content, or changed messages.
 - Identify pending items by inbound fingerprint, not contact name or queue position.
-- Preserve uncertain sends for bounded verification instead of blindly sending again.
+- Preserve uncertain sends for verification instead of blindly sending again. If existing confirmation limits are reached, retain a `send_unconfirmed` review record rather than report success.
 - Preserve message order and sender roles. Never infer an unknown sender as the contact.
 - If a click clears a badge, continue only when contact-row evidence, preview text, and the gray inbound bubble agree. Retry uncertainty within a finite budget.
 - Report the login screen as `wechat_login_required`, not an empty healthy roster.
 - Logging and cleanup failures must not stop the reply state machine.
-- Restore the previously active application after a foreground WeChat session whenever possible.
+- Leave window visibility and the frontmost application under user control throughout the operation.
 
 ## Runtime flow
 
 ```text
-Dock/menu signal ─┐
-                  ├─> claim policy ─> hidden roster preflight
-periodic sweep ───┘                         │
-                                   numeric allowlist badge?
-                                      no │        │ yes
-                                         │        v
-                                      stay hidden  foreground claim
-                                                     │
-                                             OCR + context + model
-                                                     │
-                                                pending queue
-                                                     │
-                                      earliest due + multi-frame recheck
-                                                     │
-                                      cancel / refresh / verify and send
+Dock unread or periodic scan → read the existing roster window
+  ├─ fresh matching preview, contact, and incoming bubble → draft in background
+  └─ insufficient evidence → save the contact or scan for a later foreground check
+
+User opens WeChat and becomes idle → recheck deferred work
+  └─ due draft → verify contact, latest messages, and input box → send and verify
 ```
 
-Normal operation has two reasons to bring WeChat forward:
-
-- `claim_scan`: read and claim a message after actionable unread evidence.
-- `pending_send_due`: recheck the earliest due draft before sending.
-
-Any unexplained foreground opening is a defect.
+A static or unreadable hidden window leaves the work pending. While WeChat is hidden,
+another app has focus, or the user is active, saved drafts stay in the queue.
+An overdue draft still goes through the normal manual-reply and send checks.
+Switching apps during a send pauses further input. Once a Return may have been sent,
+the runner keeps the attempt for confirmation.
 
 ## Modules
 
@@ -360,7 +350,7 @@ Text replies primarily use OCR and chat context. Image/photo/sticker messages ca
 
 | Option | Default | Purpose |
 | --- | ---: | --- |
-| `idle_threshold_seconds` | `30` | Minimum idle time before UI automation |
+| `idle_threshold_seconds` | `20` | Minimum idle time before UI automation resumes |
 | `send_delay_seconds` | `180` | Delay after a draft is queued |
 | `poll_interval_seconds` | `5` | Runner tick interval |
 | `menubar_check_interval_seconds` | `15` | Dock/menu sampling interval |
@@ -400,7 +390,7 @@ Text replies primarily use OCR and chat context. Image/photo/sticker messages ca
 | `menu_bar_checked` | Dock/menu unread sample |
 | `passive_roster_preflight` | Roster check without focusing WeChat |
 | `wechat_login_required` | Runner alive, WeChat login required |
-| `wechat_window_action` | Foreground enter/leave and its reason |
+| `wechat_foreground_session` | Begin or end of work in the already-frontmost WeChat window |
 | `claim_candidates` | Candidate rows detected this tick |
 | `draft_saved_locally` | Draft queued |
 | `pending_recheck_voted` | Multi-frame pre-send result |

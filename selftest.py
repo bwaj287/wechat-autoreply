@@ -29,6 +29,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self.config = default_config()
         self.config["enabled"] = True
+        self.config["contact_memory_enabled"] = False
         self.config["passive_roster_sweep_enabled"] = False
         # Keep regression fixtures independent from the operator's live whitelist.
         self.config["allowed_contacts"] = [
@@ -146,6 +147,13 @@ class FakeUI:
     def __init__(self, probes):
         self.probes = list(probes)
         self.calls: list = []
+        self.frontmost = True
+
+    def is_wechat_frontmost(self):
+        return self.frontmost
+
+    def restore_frontmost_app(self, app):
+        self.calls.append(("restore", app))
 
     def activate_wechat(self):
         self.calls.append("activate")
@@ -153,9 +161,12 @@ class FakeUI:
     def hide_wechat(self):
         self.calls.append("hide")
 
-    def probe(self, select_chat=None, sleep_after_click=1.0, select_chat_click=None):
+    def probe(self, select_chat=None, sleep_after_click=1.0, select_chat_click=None, ui_action=None, *, strict_foreground):
+        assert strict_foreground and self.frontmost
         self.calls.append(("probe", select_chat))
         result = copy.deepcopy(self.probes.pop(0))
+        if result.get("status") == "ok":
+            result.setdefault("window", {"window_id": 73})
         visible_chats = list(result.get("visibleChats") or [])
         for chat in visible_chats:
             if not isinstance(chat, dict):
@@ -174,13 +185,19 @@ class FakeUI:
         result["visibleChats"] = visible_chats
         return result
 
-    def focus_input_box(self, probe):
+    def verify_chat_for_input(self, selected, contact):
+        pass
+
+    def focus_input_box(self, probe, ui_action=None, *, strict_foreground):
+        assert strict_foreground and self.frontmost
         self.calls.append("focus_input")
 
-    def paste_text(self, text):
+    def paste_text(self, text, *, strict_foreground, window_id):
+        assert strict_foreground and self.frontmost and window_id > 0
         self.calls.append(("paste", text))
 
-    def send_message(self):
+    def send_message(self, *, strict_foreground, window_id):
+        assert strict_foreground and self.frontmost and window_id > 0
         self.calls.append("send")
 
 
@@ -769,7 +786,7 @@ def run_overdue_pending_bypasses_snoozed_queue_head_path() -> None:
 
     result = runner.tick()
 
-    assert result["status"] == "sent", result
+    assert result["status"] == "send_unconfirmed", result
     assert result["contact"] == "Darren", result
     assert [item["contact"] for item in store.state["pending_queue"]] == ["1ock"]
 
@@ -1079,11 +1096,9 @@ def run_no_claim_sweep_while_pending_wait_path() -> None:
     second = runner.tick()
     assert second["status"] == "pending_wait_delay", second
     assert fake_ui.calls == [
-        "activate",
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
-        "hide",
     ], fake_ui.calls
 
 
@@ -1169,7 +1184,7 @@ def run_empty_claim_menu_flicker_does_not_reopen_path() -> None:
     clock["now"] = 9_140.0
     third = runner.tick()
     assert third["status"] == "idle_wait", third
-    assert fake_ui.calls.count("activate") == 1, fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
     assert sum(1 for event in store.events if event["type"] == "claim_candidates") == 1, store.events
 
 
@@ -1239,16 +1254,12 @@ def run_queue_claims_on_menu_rising_path() -> None:
     assert third["status"] == "pending_wait_delay", third
     assert [item["contact"] for item in store.state["pending_queue"]] == ["shawn", "May"]
     assert fake_ui.calls == [
-        "activate",
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
-        "hide",
-        "activate",
         ("probe", None),
         ("probe", "May"),
         ("probe", None),
-        "hide",
     ], fake_ui.calls
 
 
@@ -1318,11 +1329,9 @@ def run_queue_claims_while_pending_after_sweep_interval_path() -> None:
     assert third["status"] == "pending_wait_delay", third
     assert [item["contact"] for item in store.state["pending_queue"]] == ["shawn"]
     assert fake_ui.calls == [
-        "activate",
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
-        "hide",
     ], fake_ui.calls
 
 
@@ -1447,9 +1456,7 @@ def run_passive_roster_sweep_claims_without_menu_signal_path() -> None:
     assert result["contact"] == "Darren", result
     assert store.state["pending"]["inbound_text"] == "费了！！"
     assert any(
-        event["type"] == "wechat_window_action"
-        and event.get("action") == "open"
-        and event.get("trigger") == "passive_roster_sweep"
+        event["type"] == "passive_roster_preflight" and event.get("badge_detected")
         for event in store.events
     ), store.events
 
@@ -1605,7 +1612,7 @@ def run_passive_roster_sweep_opens_only_after_background_badge_path() -> None:
     result = runner.tick()
     assert result["status"] == "draft_saved", result
     assert fake_ui.calls[0] == ("probe_background", None), fake_ui.calls
-    assert "activate" in fake_ui.calls
+    assert ("probe", None) in fake_ui.calls
     assert any(
         event.get("type") == "passive_roster_preflight"
         and event.get("badge_detected") is True
@@ -1685,7 +1692,7 @@ def run_passive_roster_sweep_queues_whitelist_while_pending_path() -> None:
     assert [item["contact"] for item in store.state["pending_queue"]] == ["Darren", "1ock"]
     assert store.state["pending"]["contact"] == "Darren"
     assert ("probe_background", None) in fake_ui.calls
-    assert "activate" in fake_ui.calls
+    assert ("probe", None) in fake_ui.calls
 
 
 def run_passive_roster_sweep_ignores_badge_for_already_queued_contact_path() -> None:
@@ -2230,7 +2237,7 @@ def run_active_whitelist_chat_latest_outbound_skips_path() -> None:
     result = runner.tick()
     assert result["status"] == "no_candidate", result
     assert store.state["pending"] is None
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
 
 def run_whitelist_preview_fallback_claim_path() -> None:
@@ -2459,12 +2466,10 @@ def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
         for event in store.events
     ), store.events
     assert fake_ui.calls == [
-        "activate",
         ("probe", None),
         ("probe", "Barrys"),
         ("probe", "Barrys"),
         ("probe", None),
-        "hide",
     ], fake_ui.calls
 
 
@@ -2648,12 +2653,12 @@ def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
     clock["now"] = 9170.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
 
 def run_empty_queue_persistent_unread_suppresses_repeat_claim_path() -> None:
@@ -2688,18 +2693,18 @@ def run_empty_queue_persistent_unread_suppresses_repeat_claim_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
     clock["now"] = 9_170.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
     clock["now"] = 9_182.0
     third = runner.tick()
     assert third["status"] == "idle_wait", third
     assert third["menu_unread"] is True, third
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
 
 def run_same_menu_signal_with_passive_sweep_does_not_reopen_path() -> None:
@@ -2731,13 +2736,13 @@ def run_same_menu_signal_with_passive_sweep_does_not_reopen_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
     clock["now"] = 9_182.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
     assert second["menu_unread"] is True, second
-    assert fake_ui.calls == ["activate", ("probe", None), "hide"], fake_ui.calls
+    assert fake_ui.calls == [("probe", None)], fake_ui.calls
 
 
 def run_send_confirmation_retry_path() -> None:
@@ -2826,6 +2831,65 @@ def run_send_confirmation_retry_path() -> None:
     assert any(event["type"] == "send_unconfirmed_retry_scheduled" for event in store.events)
 
 
+def run_send_attempt_persisted_before_confirmation_probe_path() -> None:
+    store = MemoryStore()
+    store.config["contact_memory_enabled"] = False
+    store.config["recheck_vote_frames"] = 1
+    pending = {
+        "contact": "May",
+        "inbound_text": "锯掉一块再钉起来",
+        "inbound_fingerprint": "fp-may-send-confirmation-failure",
+        "draft_text": "你这路子有点野",
+        "created_at": 800.0,
+        "due_at": 900.0,
+    }
+    store.state["pending_queue"] = [pending]
+    store.state["pending"] = pending
+
+    class ConfirmationFailureUI(FakeUI):
+        def probe(self, **kwargs):
+            if "send" in self.calls:
+                raise RuntimeError("confirmation window disappeared")
+            return super().probe(**kwargs)
+
+    ui = ConfirmationFailureUI([
+        {
+            "status": "ok",
+            "selectionConfirmed": True,
+            "activeChat": "May",
+            "chatPanel": {
+                "latestInbound": "锯掉一块再钉起来",
+                "latestOutbound": "之前的回复",
+                "inbound": [{"text": "锯掉一块再钉起来", "top": 0.65}],
+                "outbound": [{"text": "之前的回复", "top": 0.25}],
+            },
+        }
+    ])
+    runner = AutoReplyRunner(
+        idle_sensor=FakeIdle(60),
+        ui=ui,
+        load_config_fn=store.load_config,
+        load_state_fn=store.load_state,
+        save_state_fn=store.save_state,
+        append_event_fn=store.append_event,
+        now_fn=lambda: 1000.0,
+    )
+    state = store.load_state()
+    try:
+        runner._handle_pending(store.load_config(), state, state["pending_queue"][0], 60.0, 1000.0)
+    except RuntimeError as exc:
+        assert "confirmation window disappeared" in str(exc), exc
+    else:
+        raise AssertionError("confirmation probe should fail")
+    assert ui.calls.count("send") == 1, ui.calls
+    assert store.state["pending"]["send_attempts"] == 1, store.state["pending"]
+    assert store.state["pending"]["last_send_attempt_at"] == 1000.0, store.state["pending"]
+    retry_state = store.load_state()
+    result = runner._handle_pending(store.load_config(), retry_state, retry_state["pending"], 60.0, 1200.0)
+    assert result["status"] == "send_unconfirmed", result
+    assert ui.calls.count("send") == 1, ui.calls
+
+
 def run_stale_unconfirmed_send_closes_without_opening_path() -> None:
     store = MemoryStore()
     store.config["contact_memory_enabled"] = False
@@ -2864,14 +2928,13 @@ def run_stale_unconfirmed_send_closes_without_opening_path() -> None:
         store.load_config(), state, state["pending_queue"][0], idle_seconds=0, now=1_301.0
     )
 
-    assert result["status"] == "sent", result
+    assert result["status"] == "send_unconfirmed", result
     assert result["confirmation"] == "send_action_timeout", result
     assert state["pending"] is None
     assert fake_ui.calls == [], fake_ui.calls
     assert any(
-        event["type"] == "auto_sent"
+        event["type"] == "send_unconfirmed"
         and event.get("confirmation") == "send_action_timeout"
-        and event.get("inferred") is True
         for event in store.events
     ), store.events
 
@@ -2923,12 +2986,11 @@ def run_unconfirmed_send_selection_failures_have_finite_budget_path() -> None:
         store.load_config(), state, state["pending_queue"][0], idle_seconds=45, now=1_205.0
     )
 
-    assert result["status"] == "sent", result
+    assert result["status"] == "send_unconfirmed", result
     assert result["confirmation"] == "send_confirmation_exhausted", result
     assert state["pending"] is None
     assert fake_ui.calls.count("send") == 0, fake_ui.calls
-    assert fake_ui.calls.count("activate") == 1, fake_ui.calls
-    assert fake_ui.calls.count("hide") == 1, fake_ui.calls
+    assert "activate" not in fake_ui.calls and "hide" not in fake_ui.calls, fake_ui.calls
 
 
 def run_send_confirmation_self_echo_marks_sent_path() -> None:
@@ -3616,7 +3678,7 @@ def run_ocr_variant_same_message_does_not_refresh_path() -> None:
         [
             {
                 "status": "ok",
-                "visibleChats": [{"name": "Darren", "preview": "jade 爸妈没来", "time": "14:41", "unread": True}],
+                "visibleChats": [{"name": "Darren", "preview": "晚上想吃啥", "time": "14:41", "unread": True}],
                 "chatPanel": {},
             },
             {
@@ -3627,7 +3689,7 @@ def run_ocr_variant_same_message_does_not_refresh_path() -> None:
                     "latestInbound": "jade 爸妈没来\n晚上想吃啥",
                     "latestOutbound": "",
                     "inbound": [
-                        {"text": "jade 爸妈没来", "top": 0.42},
+                        {"text": "jade 爸妈没来", "top": 0.50},
                         {"text": "晚上想吃啥", "top": 0.57},
                     ],
                 },
@@ -3641,7 +3703,7 @@ def run_ocr_variant_same_message_does_not_refresh_path() -> None:
                 "status": "ok",
                 "selectionConfirmed": True,
                 "activeChat": "Darren",
-                "visibleChats": [{"name": "Darren", "preview": "jade 爸妈没来", "time": "14:41", "unread": False}],
+                "visibleChats": [{"name": "Darren", "preview": "晚上想吃啥", "time": "14:41", "unread": False}],
                 "chatPanel": {
                     "latestInbound": "晚上想吃啥",
                     "latestOutbound": "",
@@ -3666,6 +3728,7 @@ def run_ocr_variant_same_message_does_not_refresh_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "draft_saved", first
+    assert store.state["pending"]["inbound_text"] == "jade 爸妈没来\n晚上想吃啥", store.state["pending"]
 
     clock["now"] = 12_305.0
     second = runner.tick()
@@ -3839,6 +3902,7 @@ def main() -> int:
     run_preview_matching_outbound_is_not_inbound_path()
     run_latest_message_refresh_path()
     run_send_confirmation_retry_path()
+    run_send_attempt_persisted_before_confirmation_probe_path()
     run_stale_unconfirmed_send_closes_without_opening_path()
     run_unconfirmed_send_selection_failures_have_finite_budget_path()
     run_send_confirmation_self_echo_marks_sent_path()

@@ -117,7 +117,7 @@ def default_config() -> dict[str, Any]:
     return {
         "version": 1,
         "enabled": False,
-        "idle_threshold_seconds": 30,
+        "idle_threshold_seconds": 20,
         "send_delay_seconds": 180,
         "pending_refresh_delay_seconds": 180,
         "pending_change_debounce_frames": 3,

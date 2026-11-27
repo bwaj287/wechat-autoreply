@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from wechat_autoreply.wechat_ui import _extract_chat_panel, _extract_chat_window_panel, _panel_read_is_stable
+from wechat_autoreply.wechat_ui import _extract_chat_panel, _extract_chat_window_panel, _panel_read_is_stable, choose_chat_window
 
 
 def observation(text: str, top: float, left: float, width: float, role: str = "inbound") -> dict:
@@ -16,6 +16,15 @@ def observation(text: str, top: float, left: float, width: float, role: str = "i
 
 
 class PanelExtractionTests(unittest.TestCase):
+    def test_standalone_window_must_belong_to_requested_contact(self) -> None:
+        other = {"title": "Ted Liu", "width": 1000, "height": 800, "isMainWindow": True}
+        target = {"title": "May", "width": 600, "height": 500}
+        self.assertIs(choose_chat_window([other, target], requested_title="May"), target)
+        self.assertIsNone(choose_chat_window([other], requested_title="May"))
+        self.assertIsNone(choose_chat_window([dict(other, title="WeChat")]))
+        alias = dict(target, title="10ck")
+        self.assertIs(choose_chat_window([other, alias], requested_title="1ock"), alias)
+
     def test_stable_panel_read_can_skip_third_frame(self) -> None:
         first = {"title": "May", "panel": {"inbound": [{"text": "到了", "confidence": 0.8}]}}
         second = {"title": "May", "panel": {"inbound": [{"text": "到了", "confidence": 0.9}]}}

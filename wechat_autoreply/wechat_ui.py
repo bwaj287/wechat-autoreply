@@ -8,14 +8,17 @@ import subprocess
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageOps
+from AppKit import NSRunningApplication, NSWorkspace
+from Quartz import CGWindowListCopyWindowInfo, kCGNullWindowID, kCGWindowListOptionAll, kCGWindowListOptionOnScreenOnly
 
 from .badge_detection import fallback_row_badge_detection as _fallback_row_badge_detection
-from .config_store import load_config, save_config
+from .config_store import load_allowed_contacts, load_config, save_config
+from .event_log import append_event
 from .json_output import load_first_json_object
-from .ocr import ocr_image
+from .ocr import contact_label, ocr_image, ocr_region
 from .paths import BUBBLE_ROLE_HELPER, CAPTURE_DIR, PEEKABOO, WECHAT_APP
 from .peekaboo_utils import peekaboo_commands, run, run_peekaboo_variants
 
@@ -59,6 +62,75 @@ TARGET_ROSTER_WINDOW_X = 96
 TARGET_ROSTER_WINDOW_Y = 84
 TARGET_ROSTER_WINDOW_WIDTH = 980
 TARGET_ROSTER_WINDOW_HEIGHT = 820
+WECHAT_BUNDLE_ID = "com.tencent.xinWeChat"
+
+
+class WeChatNotFrontmost(RuntimeError):
+    pass
+
+
+def _existing_windows(*, onscreen_only: bool = False) -> list[dict[str, Any]]:
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
+    pids = {int(app.processIdentifier()) for app in apps}
+    if len(pids) != 1:
+        return []
+    option = kCGWindowListOptionOnScreenOnly if onscreen_only else kCGWindowListOptionAll
+    windows = []
+    for entry in CGWindowListCopyWindowInfo(option, kCGNullWindowID) or []:
+        pid = int(entry.get("kCGWindowOwnerPID", 0))
+        if pid not in pids or entry.get("kCGWindowLayer") != 0:
+            continue
+        bounds = entry.get("kCGWindowBounds") or {}
+        width, height = int(bounds.get("Width", 0)), int(bounds.get("Height", 0))
+        if min(width, height) < 50 or not entry.get("kCGWindowNumber"):
+            continue
+        windows.append({
+            "window_id": int(entry["kCGWindowNumber"]), "pid": pid,
+            "title": str(entry.get("kCGWindowName") or ""),
+            "x": int(bounds.get("X", 0)), "y": int(bounds.get("Y", 0)), "width": width, "height": height,
+        })
+    return windows
+
+
+def _require_front_window(window_id: int | None = None) -> dict[str, Any]:
+    # Query System Events rather than addressing WeChat, which could launch a stopped app.
+    script = f'''
+tell application "System Events"
+  set p to first application process whose frontmost is true
+  if (bundle identifier of p) is not "{WECHAT_BUNDLE_ID}" or not (visible of p) then return ""
+  set w to value of attribute "AXFocusedWindow" of p
+  if (value of attribute "AXMinimized" of w) is not false then return ""
+  if (subrole of w) is not "AXStandardWindow" or (exists sheet 1 of w) then return ""
+  return (unix id of p as text) & linefeed & (name of w as text)
+end tell
+'''
+    try:
+        workspace = NSWorkspace.sharedWorkspace()
+        app = workspace.frontmostApplication()
+        if not app or app.bundleIdentifier() != WECHAT_BUNDLE_ID or app.isHidden():
+            raise WeChatNotFrontmost("WeChat is not frontmost")
+        answer = run(["osascript", "-e", script], timeout=3).stdout.strip().split("\n", 1)
+        windows = _existing_windows(onscreen_only=True)
+        if len(answer) == 2 and answer[1] and windows:
+            front = windows[0]
+            current = workspace.frontmostApplication()
+            if (current and current.processIdentifier() == front["pid"] and str(front["pid"]) == answer[0]
+                    and not current.isHidden() and front["title"] == answer[1]
+                    and (window_id is None or window_id == front["window_id"])):
+                return front
+    except WeChatNotFrontmost:
+        raise
+    except Exception as exc:
+        raise WeChatNotFrontmost("Could not inspect the foreground WeChat window") from exc
+    raise WeChatNotFrontmost("WeChat has no verified foreground window")
+
+
+def is_wechat_frontmost() -> bool:
+    try:
+        _require_front_window()
+        return True
+    except WeChatNotFrontmost:
+        return False
 
 
 def normalize_text(text: str) -> str:
@@ -101,11 +173,24 @@ def _looks_truncated_name(text: str) -> bool:
 
 def _is_service_chat_name(text: str) -> bool:
     name = normalize_text(text)
-    stem = name.rstrip(".…")
+    stem = _canonical_name_key(text)
     return (
         name == "service"
         or name.startswith("service ")
-        or (name.endswith(("...", "…")) and len(stem) >= 4 and "service".startswith(stem))
+        or (("..." in name or "…" in name) and len(stem) >= 4 and "service".startswith(stem))
+    )
+
+
+def _service_accounts_heading(obs_list: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next(
+        (
+            obs
+            for obs in obs_list
+            if "service accounts" in normalize_text(str(obs.get("text") or ""))
+            and float(obs.get("bbox", {}).get("left", 1)) < 0.30
+            and float(obs.get("bbox", {}).get("top", 1)) < 0.13
+        ),
+        None,
     )
 
 
@@ -320,10 +405,12 @@ return "hidden"
     raise RuntimeError(" ; ".join(errors) or "failed to hide wechat")
 
 
-def _read_clipboard_text() -> str:
+def _read_clipboard_text(*, strict: bool = False) -> str:
     try:
-        return run(["pbpaste"], check=False, timeout=5).stdout
-    except Exception:
+        return run(["pbpaste"], check=strict, timeout=5).stdout
+    except Exception as exc:
+        if strict:
+            raise WeChatNotFrontmost("Could not verify the input clipboard") from exc
         return ""
 
 
@@ -341,7 +428,9 @@ def _write_clipboard_text(text: str) -> None:
         pass
 
 
-def list_wechat_windows() -> list[dict[str, Any]]:
+def list_wechat_windows(*, passive: bool = False) -> list[dict[str, Any]]:
+    if passive:
+        return _existing_windows()
     payload = load_first_json_object(
         run_peekaboo_variants(
             peekaboo_commands(["list", "windows", "--app", WECHAT_APP, "--json"]),
@@ -372,9 +461,9 @@ def list_wechat_windows() -> list[dict[str, Any]]:
 
 
 def choose_roster_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    candidates = [window for window in windows if window["title"] == "Weixin"]
+    candidates = [window for window in windows if window["title"] in {"Weixin", "WeChat", "微信"}]
     if not candidates:
-        raise RuntimeError(f"no roster window found: {windows!r}")
+        raise RuntimeError("no roster window found")
     return max(candidates, key=lambda item: item["width"] * item["height"])
 
 
@@ -520,12 +609,13 @@ def ensure_main_roster_window() -> dict[str, Any]:
     return roster
 
 
-def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
+def choose_chat_window(windows: list[dict[str, Any]], *, requested_title: str = "") -> dict[str, Any] | None:
     usable = [
         window
         for window in windows
         if str(window.get("title") or "").strip()
-        and window["title"] not in {"Weixin", "WeChat (Window)"}
+        and window["title"] not in {"Weixin", "WeChat", "WeChat (Window)"}
+        and (not requested_title or names_match(str(window["title"]), requested_title))
     ]
     if not usable:
         return None
@@ -547,8 +637,14 @@ def choose_chat_window(windows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(candidates, key=lambda item: item["width"] * item["height"])
 
 
-def capture_window(path: Path, info: dict[str, Any]) -> Path:
+def capture_window(path: Path, info: dict[str, Any], *, passive: bool = False) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if passive:
+        window_id = int(info.get("window_id", 0))
+        if window_id <= 0:
+            raise RuntimeError("No existing WeChat window ID for capture")
+        run(["/usr/sbin/screencapture", "-x", "-o", f"-l{window_id}", str(path)], timeout=10)
+        return path
     args = [
         "image",
         "--app",
@@ -567,14 +663,16 @@ def capture_window(path: Path, info: dict[str, Any]) -> Path:
     return path
 
 
-def probe_roster_background() -> dict[str, Any]:
+def probe_roster_background(*, include_panel: bool = False) -> dict[str, Any]:
     """Inspect roster badges without activating or focusing WeChat."""
-    windows = list_wechat_windows()
+    windows = list_wechat_windows(passive=True)
     roster_info = choose_roster_window(windows)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    timestamp = time.time_ns()
     roster_path = CAPTURE_DIR / f"wechat-roster-background-{timestamp}.png"
-    capture_window(roster_path, roster_info)
-    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    capture_window(roster_path, roster_info, passive=True)
+    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=include_panel)
+    if not roster_obs:
+        return {"status": "window_unreadable", "window": roster_info, "screenshot": str(roster_path), "visibleChats": []}
     if wechat_login_required(roster_obs):
         return {
             "status": "login_required",
@@ -582,16 +680,31 @@ def probe_roster_background() -> dict[str, Any]:
             "screenshot": str(roster_path),
             "visibleChats": [],
         }
+    heading = _service_accounts_heading(roster_obs)
+    if heading:
+        bbox = heading["bbox"]
+        return {
+            "status": "service_accounts",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "visibleChats": [],
+            "serviceBack": (roster_info["x"] + int(bbox["left"] * roster_info["width"]) + 6,
+                            roster_info["y"] + int((bbox["top"] + bbox["h"] / 2) * roster_info["height"])),
+        }
     chats = annotate_unread_chats(
         extract_visible_chats(roster_obs, roster_info),
         roster_path,
     )
-    return {
+    result = {
         "status": "ok",
         "window": roster_info,
         "screenshot": str(roster_path),
         "visibleChats": chats,
     }
+    if include_panel:
+        title = _pick_selected_title(roster_obs)
+        result.update(activeChat=title, chatPanel=_extract_chat_panel(roster_obs, selected_title=title))
+    return result
 
 
 def _is_time(text: str) -> bool:
@@ -672,7 +785,9 @@ def _build_roster_ocr_variants(image_path: Path) -> list[Path]:
     return variants
 
 
-def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[str, Any]]:
+def _prepare_ocr_items(
+    image_path: Path, *, panel_hint: str = "", recover_outbound: bool = False,
+) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     temp_variants: list[Path] = []
     source_images: list[Path] = [image_path]
@@ -694,12 +809,13 @@ def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[s
                 return existing
         return None
 
-    def _record_item(text: str, x: float, y: float, w: float, h: float, confidence: float) -> None:
+    def _record_item(text: str, x: float, y: float, w: float, h: float, confidence: float, candidates: list) -> None:
         top = 1.0 - (y + h)
         prepared.append(
             {
                 "text": text,
                 "confidence": confidence,
+                "candidates": candidates,
                 "bbox": {"x": x, "y": y, "w": w, "h": h, "top": top, "left": x},
                 "center": {"x": x + w / 2.0, "y": top + h / 2.0},
             }
@@ -717,13 +833,18 @@ def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[s
             w = float(bbox.get("w", 0.0))
             h = float(bbox.get("h", 0.0))
             confidence = float(item.get("confidence", 0.0))
-            _record_item(text, x, y, w, h, confidence)
+            _record_item(text, x, y, w, h, confidence, list(item.get("candidates") or []))
 
         # Enhanced roster OCR pass:
         # only update existing boxes, never add brand-new boxes.
         # This avoids false rows introduced by aggressive enhancement.
         for source in source_images[1:]:
-            for item in ocr_image(source):
+            try:
+                enhanced_items = ocr_image(source)
+            except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
+                append_event("ocr_enhancement_failed", screenshot=str(image_path), error=str(exc))
+                continue
+            for item in enhanced_items:
                 text = (item.get("text") or "").strip()
                 if not text:
                     continue
@@ -747,6 +868,7 @@ def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[s
                         {
                             "text": text,
                             "confidence": confidence,
+                            "candidates": list(item.get("candidates") or []),
                             "bbox": {"x": x, "y": y, "w": w, "h": h, "top": top, "left": x},
                             "center": {"x": x + w / 2.0, "y": top + h / 2.0},
                         }
@@ -754,7 +876,26 @@ def _prepare_ocr_items(image_path: Path, *, panel_hint: str = "") -> list[dict[s
     finally:
         for path in temp_variants:
             path.unlink(missing_ok=True)
+    base_count = len(prepared)
+    if recover_outbound:
+        # Whole-window OCR can omit green bubbles; never invent roster rows from this crop.
+        left = 0.30 if panel_hint == "roster" else 0.0
+        try:
+            for item in ocr_region(image_path, (left, 0.50, 0.99, 0.90)):
+                text = str(item.get("text") or "").strip()
+                bbox = item["bbox"]
+                x, y, w, h = (float(bbox[key]) for key in ("x", "y", "w", "h"))
+                if text and not _find_bbox_match(x, 1.0 - y - h, w, h):
+                    _record_item(text, x, y, w, h, float(item.get("confidence", 0)), list(item.get("candidates") or []))
+        except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            append_event("ocr_outbound_recovery_failed", screenshot=str(image_path), error=str(exc))
     _annotate_bubble_roles(prepared, image_path)
+    prepared = prepared[:base_count] + [
+        item for item in prepared[base_count:] if item.get("bubbleRole") == "outbound"
+    ]
+    contacts = load_allowed_contacts()
+    for item in prepared:
+        item["contactText"] = item["text"] if _is_service_chat_name(item["text"]) else contact_label(item, contacts)
     return prepared
 
 
@@ -826,12 +967,14 @@ def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str,
                 # like the contact itself is named "Video Call". Prefer the
                 # non-call text as the contact label in that case.
                 name_item, preview_item = preview_item, name_item
+            if _is_service_chat_name(name_item["text"]):
+                continue
             if len(name_item["text"]) <= 1 and not re.search(r"[A-Za-z\u4e00-\u9fff]", name_item["text"]):
                 continue
             gx, gy = _global_coords(window_info, name_item)
             chats.append(
                 {
-                    "name": name_item["text"],
+                    "name": name_item.get("contactText", name_item["text"]),
                     "preview": preview_item["text"] if preview_item else "",
                     "time": time_item["text"] if time_item else "",
                     "ocrTop": round(name_item["bbox"]["top"], 4),
@@ -999,6 +1142,15 @@ def _roster_search_coords(window_info: dict[str, Any]) -> tuple[int, int]:
     return int(window_info.get("x", 0) or 0) + x_offset, int(window_info.get("y", 0) or 0) + y_offset
 
 
+def _perform_ui_action(
+    ui_action: Callable[..., Any] | None,
+    action: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    return ui_action(action, *args, **kwargs) if ui_action else action(*args, **kwargs)
+
+
 def _select_chat_via_search(
     target: str,
     roster_info: dict[str, Any],
@@ -1006,21 +1158,22 @@ def _select_chat_via_search(
     *,
     sleep_after_click: float,
     badge_rescue_targets: list[str] | None,
+    ui_action: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     previous_clipboard = _read_clipboard_text()
     try:
         current_window_id = int(roster_info.get("window_id", 0) or 0)
         search_x, search_y = _roster_search_coords(roster_info)
-        click_coords(search_x, search_y, window_id=current_window_id, auto_focus=False)
+        _perform_ui_action(ui_action, click_coords, search_x, search_y, window_id=current_window_id, auto_focus=False)
         time.sleep(0.15)
-        _command_a()
+        _perform_ui_action(ui_action, _command_a)
         time.sleep(0.05)
-        _write_clipboard_text(target)
+        _perform_ui_action(ui_action, _write_clipboard_text, target)
         time.sleep(0.05)
-        _command_v()
+        _perform_ui_action(ui_action, _command_v)
         time.sleep(max(0.45, min(1.0, sleep_after_click)))
 
-        roster_info = ensure_main_roster_window()
+        roster_info = _perform_ui_action(ui_action, ensure_main_roster_window)
         capture_window(roster_path, roster_info)
         roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
         chats = annotate_unread_chats(
@@ -1030,7 +1183,7 @@ def _select_chat_via_search(
         )
         match = find_chat(chats, target)
         if not match:
-            _press_escape()
+            _perform_ui_action(ui_action, _press_escape)
             return {
                 "selectedChat": "",
                 "window": roster_info,
@@ -1039,7 +1192,9 @@ def _select_chat_via_search(
             }
 
         current_window_id = int(roster_info.get("window_id", 0) or 0)
-        click_coords(
+        _perform_ui_action(
+            ui_action,
+            click_coords,
             match["click"]["x"],
             match["click"]["y"],
             window_id=current_window_id,
@@ -1047,11 +1202,11 @@ def _select_chat_via_search(
         )
         selected_chat = str(match.get("name") or target)
         time.sleep(0.2)
-        _press_escape()
+        _perform_ui_action(ui_action, _press_escape)
         time.sleep(max(sleep_after_click, 0.2))
-        roster_info = ensure_main_roster_window()
+        roster_info = _perform_ui_action(ui_action, ensure_main_roster_window)
         capture_window(roster_path, roster_info)
-        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=True)
         chats = annotate_unread_chats(
             extract_visible_chats(roster_obs, roster_info),
             roster_path,
@@ -1064,7 +1219,8 @@ def _select_chat_via_search(
             "visibleChats": chats,
         }
     finally:
-        _write_clipboard_text(previous_clipboard)
+        if _read_clipboard_text() == target:
+            _write_clipboard_text(previous_clipboard)
 
 
 def click_coords(
@@ -1105,7 +1261,7 @@ def _pick_selected_title(obs_list: list[dict[str, Any]]) -> str:
     if not candidates:
         return ""
     candidates.sort(key=lambda item: (item["bbox"]["top"], -item["bbox"]["w"]))
-    return _sanitize_chat_title_text(candidates[0]["text"])
+    return _sanitize_chat_title_text(candidates[0].get("contactText", candidates[0]["text"]))
 
 
 def _pick_chat_window_title(obs_list: list[dict[str, Any]]) -> str:
@@ -1128,7 +1284,7 @@ def _pick_chat_window_title(obs_list: list[dict[str, Any]]) -> str:
     if not candidates:
         return ""
     candidates.sort(key=lambda item: (item["bbox"]["top"], item["bbox"]["left"]))
-    return _sanitize_chat_title_text(candidates[0]["text"])
+    return _sanitize_chat_title_text(candidates[0].get("contactText", candidates[0]["text"]))
 
 
 def _join_texts(parts: list[str]) -> str:
@@ -1502,18 +1658,198 @@ def _panel_read_is_stable(frames: list[dict[str, Any]], requested_title: str) ->
     return any(first_messages) and first_messages == messages(second)
 
 
+def _strict_interaction(args: list[str], window_id: int | None, *, bounds: dict[str, Any] | None = None) -> None:
+    front = _require_front_window(window_id)
+    if bounds and any(front[key] != bounds[key] for key in ("x", "y", "width", "height")):
+        raise WeChatNotFrontmost("WeChat window moved since the last capture")
+    command = [*args, "--app", f"PID:{front['pid']}", "--window-id", str(front["window_id"]),
+               "--no-auto-focus", "--json"]
+    # Never replay a click or Return after a transport error or a focus change.
+    try:
+        run(peekaboo_commands(command)[0], timeout=15)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        _require_front_window(window_id)
+        raise
+
+
+def _verified_panel(contact: str, roster: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
+    detached = window["window_id"] != roster["window"]["window_id"]
+    frames = []
+    for index in range(2):
+        if not detached and index == 0:
+            title, panel, path = roster["activeChat"], roster["chatPanel"], roster["screenshot"]
+        else:
+            image = CAPTURE_DIR / f"wechat-panel-read-{time.time_ns()}.png"
+            capture_window(image, window, passive=True)
+            obs = _prepare_ocr_items(image, panel_hint="" if detached else "roster", recover_outbound=True)
+            title = _pick_chat_window_title(obs) if detached else _pick_selected_title(obs)
+            panel = _extract_chat_panel(obs, selected_title=title, standalone_window=detached)
+            path = str(image)
+        if normalize_text(title) != normalize_text(contact):
+            return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+        frames.append({"title": title, "panel": panel, "path": path})
+    if not _panel_read_is_stable(frames, contact):
+        return {"status": "window_unreadable", "selectionConfirmed": False}
+    last = frames[-1]
+    return {
+        **roster, "chatWindow": window if detached else None,
+        "screenshot": last["path"], "screenshots": {"roster": roster["screenshot"], "chat": last["path"]},
+        "activeChat": last["title"], "selectedChat": last["title"], "selectedChatRequested": contact,
+        "selectionConfirmed": True, "chatPanel": last["panel"],
+    }
+
+
+def _exact_row(roster: dict[str, Any], contact: str) -> dict[str, Any] | None:
+    rows = [row for row in roster["visibleChats"] if normalize_text(row["name"]) == normalize_text(contact)]
+    return rows[0] if len(rows) == 1 else None
+
+
+def _search_field_focused(pid: int) -> bool:
+    script = f'''
+tell application "System Events"
+  set p to first application process whose frontmost is true
+  if unix id of p is not {int(pid)} then return false
+  set field to value of attribute "AXFocusedUIElement" of p
+  if subrole of field is "AXSearchField" then return true
+  if role of field is not "AXTextField" then return false
+  return (value of attribute "AXPlaceholderValue" of field) is in {{"Search", "搜索", "搜尋"}}
+end tell
+'''
+    try:
+        return run(["osascript", "-e", script], timeout=3).stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def probe_chat_background(contact: str) -> dict[str, Any]:
+    """Read an already-open target and corroborate its inbound bubble with the roster preview."""
+    failed = {"status": "selection_unconfirmed", "selectionConfirmed": False}
+    try:
+        roster = probe_roster_background(include_panel=True)
+        if roster["status"] != "ok":
+            return {**roster, "selectionConfirmed": False}
+        row = _exact_row(roster, contact)
+        if not contact.strip() or not row or not row.get("numericBadge") or not row.get("preview"):
+            return failed
+        window = roster["window"]
+        if normalize_text(roster["activeChat"]) != normalize_text(contact):
+            matches = [w for w in list_wechat_windows(passive=True) if normalize_text(w["title"]) == normalize_text(contact)]
+            if len(matches) != 1 or matches[0]["window_id"] == window["window_id"]:
+                return failed
+            window = matches[0]
+        selected = _verified_panel(contact, roster, window)
+        if not selected.get("selectionConfirmed"):
+            return selected
+        inbound = normalize_text(selected["chatPanel"].get("latestInbound", ""))
+        preview = normalize_text(row["preview"])
+        prefix = preview.removesuffix("…").removesuffix("...")
+        if preview != inbound and not (prefix != preview and len(prefix) >= 3 and inbound.startswith(prefix)):
+            return failed
+        return selected
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return {"status": "window_unreadable", "selectionConfirmed": False}
+
+
+def _strict_probe(contact: str, sleep_after_click: float, ui_action: Callable[..., Any] | None) -> dict[str, Any]:
+    front = _require_front_window()
+    window_id = front["window_id"]
+
+    def interact(*args: str) -> None:
+        _perform_ui_action(ui_action, _strict_interaction, list(args), window_id, bounds=front)
+
+    def click(x: int, y: int) -> None:
+        interact("click", "--coords", f"{x},{y}")
+
+    roster = probe_roster_background(include_panel=True)
+    on_roster = window_id == roster["window"]["window_id"]
+    if on_roster and roster["status"] == "service_accounts":
+        click(*roster["serviceBack"])
+        time.sleep(0.3)
+        roster = probe_roster_background(include_panel=True)
+    if roster["status"] != "ok" or not contact:
+        return roster
+    if on_roster:
+        if roster["window"]["window_id"] != window_id:
+            return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+        if normalize_text(roster["activeChat"]) != normalize_text(contact):
+            row = _exact_row(roster, contact)
+            searching = row is None
+            if searching:
+                click(*_roster_search_coords(front))
+                time.sleep(0.15)
+                if not _search_field_focused(front["pid"]):
+                    return {"status": "chat_not_visible", "selectionConfirmed": False}
+                interact("hotkey", "--keys", "cmd,a")
+                if not _search_field_focused(front["pid"]):
+                    return {"status": "chat_not_visible", "selectionConfirmed": False}
+                interact("paste", "--text", contact)
+                time.sleep(max(sleep_after_click, 0.45))
+                matches = probe_roster_background()
+                if matches["status"] == "ok" and matches["window"]["window_id"] == window_id:
+                    row = _exact_row(matches, contact)
+            if not row:
+                interact("press", "escape")
+                return {"status": "chat_not_visible", "selectionConfirmed": False}
+            click(int(row["click"]["x"]), int(row["click"]["y"]))
+            if searching:
+                time.sleep(0.2)
+                interact("press", "escape")
+            time.sleep(max(sleep_after_click, 0.2))
+            roster = probe_roster_background(include_panel=True)
+            if roster["status"] != "ok" or roster["window"]["window_id"] != front["window_id"]:
+                return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+    elif normalize_text(front["title"]) != normalize_text(contact):
+        return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+    selected = _verified_panel(contact, roster, front)
+    _require_front_window(front["window_id"])
+    return selected
+
+
+def verify_chat_for_input(selected: dict[str, Any], contact: str) -> None:
+    detached = bool(selected.get("chatWindow"))
+    window = selected.get("chatWindow") or selected.get("window") or {}
+    window_id = int(window.get("window_id") or 0)
+    target = normalize_text(contact)
+    if not window_id or not target or not selected.get("selectionConfirmed"):
+        raise WeChatNotFrontmost("No verified selection for input")
+    front = _require_front_window(window_id)
+    if detached and normalize_text(front["title"]) != target:
+        raise WeChatNotFrontmost("Foreground chat window changed")
+    try:
+        image = CAPTURE_DIR / f"wechat-input-check-{time.time_ns()}.png"
+        capture_window(image, front, passive=True)
+        obs = _prepare_ocr_items(image, panel_hint="" if detached else "roster")
+        header = _pick_chat_window_title(obs) if detached else _pick_selected_title(obs)
+        if normalize_text(header) != target:
+            raise WeChatNotFrontmost("Foreground chat header changed")
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WeChatNotFrontmost("Could not verify the current chat for input") from exc
+    _require_front_window(window_id)
+
+
 def probe(
     select_chat: str | None = None,
     sleep_after_click: float = 1.0,
     select_chat_click: dict[str, Any] | None = None,
     badge_rescue_targets: list[str] | None = None,
+    ui_action: Callable[..., Any] | None = None,
+    *, strict_foreground: bool = False,
 ) -> dict[str, Any]:
-    activate_wechat()
-    roster_info = ensure_main_roster_window()
+    if strict_foreground:
+        return _strict_probe(select_chat or "", sleep_after_click, ui_action)
+    _perform_ui_action(ui_action, activate_wechat)
+    roster_info = _perform_ui_action(ui_action, ensure_main_roster_window)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     roster_path = CAPTURE_DIR / f"wechat-roster-{timestamp}.png"
     capture_window(roster_path, roster_info)
-    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+    roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=bool(select_chat))
+    if not roster_obs:
+        return {
+            "status": "window_unreadable",
+            "window": roster_info,
+            "screenshot": str(roster_path),
+            "visibleChats": [],
+        }
     if wechat_login_required(roster_obs):
         return {
             "status": "login_required",
@@ -1527,6 +1863,29 @@ def probe(
             "selectionConfirmed": False,
             "chatPanel": {},
         }
+    heading = _service_accounts_heading(roster_obs)
+    if heading:
+        bbox = heading["bbox"]
+        back_x = roster_info["x"] + int(float(bbox["left"]) * roster_info["width"]) + 6
+        back_y = roster_info["y"] + int((float(bbox["top"]) + float(bbox["h"]) / 2) * roster_info["height"])
+        _perform_ui_action(
+            ui_action,
+            click_coords,
+            back_x,
+            back_y,
+            window_id=int(roster_info.get("window_id", 0) or 0),
+            auto_focus=False,
+        )
+        time.sleep(0.3)
+        capture_window(roster_path, roster_info)
+        roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=bool(select_chat))
+        if _service_accounts_heading(roster_obs):
+            return {
+                "status": "service_accounts",
+                "window": roster_info,
+                "screenshot": str(roster_path),
+                "visibleChats": [],
+            }
     chats = annotate_unread_chats(
         extract_visible_chats(roster_obs, roster_info),
         roster_path,
@@ -1561,6 +1920,7 @@ def probe(
                     roster_path,
                     sleep_after_click=sleep_after_click,
                     badge_rescue_targets=badge_rescue_targets,
+                    ui_action=ui_action,
                 )
                 selected_chat = str(search_result.get("selectedChat") or "")
                 roster_info = dict(search_result.get("window") or roster_info)
@@ -1580,7 +1940,9 @@ def probe(
             current_window_id = int(roster_info.get("window_id", 0) or 0)
             if not selected_via_search:
                 if match:
-                    click_coords(
+                    _perform_ui_action(
+                        ui_action,
+                        click_coords,
                         match["click"]["x"],
                         match["click"]["y"],
                         window_id=current_window_id,
@@ -1588,7 +1950,9 @@ def probe(
                     )
                     selected_chat = match["name"]
                 else:
-                    click_coords(
+                    _perform_ui_action(
+                        ui_action,
+                        click_coords,
                         click_x,
                         click_y,
                         window_id=current_window_id,
@@ -1596,9 +1960,9 @@ def probe(
                     )
                     selected_chat = select_chat
                 time.sleep(max(sleep_after_click, 0.2))
-                roster_info = ensure_main_roster_window()
+                roster_info = _perform_ui_action(ui_action, ensure_main_roster_window)
                 capture_window(roster_path, roster_info)
-                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=bool(select_chat))
                 chats = annotate_unread_chats(
                     extract_visible_chats(roster_obs, roster_info),
                     roster_path,
@@ -1606,7 +1970,7 @@ def probe(
                 )
 
     windows = list_wechat_windows()
-    chat_window = choose_chat_window(windows)
+    chat_window = choose_chat_window(windows, requested_title=selected_requested or preselected_title)
     fallback_title = selected_chat or _pick_selected_title(roster_obs)
     panel_vote_frames, panel_vote_interval = _panel_vote_settings()
     if chat_window:
@@ -1614,7 +1978,7 @@ def probe(
         for index in range(panel_vote_frames):
             chat_path = CAPTURE_DIR / f"wechat-chat-{timestamp}-{index}.png"
             capture_window(chat_path, chat_window)
-            chat_obs = _prepare_ocr_items(chat_path)
+            chat_obs = _prepare_ocr_items(chat_path, recover_outbound=True)
             title = _pick_chat_window_title(chat_obs)
             panel = _extract_chat_window_panel(chat_obs, selected_title=title)
             chat_frames.append({"panel": panel, "title": title, "path": str(chat_path)})
@@ -1637,7 +2001,7 @@ def probe(
             ]
             for index in range(1, panel_vote_frames):
                 capture_window(roster_path, roster_info)
-                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+                roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=bool(select_chat))
                 frame_title = _pick_selected_title(roster_obs) or title
                 roster_frames.append(
                     {
@@ -1665,7 +2029,7 @@ def probe(
         ]
         for index in range(1, panel_vote_frames):
             capture_window(roster_path, roster_info)
-            roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster")
+            roster_obs = _prepare_ocr_items(roster_path, panel_hint="roster", recover_outbound=bool(select_chat))
             frame_title = _pick_selected_title(roster_obs) or fallback_title
             roster_frames.append(
                 {
@@ -1714,53 +2078,87 @@ def _input_coords(probe_result: dict[str, Any]) -> tuple[int, int]:
     return x, y
 
 
-def focus_input_box(probe_result: dict[str, Any]) -> None:
+def focus_input_box(
+    probe_result: dict[str, Any],
+    ui_action: Callable[..., Any] | None = None,
+    *, strict_foreground: bool = False,
+) -> None:
     x, y = _input_coords(probe_result)
-    click_coords(x, y)
+    if strict_foreground:
+        window = probe_result.get("chatWindow") or probe_result.get("window") or {}
+        window_id = int(window.get("window_id") or 0)
+        if window_id <= 0 or not probe_result.get("selectionConfirmed"):
+            raise WeChatNotFrontmost("No verified chat window for input")
+        _perform_ui_action(ui_action, _strict_interaction, ["click", "--coords", f"{x},{y}"], window_id, bounds=window)
+        return
+    _perform_ui_action(ui_action, click_coords, x, y)
     time.sleep(0.15)
-    click_coords(x, y)
+    _perform_ui_action(ui_action, click_coords, x, y)
     time.sleep(0.2)
 
 
-def read_input_box_text(probe_result: dict[str, Any]) -> str:
-    previous_clipboard = _read_clipboard_text()
+def read_input_box_text(
+    probe_result: dict[str, Any],
+    ui_action: Callable[..., Any] | None = None,
+    *, strict_foreground: bool = False,
+) -> str:
+    previous_clipboard = _read_clipboard_text(strict=strict_foreground)
     # Put a sentinel into clipboard first. If Cmd+C fails or focus misses
     # the input box, clipboard stays sentinel and we treat it as "no input"
     # instead of misclassifying stale clipboard text as manual edits.
     sentinel = f"__WECHAT_INPUT_PROBE_{time.time_ns()}__"
-    focus_input_box(probe_result)
+    copied = sentinel
+    focus_input_box(probe_result, ui_action=ui_action, strict_foreground=strict_foreground)
     try:
         _write_clipboard_text(sentinel)
         time.sleep(0.05)
-        run(
-            ["osascript", "-e", 'tell application "System Events" to keystroke "a" using {command down}'],
-            timeout=30,
-        )
-        time.sleep(0.1)
-        run(
-            ["osascript", "-e", 'tell application "System Events" to keystroke "c" using {command down}'],
-            timeout=30,
-        )
+        if strict_foreground and _read_clipboard_text(strict=True) != sentinel:
+            raise WeChatNotFrontmost("Could not verify the input clipboard sentinel")
+        for key in ("a", "c"):
+            if strict_foreground:
+                window = probe_result.get("chatWindow") or probe_result["window"]
+                _perform_ui_action(ui_action, _strict_interaction, ["hotkey", "--keys", f"cmd,{key}"], window["window_id"])
+            else:
+                _perform_ui_action(ui_action, run, ["osascript", "-e",
+                    f'tell application "System Events" to keystroke "{key}" using {{command down}}'], timeout=30)
+            if key == "a":
+                time.sleep(0.1)
         time.sleep(0.12)
-        copied = _read_clipboard_text().strip()
+        copied = _read_clipboard_text(strict=strict_foreground).strip()
         if not copied or copied == sentinel:
             return ""
         return copied
     finally:
-        _write_clipboard_text(previous_clipboard)
+        if _read_clipboard_text() in {sentinel, copied}:
+            _write_clipboard_text(previous_clipboard)
 
 
-def paste_text(text: str) -> None:
+def paste_text(text: str, *, strict_foreground: bool = False, window_id: int | None = None) -> None:
+    if strict_foreground:
+        if not window_id or window_id <= 0:
+            raise WeChatNotFrontmost("No verified chat window for paste")
+        _strict_interaction(["paste", "--text", text], window_id)
+        time.sleep(0.2)
+        return
     run_peekaboo_variants(
         peekaboo_commands(["paste", "--text", text, "--app", WECHAT_APP, "--json"]),
         timeout=60,
+        retry_on_error=False,
     )
     time.sleep(0.2)
 
 
-def send_message() -> None:
+def send_message(*, strict_foreground: bool = False, window_id: int | None = None) -> None:
+    if strict_foreground:
+        if not window_id or window_id <= 0:
+            raise WeChatNotFrontmost("No verified chat window for Return")
+        _strict_interaction(["press", "return"], window_id)
+        time.sleep(0.5)
+        return
+    # A transport error can arrive after Return landed; confirmation owns any retry.
     run_peekaboo_variants(
         peekaboo_commands(["press", "return", "--app", WECHAT_APP, "--json"]),
         timeout=60,
+        retry_on_error=False,
     )
     time.sleep(0.5)

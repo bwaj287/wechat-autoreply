@@ -12,7 +12,7 @@
 
 1. `AutoReplyRunner.tick()` samples idle time and the Dock/menu unread signal.
 2. `claim_policy` decides whether evidence is strong enough to enter claim flow.
-3. Passive recovery first captures the hidden roster; WeChat is focused only after a whitelist numeric badge is found.
+3. A background window capture can confirm a changed allowlisted row against an already-open chat. Unconfirmed observations persist across restarts. Interactive checks resume when the user brings WeChat to the foreground and becomes idle.
 4. `wechat_ui` captures windows and returns OCR observations, badge evidence, and panel bubbles.
 5. Claim flow resolves inbound text, suppresses self-echoes, and appends a draft to the FIFO queue.
 6. Pending flow waits for the delay, collects multi-frame OCR samples, and asks `recheck_policy` for consensus.
@@ -52,13 +52,13 @@
 ## Invariants
 
 - A plain red avatar is never actionable unread evidence.
-- Passive scans do not focus WeChat unless a whitelist numeric badge is found.
+- Background probes only read existing window IDs. Selecting a row, inspecting the input box and sending each require an idle user and a verified foreground WeChat window.
 - A global Dock/menu unread signal without a visible whitelist numeric badge is treated as non-whitelist; the runner must not search through whitelist contacts.
 - A gray latest inbound bubble can override text equality with the previous outbound.
 - A pending item is identified and removed by inbound fingerprint, not contact name.
 - `pending` is only a compatibility mirror of `pending_queue[0]`.
 - Event logging and retention cleanup cannot terminate the reply state machine.
-- Foreground WeChat sessions always emit paired open/hide events and restore the previous app when possible.
+- A foreground session emits begin/end events and leaves window visibility and app focus under user control.
 
 ## Verification
 

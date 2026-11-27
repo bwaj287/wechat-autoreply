@@ -106,6 +106,15 @@ def _connected_components(mask: list[list[bool]]) -> list[dict[str, int]]:
     return components
 
 
+def _badge_center_matches_name(
+    center_x: float, center_y: float, name_x: int, name_y: int | None,
+) -> bool:
+    # Row midpoints include the previous preview; only the avatar's upper-right is a badge site.
+    return center_x <= name_x + 4 and (
+        name_y is None or name_y - 18 <= center_y <= name_y + 4
+    )
+
+
 def _embedded_numeric_badge_detection(
     image: Image.Image,
     *,
@@ -115,6 +124,7 @@ def _embedded_numeric_badge_detection(
     y1: int,
     red_components: list[dict[str, int]],
     name_x: int,
+    name_y: int | None,
 ) -> dict[str, int] | None:
     oversized = [
         component
@@ -142,7 +152,7 @@ def _embedded_numeric_badge_detection(
         center_x = (int(digit["minX"]) + int(digit["maxX"])) / 2.0
         center_y = (int(digit["minY"]) + int(digit["maxY"])) / 2.0
         absolute_center_x = x0 + center_x
-        if absolute_center_x > name_x + 4:
+        if not _badge_center_matches_name(absolute_center_x, y0 + center_y, name_x, name_y):
             continue
 
         host = None
@@ -207,6 +217,8 @@ def fallback_row_badge_detection(
     y0 = max(0, int(round(max(0.0, row_top - 0.012) * height)))
     y1 = min(height, int(round(min(1.0, row_top + max(0.085, min(0.135, row_span * 0.78))) * height)))
     name_top = float(row.get("nameTop", 0.0) or 0.0)
+    name_x = int(round(name_left * width))
+    name_y = int(round(name_top * height)) if name_top > row_top else None
     if name_top > row_top:
         # The preview line can contain red emoji with white centers; badge pixels sit above it.
         y1 = min(y1, int(round(min(1.0, name_top + 0.02) * height)))
@@ -221,6 +233,13 @@ def fallback_row_badge_detection(
     components = _connected_components(mask)
     best: dict[str, int] | None = None
     for component in components:
+        if not _badge_center_matches_name(
+            x0 + (component["minX"] + component["maxX"]) / 2.0,
+            y0 + (component["minY"] + component["maxY"]) / 2.0,
+            name_x,
+            name_y,
+        ):
+            continue
         comp_w = int(component["width"])
         comp_h = int(component["height"])
         count = int(component["count"])
@@ -248,7 +267,8 @@ def fallback_row_badge_detection(
             y0=y0,
             y1=y1,
             red_components=components,
-            name_x=int(round(name_left * width)),
+            name_x=name_x,
+            name_y=name_y,
         )
         if embedded is None:
             return None

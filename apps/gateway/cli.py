@@ -30,6 +30,7 @@ TRACE_TYPES = {
     "pending_refreshed_latest",
     "pending_message_changed_recheck",
     "auto_sent",
+    "send_unconfirmed",
     "pending_cancelled",
     "draft_retry_scheduled",
     "draft_retry_recovered",
@@ -152,7 +153,12 @@ def _format_trace(event: dict[str, Any]) -> str:
         return f"{prefix} 发送前检测消息变化，延后{delay_label}复检{suffix}"
     if event_type == "auto_sent":
         draft = _shorten(str(event.get("draft_text") or ""))
+        if event.get("inferred"):
+            return f"{prefix} 历史发送结果未确认：{draft}"
         return f"{prefix} 已发送：{draft}"
+    if event_type == "send_unconfirmed":
+        draft = _shorten(str(event.get("draft_text") or ""))
+        return f"{prefix} 发送结果待核实（不会盲目重发）：{draft}"
     if event_type == "pending_cancelled":
         reason = str(event.get("reason") or "unknown")
         return f"{prefix} 已取消：{reason}"
@@ -360,7 +366,8 @@ def status_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     traces = recent_trace_lines()
     no_new_lines = _recent_open_without_new_message_lines(limit=3)
     runner = _runner_snapshot()
-    lines = [base, _runner_brief(runner)]
+    lines = [base, _runner_brief(runner), *_foreground_wait_lines(state)]
+    lines.extend(_unconfirmed_send_lines(state))
     if bool(state.get("wechat_login_required")) or state.get("last_error") == "wechat_login_required":
         lines.append("警告：微信需要登录，自动回复当前不可用")
     elif bool(config.get("enabled")) and bool(state.get("wechat_window_unavailable")):
@@ -380,6 +387,17 @@ def _pending_queue(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [pending] if isinstance(pending, dict) else []
 
 
+def _foreground_wait_lines(state: dict[str, Any]) -> list[str]:
+    observations = state.get("background_claim_opportunities") or {}
+    deferred = sum(bool(item.get("awaiting_foreground")) for item in _pending_queue(state))
+    if observations or deferred or state.get("foreground_scan_pending"):
+        lines = [f"等待微信处于前台并空闲：待核对会话 {len(observations)} 个，待复核草稿 {deferred} 条"]
+        if state.get("foreground_scan_pending"):
+            lines.append("待核对未读角标")
+        return lines
+    return []
+
+
 def _format_queue_item(index: int, item: dict[str, Any], now: float) -> str:
     contact = str(item.get("contact") or "?").strip()
     inbound = _shorten(str(item.get("inbound_text") or ""), 36) or "-"
@@ -390,15 +408,26 @@ def _format_queue_item(index: int, item: dict[str, Any], now: float) -> str:
     return f"{index}. {contact} · {due_label} | 入站：{inbound} | 草稿：{draft}"
 
 
+def _unconfirmed_send_lines(state: dict[str, Any]) -> list[str]:
+    records = list(state.get("unconfirmed_sends") or [])
+    if not records:
+        return []
+    lines = [f"发送结果待核实：{len(records)} 条（保留记录，不自动重发）"]
+    for item in records[-3:]:
+        lines.append(f"- {item.get('contact', '?')}：{_shorten(str(item.get('draft_text') or ''), 48)}")
+    return lines
+
+
 def queue_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     queue = _pending_queue(state)
     base = status_line(config, len(queue))
     if not queue:
-        return f"{base}\n队列为空"
+        return "\n".join([base, "队列为空", *_foreground_wait_lines(state), *_unconfirmed_send_lines(state)])
     now = time.time()
-    lines = [base, "待发送队列："]
+    lines = [base, *_foreground_wait_lines(state), "待发送队列："]
     for idx, item in enumerate(queue, 1):
         lines.append(_format_queue_item(idx, item, now))
+    lines.extend(_unconfirmed_send_lines(state))
     return "\n".join(lines)
 
 
@@ -413,6 +442,8 @@ def diagnose_output(config: dict[str, Any], state: dict[str, Any]) -> str:
     lines.append(f"- queue_length: {len(queue)}")
     lines.append(f"- last_run_at: {state.get('last_run_at') or '-'}")
     lines.append(f"- last_error: {state.get('last_error') or '-'}")
+    lines.extend(_foreground_wait_lines(state))
+    lines.extend(_unconfirmed_send_lines(state))
     lines.append(f"- wechat_login_required: {bool(state.get('wechat_login_required'))}")
     lines.append(f"- wechat_window_unavailable: {bool(state.get('wechat_window_unavailable'))}")
     lines.append(f"- last_menu_signal: {state.get('last_menu_signal') or '-'}")
@@ -462,7 +493,7 @@ def sent_since_output(config: dict[str, Any], state: dict[str, Any]) -> tuple[st
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if str(event.get("type") or "") != "auto_sent":
+            if str(event.get("type") or "") != "auto_sent" or event.get("inferred"):
                 continue
             event_dt = _parse_iso_datetime(event.get("ts"))
             if not event_dt or event_dt <= baseline_dt or event_dt > now_dt:
@@ -595,6 +626,7 @@ def help_output(config: dict[str, Any], state: dict[str, Any]) -> str:
 def _fresh_runtime_state_preserving_safety_history(before_state: dict[str, Any]) -> dict[str, Any]:
     state = default_state()
     state["recent_auto_outbounds"] = copy.deepcopy(before_state.get("recent_auto_outbounds") or {})
+    state["unconfirmed_sends"] = copy.deepcopy(before_state.get("unconfirmed_sends") or [])
     return state
 
 

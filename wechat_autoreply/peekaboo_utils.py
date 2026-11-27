@@ -28,7 +28,9 @@ def peekaboo_commands(args: list[str]) -> list[list[str]]:
     return commands
 
 
-def run_peekaboo_variants(commands: Iterable[list[str]], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def run_peekaboo_variants(
+    commands: Iterable[list[str]], *, timeout: int = 120, retry_on_error: bool = True,
+) -> subprocess.CompletedProcess[str]:
     errors: list[str] = []
     started = time.monotonic()
     for cmd in commands:
@@ -44,4 +46,6 @@ def run_peekaboo_variants(commands: Iterable[list[str]], *, timeout: int = 120) 
             return run(cmd, timeout=per_cmd_timeout)
         except Exception as exc:  # pragma: no cover - exercised only on macOS host
             errors.append(str(exc))
+            if not retry_on_error:
+                break
     raise RuntimeError(" ; ".join(errors) or "peekaboo command failed")

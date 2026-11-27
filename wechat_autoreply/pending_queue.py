@@ -93,7 +93,7 @@ def prune_stale_pending(
     removed: list[dict[str, Any]] = []
     for item in queue:
         anchor = _pending_anchor_ts(item)
-        if anchor <= 0 or now - anchor <= ttl_seconds:
+        if item.get("awaiting_foreground") or anchor <= 0 or now - anchor <= ttl_seconds:
             kept.append(item)
         else:
             removed.append(item)

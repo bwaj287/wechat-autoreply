@@ -120,9 +120,10 @@ class DuplicateDraftGuardTests(unittest.TestCase):
             "inbound_fingerprint": "new-inbound",
         }
         state["pending_queue"] = [pending]
+        config = {"allowed_contacts": ["May"], "recent_auto_outbound_ttl_seconds": 3600, "send_delay_seconds": 300}
 
         result = runner._handle_pending(
-            {"recent_auto_outbound_ttl_seconds": 3600, "send_delay_seconds": 300},
+            config,
             state,
             pending,
             idle_seconds=60.0,
@@ -133,7 +134,7 @@ class DuplicateDraftGuardTests(unittest.TestCase):
         self.assertEqual(state["pending_queue"][0]["due_at"], 240.0)
 
         result = runner._handle_pending(
-            {"recent_auto_outbound_ttl_seconds": 3600, "send_delay_seconds": 300},
+            config,
             state,
             pending,
             idle_seconds=60.0,

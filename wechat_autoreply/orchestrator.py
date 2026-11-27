@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import copy
 import hashlib
 import re
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .background_claim import process_background_claims
 from .capture_cleanup import cleanup_runtime_artifacts_older_than
 from .claim_policy import (
     candidate_contact_name,
@@ -86,7 +88,10 @@ MEDIA_PREVIEW_PREFIX_RE = re.compile(
     r"(?i)^\s*[\[\(（【<〈《［]\s*(?:link|photo|picture|image|pic|sticker|emoji|video|图片|照片|相片|截图|表情包|贴纸|视频)"
     r"(?:[^\]\)）】>〉》］]{0,12})?[\]\)）】>〉》］]"
 )
-MAX_INTERNAL_UI_SUPPRESSION_SECONDS = 0.45
+
+
+class _UserActivityPause(Exception):
+    pass
 
 
 def normalize_text(text: str) -> str:
@@ -259,7 +264,7 @@ def _extract_quote_payload(
     if quote_index is None or not quote_match:
         return {}
     main_lines = _sanitize_inbound_lines(
-        [str(item.get("text", "")).strip() for item in rows[:quote_index] if item.get("text")],
+        [str(item.get("text", "")).strip() for idx, item in enumerate(rows) if idx != quote_index and item.get("text")],
         preview,
     )
     main_text = "\n".join(main_lines) if main_lines else ""
@@ -1221,6 +1226,17 @@ def latest_message_is_outbound(panel: dict[str, Any], *, max_top: float = 0.90, 
     return outbound_top > inbound_top + epsilon
 
 
+def latest_bubble_is_unresolved(panel: dict[str, Any]) -> bool:
+    known = list(panel.get("inbound") or []) + list(panel.get("outbound") or [])
+    known_top = max((float(item.get("top", 0)) for item in known if item.get("text")), default=-1)
+    return any(
+        str(item.get("text") or "").strip()
+        and not is_history_marker(str(item["text"]))
+        and known_top + 0.01 < float(item.get("top", 0)) <= 0.90
+        for item in panel.get("misc") or []
+    )
+
+
 def latest_panel_bubble_is_inbound_gray(
     panel: dict[str, Any],
     *,
@@ -1315,8 +1331,11 @@ class AutoReplyRunner:
         self.append_event = append_event_fn
         self.now = now_fn or time.time
         self.dry_run = dry_run
-        self._internal_ui_grace_until = 0.0
         self._internal_ui_idle_floor = 0.0
+        self._internal_ui_event_at = 0.0
+        self._internal_ui_action_end_at = 0.0
+        self._idle_threshold = 20.0
+        self._user_activity_pause = False
 
     def _contact_memory_enabled(self, config: dict[str, Any]) -> bool:
         return bool(config.get("contact_memory_enabled", True))
@@ -1368,45 +1387,54 @@ class AutoReplyRunner:
 
     def _live_idle_seconds(self) -> float:
         seconds = self._raw_idle_seconds()
-        if self.now() < self._internal_ui_grace_until:
-            return max(seconds, self._internal_ui_idle_floor)
-        self._internal_ui_idle_floor = 0.0
+        now = self.now()
+        if self._internal_ui_event_at and now - seconds <= self._internal_ui_event_at + 0.01:
+            return max(seconds, self._internal_ui_idle_floor + max(0.0, now - self._internal_ui_action_end_at))
         return seconds
+
+    def _ensure_user_idle(self) -> None:
+        if self._live_idle_seconds() < self._idle_threshold:
+            self._user_activity_pause = True
+            raise _UserActivityPause()
 
     def _run_internal_ui_action(
         self,
         action: Callable[..., Any],
         *args: Any,
-        grace_seconds: float = 1.5,
         **kwargs: Any,
     ) -> Any:
-        idle_floor = max(self._live_idle_seconds(), 30.0)
+        self._ensure_user_idle()
+        idle_floor = max(self._live_idle_seconds(), self._idle_threshold)
+        if not self._wechat_frontmost():
+            raise wechat_ui.WeChatNotFrontmost()
         result = action(*args, **kwargs)
-        # Only suppress our own synthetic input for a very short window.
-        # Longer masking makes real user activity look idle and lets the
-        # runner keep stealing focus after the user has resumed control.
-        effective_grace = min(
-            max(float(grace_seconds or 0.0), 0.0),
-            MAX_INTERNAL_UI_SUPPRESSION_SECONDS,
-        )
-        self._internal_ui_idle_floor = max(self._internal_ui_idle_floor, idle_floor)
-        if effective_grace > 0:
-            self._internal_ui_grace_until = max(
-                self._internal_ui_grace_until,
-                self.now() + effective_grace,
-            )
+        # Only the individual native mutation gets credit for its input timestamp.
+        self._internal_ui_idle_floor = idle_floor
+        self._internal_ui_action_end_at = self.now()
+        self._internal_ui_event_at = self._internal_ui_action_end_at - self._raw_idle_seconds()
         return result
 
-    def _activate_wechat_ui(self) -> None:
-        self._run_internal_ui_action(self.ui.activate_wechat, grace_seconds=2.5)
+    def _wechat_frontmost(self) -> bool:
+        try:
+            return bool(self.ui.is_wechat_frontmost())
+        except Exception:
+            return False
 
     def _probe_ui(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        sleep_after_click = float(kwargs.get("sleep_after_click", 0.0) or 0.0)
-        select_chat = kwargs.get("select_chat")
-        grace_seconds = 1.5
-        if select_chat:
-            grace_seconds = max(grace_seconds, sleep_after_click + 1.0)
-        return self._run_internal_ui_action(self.ui.probe, *args, grace_seconds=grace_seconds, **kwargs)
+        self._require_interactive_wechat()
+        result = self.ui.probe(*args, strict_foreground=True, ui_action=self._run_internal_ui_action, **kwargs)
+        self._require_interactive_wechat()
+        return result
+
+    def _require_interactive_wechat(self) -> None:
+        self._ensure_user_idle()
+        if not self._wechat_frontmost():
+            raise wechat_ui.WeChatNotFrontmost()
+
+    def _verify_input_target(self, selected: dict[str, Any], contact: str) -> None:
+        self._require_interactive_wechat()
+        self.ui.verify_chat_for_input(selected, contact)
+        self._require_interactive_wechat()
 
     def _probe_roster_background_ui(self) -> dict[str, Any]:
         probe = getattr(self.ui, "probe_roster_background", None)
@@ -1438,70 +1466,29 @@ class AutoReplyRunner:
         state["wechat_login_required"] = False
 
     def _focus_input_box_ui(self, selected: dict[str, Any]) -> None:
-        self._run_internal_ui_action(self.ui.focus_input_box, selected, grace_seconds=1.0)
+        self._require_interactive_wechat()
+        self.ui.focus_input_box(selected, strict_foreground=True, ui_action=self._run_internal_ui_action)
 
-    def _paste_text_ui(self, text: str) -> None:
-        self._run_internal_ui_action(self.ui.paste_text, text, grace_seconds=1.0)
+    def _paste_text_ui(self, text: str, window_id: int) -> None:
+        self._run_internal_ui_action(self.ui.paste_text, text, window_id=window_id, strict_foreground=True)
 
-    def _send_message_ui(self) -> None:
-        self._run_internal_ui_action(self.ui.send_message, grace_seconds=1.0)
+    def _send_message_ui(self, window_id: int) -> None:
+        self._run_internal_ui_action(self.ui.send_message, window_id=window_id, strict_foreground=True)
 
     def _read_input_box_text_ui(self, selected: dict[str, Any]) -> str:
-        return str(
-            self._run_internal_ui_action(
-                self.ui.read_input_box_text,
-                selected,
-                grace_seconds=2.0,
-            )
-            or ""
-        ).strip()
+        self._require_interactive_wechat()
+        value = self.ui.read_input_box_text(selected, strict_foreground=True, ui_action=self._run_internal_ui_action)
+        self._require_interactive_wechat()
+        return str(value or "").strip()
 
-    def _hide_wechat_ui(self) -> None:
-        self._run_internal_ui_action(self.ui.hide_wechat, grace_seconds=0.75)
-
-    def _restore_frontmost_app_ui(self, app_name: str) -> None:
-        self._run_internal_ui_action(self.ui.restore_frontmost_app, app_name, grace_seconds=0.75)
-
-    def _open_wechat_foreground(self, *, reason: str, **event_payload: Any) -> str:
-        restore_app = ""
-        if hasattr(self.ui, "capture_frontmost_app"):
-            try:
-                restore_app = str(self.ui.capture_frontmost_app() or "")
-            except Exception:
-                restore_app = ""
-        self.append_event(
-            "wechat_window_action",
-            action="open",
-            reason=reason,
-            **event_payload,
-        )
-        self._activate_wechat_ui()
-        return restore_app
-
-    def _close_wechat_foreground(
-        self,
-        *,
-        reason: str,
-        restore_app: str,
-        **event_payload: Any,
-    ) -> None:
-        self.append_event(
-            "wechat_window_action",
-            action="hide",
-            reason=reason,
-            **event_payload,
-        )
-        self._hide_wechat_ui()
-        if restore_app and hasattr(self.ui, "restore_frontmost_app"):
-            try:
-                self._restore_frontmost_app_ui(restore_app)
-            except Exception as exc:
-                self.append_event(
-                    "restore_frontmost_failed",
-                    context=reason,
-                    error=str(exc),
-                    app=restore_app,
-                )
+    @contextmanager
+    def _foreground_session(self, reason: str, **details: Any):
+        self._require_interactive_wechat()
+        self.append_event("wechat_foreground_session", action="begin", reason=reason, **details)
+        try:
+            yield
+        finally:
+            self.append_event("wechat_foreground_session", action="end", reason=reason, **details)
 
     def _claim_abort_user_active(
         self,
@@ -1511,6 +1498,7 @@ class AutoReplyRunner:
         phase: str,
     ) -> dict[str, Any]:
         live_idle_seconds = self._live_idle_seconds()
+        self._user_activity_pause = True
         state["claim_retry_pending"] = True
         self.append_event(
             "claim_aborted_user_active",
@@ -1534,6 +1522,7 @@ class AutoReplyRunner:
         phase: str,
     ) -> dict[str, Any]:
         live_idle_seconds = self._live_idle_seconds()
+        self._user_activity_pause = True
         queue = sync_pending_state(state)
         self.append_event(
             "pending_aborted_user_active",
@@ -1553,12 +1542,15 @@ class AutoReplyRunner:
 
     def tick(self) -> dict[str, Any]:
         config = self.load_config()
+        self._idle_threshold = float(config.get("idle_threshold_seconds", 20))
+        self._user_activity_pause = False
         state = self.load_state()
         state["last_run_at"] = utc_now_iso()
         now = float(self.now())
         recent_outbound_ttl = _recent_auto_outbound_ttl(config)
         _prune_recent_auto_outbounds(state, now=now, ttl_seconds=recent_outbound_ttl)
         result: dict[str, Any]
+        claim_in_progress = False
 
         try:
             if not config.get("enabled"):
@@ -1566,20 +1558,13 @@ class AutoReplyRunner:
                 result = {"status": "disabled"}
                 return result
 
-            idle_seconds = float(self.idle.get_idle_time_seconds())
-            idle_threshold = float(config.get("idle_threshold_seconds", 30))
+            idle_seconds = self._live_idle_seconds()
+            idle_threshold = self._idle_threshold
+            frontmost = self._wechat_frontmost()
+            interactive = frontmost and idle_seconds >= idle_threshold
             idle_probe_armed = bool(state.get("idle_probe_armed", True))
-            claim_retry_pending = bool(state.get("claim_retry_pending", False))
-            if idle_seconds < idle_threshold:
-                # While user is active, don't sample menubar digits; clear transient menu signal
-                # to avoid stale "has digit" state triggering a late false open.
+            if not interactive:
                 state["idle_probe_armed"] = True
-                idle_probe_armed = True
-                if not claim_retry_pending:
-                    state["last_menu_unread"] = False
-                    state["last_menu_signal"] = ""
-                    state["last_claim_menu_signal"] = ""
-                    state["pending_menu_clear_streak"] = 0
 
             def _record_menu_signal(menu_signal: str, *, source: str) -> None:
                 has_unread = bool(menu_signal)
@@ -1603,16 +1588,12 @@ class AutoReplyRunner:
                         state["last_claim_menu_signal"] = ""
                 self.append_event("menu_bar_checked", unread=has_unread, signal=menu_signal, source=source)
 
-            menu_checked_now = False
-            should_check_menu = False
-            if idle_seconds >= idle_threshold:
-                check_interval_due = now - float(state.get("last_menu_check_at", 0.0) or 0.0) >= float(
-                    config.get("menubar_check_interval_seconds", 15)
-                )
-                should_check_menu = check_interval_due or idle_probe_armed
-            if should_check_menu:
+            check_interval_due = now - float(state.get("last_menu_check_at", 0.0) or 0.0) >= float(
+                config.get("menubar_check_interval_seconds", 15)
+            )
+            menu_checked_now = check_interval_due or (idle_probe_armed and interactive)
+            if menu_checked_now:
                 _record_menu_signal(self._menu_unread_signal(), source="interval")
-                menu_checked_now = True
 
             cleanup_interval = float(config.get("capture_cleanup_interval_seconds", 43200))
             if now - float(state.get("last_capture_cleanup_at", 0.0) or 0.0) >= cleanup_interval:
@@ -1639,6 +1620,9 @@ class AutoReplyRunner:
 
             queue = sync_pending_state(state)
             stale_ttl_seconds = float(config.get("pending_stale_ttl_seconds", 86400))
+            if not interactive:
+                for item in queue:
+                    item["awaiting_foreground"] = True
             queue, stale_removed = prune_stale_pending(queue, now=now, ttl_seconds=stale_ttl_seconds)
             if stale_removed:
                 sync_pending_state(state, queue)
@@ -1656,7 +1640,7 @@ class AutoReplyRunner:
             # This makes "new unread while pending" go through claim flow before send-time recheck.
             if (
                 next_pending is not None
-                and idle_seconds >= idle_threshold
+                and interactive
                 and now >= float(next_pending.get("due_at", 0.0) or 0.0)
                 and not menu_checked_now
             ):
@@ -1668,24 +1652,74 @@ class AutoReplyRunner:
             menu_signal_rising_now = menu_signal_rising(current_menu_signal, previous_claim_signal)
             roster_sweep_interval = float(config.get("roster_sweep_interval_seconds", 60) or 60)
             roster_sweep_due = now - float(state.get("last_roster_sweep_at", 0.0) or 0.0) >= roster_sweep_interval
-            passive_sweep_due = bool(config.get("passive_roster_sweep_enabled", False)) and roster_sweep_due
+            if not interactive:
+                if menu_checked_now and menu_signal_rising_now:
+                    state["foreground_scan_pending"] = True
+                    state["last_claim_menu_signal"] = current_menu_signal
+                background_result = {}
+                if ((menu_checked_now and menu_signal_rising_now) or
+                        (roster_sweep_due and config.get("passive_roster_sweep_enabled"))):
+                    state["last_roster_sweep_at"] = now
+                    try:
+                        roster = self._probe_roster_background_ui()
+                    except Exception as exc:
+                        roster = {"status": "window_unreadable"}
+                        self.append_event("background_roster_unavailable", error=str(exc))
+                    page_status = roster.get("status")
+                    if page_status == "login_required":
+                        self._mark_wechat_login_required(state, source="background_roster")
+                    elif page_status == "ok":
+                        self._mark_wechat_available(state)
+                        state["wechat_window_unavailable"] = False
+                        background_result = process_background_claims(
+                            self, config, state, roster, now, dock_signal=current_menu_signal
+                        )
+                    elif page_status == "service_accounts":
+                        state["foreground_scan_pending"] = True
+                    elif page_status == "window_unreadable":
+                        state["wechat_window_unavailable"] = True
+                queue = sync_pending_state(state)
+                for item in queue:
+                    item["awaiting_foreground"] = True
+                state["last_error"] = "wechat_login_required" if state.get("wechat_login_required") else ""
+                for item in queue:
+                    if not item.get("draft_text") and now >= float(item.get("due_at") or 0):
+                        return self._retry_missing_draft(config, state, item, queue, now)
+                if background_result.get("draft_count"):
+                    return background_result
+                work_waiting = bool(queue or state.get("background_claim_opportunities")
+                                    or state.get("foreground_scan_pending") or state.get("claim_retry_pending"))
+                if not frontmost and work_waiting:
+                    return {"status": "waiting_for_wechat", "queue_length": len(queue)}
+                return {"status": "pending_wait_user_active" if queue else "idle_wait",
+                        "idle_seconds": round(idle_seconds, 2), "queue_length": len(queue)}
+
+            passive_sweep_due = (
+                bool(config.get("passive_roster_sweep_enabled", False))
+                and roster_sweep_due
+                and idle_seconds >= idle_threshold
+            )
             passive_claim_ready = False
             if (
                 passive_sweep_due
                 and not actionable_menu_signal
                 and not bool(state.get("claim_retry_pending", False))
+                and self._live_idle_seconds() >= idle_threshold
             ):
                 try:
                     background_probe = self._probe_roster_background_ui()
-                    if str(background_probe.get("status") or "") == "login_required":
+                    page_status = str(background_probe.get("status") or "")
+                    if page_status == "login_required":
                         self._mark_wechat_login_required(
                             state,
                             source="passive_roster_preflight",
                             screenshot=str(background_probe.get("screenshot") or ""),
                         )
-                    elif str(background_probe.get("status") or "") == "ok":
+                    elif page_status == "ok":
                         self._mark_wechat_available(state)
                         state["wechat_window_unavailable"] = False
+                    elif page_status == "window_unreadable":
+                        state["wechat_window_unavailable"] = True
                     visible_chats = list(background_probe.get("visibleChats", []) or [])
                     allowed_contacts = list(config.get("allowed_contacts", []))
                     preflight = evaluate_passive_preflight(visible_chats, allowed_contacts)
@@ -1714,9 +1748,10 @@ class AutoReplyRunner:
                     ignored_queued_badge_rows = [
                         row for row in preflight.badge_rows if row not in actionable_badge_rows
                     ]
-                    passive_claim_ready = bool(actionable_badge_rows)
+                    passive_claim_ready = bool(actionable_badge_rows) or page_status == "service_accounts"
                     self.append_event(
                         "passive_roster_preflight",
+                        page_status=page_status,
                         badge_detected=preflight.badge_detected,
                         badge_rows=list(preflight.badge_rows),
                         actionable_badge_rows=actionable_badge_rows,
@@ -1752,16 +1787,24 @@ class AutoReplyRunner:
                 passive_claim_ready=passive_claim_ready,
             )
             claim_result: dict[str, Any] | None = None
-            if claim_decision.should_claim:
+            deferred_scan = bool(state.get("foreground_scan_pending") or state.get("background_claim_opportunities"))
+            deferred_due = deferred_scan and now >= float(state.get("deferred_scan_retry_at") or 0)
+            if claim_decision.should_claim or deferred_due:
                 state["idle_probe_armed"] = False
                 state["last_claim_menu_signal"] = current_menu_signal
+                claim_in_progress = True
                 claim_result = self._handle_claim(
                     config,
                     state,
                     idle_seconds,
                     now,
-                    claim_trigger=claim_decision.trigger,
+                    claim_trigger=claim_decision.trigger or "foreground_deferred",
                 )
+                claim_in_progress = False
+                if deferred_scan:
+                    if claim_result["status"] in {"no_candidate", "draft_saved", "drafts_saved"}:
+                        state["foreground_scan_pending"] = False
+                    state["deferred_scan_retry_at"] = now + roster_sweep_interval
                 queue = sync_pending_state(state)
                 next_pending = select_next_pending(queue)
 
@@ -1781,6 +1824,34 @@ class AutoReplyRunner:
                 "wechat_login_required" if bool(state.get("wechat_login_required")) else ""
             )
             return result
+        except wechat_ui.WeChatNotFrontmost:
+            if claim_in_progress:
+                state["foreground_scan_pending"] = True
+                state["deferred_scan_retry_at"] = 0
+            queue = sync_pending_state(state)
+            for item in queue:
+                item["awaiting_foreground"] = True
+            state["last_error"] = ""
+            return {"status": "waiting_for_wechat", "queue_length": len(queue)}
+        except _UserActivityPause:
+            # A paused send already lives in the queue; it needs no new roster claim.
+            state["claim_retry_pending"] = bool(state.get("claim_retry_pending")) or claim_in_progress
+            state["idle_probe_armed"] = True
+            state["last_error"] = ""
+            live_idle_seconds = self._live_idle_seconds()
+            queue = sync_pending_state(state)
+            self.append_event(
+                "ui_paused_user_active",
+                phase="claim" if claim_in_progress else "pending" if queue else "preflight",
+                idle_seconds=round(live_idle_seconds, 2),
+                threshold=idle_threshold,
+                queue_contacts=queued_contacts(queue),
+            )
+            return {
+                "status": "pending_wait_user_active" if queue else "idle_wait",
+                "idle_seconds": round(live_idle_seconds, 2),
+                "queue_length": len(queue),
+            }
         except Exception as exc:
             state["last_error"] = str(exc)
             self.append_event("runner_error", error=str(exc))
@@ -1910,6 +1981,134 @@ class AutoReplyRunner:
         )
         return retry_text
 
+    def _record_confirmed_claim(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+        candidate: dict[str, Any],
+        selected: dict[str, Any],
+        inbound_payload: dict[str, str],
+        inbound_text: str,
+        outbound_snapshot: str,
+        idle_seconds: float,
+        now: float,
+        *,
+        llm: Any | None = None,
+    ) -> str:
+        contact = candidate_contact_name(candidate)
+        panel = selected.get("chatPanel") or {}
+        queue = sync_pending_state(state)
+        existing_index = find_queue_index_for_contact(queue, contact)
+        context_messages = build_reply_context(
+            panel,
+            inbound_text,
+            max_messages=int(config.get("reply_context_messages", 8)),
+            quoted_message=inbound_payload,
+        )
+        message_time = str(candidate.get("time") or "")
+        inbound_fingerprint = fingerprint(contact, inbound_text, message_time)
+        if existing_index >= 0:
+            existing = queue[existing_index]
+            if inbound_variant_equivalent(
+                str(existing.get("inbound_text", "")),
+                inbound_text,
+                pending_time=str(existing.get("message_time", "")),
+                current_time=message_time,
+            ):
+                self.append_event("claim_skipped", reason="inbound_variant_equivalent", contact=contact)
+                return ""
+            if inbound_fingerprint == existing.get("inbound_fingerprint"):
+                self.append_event("claim_skipped", reason="already_queued", contact=contact)
+                return ""
+            updated = self._refresh_pending(
+                config,
+                state,
+                queue,
+                existing_index,
+                inbound_text,
+                outbound_snapshot,
+                selected,
+                idle_seconds,
+                now,
+                reason="latest_message_seen",
+                message_time=message_time,
+                llm=llm,
+                context_messages=context_messages,
+                inbound_payload=inbound_payload,
+            )
+            if updated is None:
+                return ""
+            return "refreshed"
+        if state.get("last_seen_inbound", {}).get(contact) == inbound_fingerprint:
+            self.append_event("claim_skipped", reason="already_seen", contact=contact)
+            return ""
+        if any(item.get("inbound_fingerprint") == inbound_fingerprint for item in queue):
+            self.append_event("claim_skipped", reason="already_queued", contact=contact)
+            return ""
+
+        contact_memory = self._load_contact_memory(config, contact)
+        draft_text = self._generate_guarded_reply(
+            config,
+            state,
+            llm or self._build_llm(config),
+            contact,
+            inbound_text,
+            now=now,
+            conversation_context=context_messages,
+            contact_memory=contact_memory,
+            screenshot_path=_preferred_chat_screenshot(selected),
+            quoted_message=inbound_payload,
+        )
+        if not draft_text:
+            self.append_event(
+                "draft_retry_scheduled",
+                contact=contact,
+                reason="duplicate_draft_blocked",
+                inbound_text=inbound_text,
+                retry_seconds=120,
+            )
+        pending = {
+            "contact": contact,
+            "inbound_text": inbound_text,
+            "quoted_text": str(inbound_payload.get("quoted_text") or "").strip(),
+            "quoted_role": str(inbound_payload.get("quoted_role") or "").strip(),
+            "quoted_sender": str(inbound_payload.get("quoted_sender") or "").strip(),
+            "message_time": message_time,
+            "inbound_fingerprint": inbound_fingerprint,
+            "draft_text": draft_text,
+            "created_at": now,
+            "due_at": now + (120 if not draft_text else float(config.get("send_delay_seconds", 300))),
+            "draft_retry_count": 0,
+            "low_confidence_retries": 0,
+            "outbound_snapshot": outbound_snapshot,
+            "active_chat_title": selected.get("activeChat", ""),
+            "chat_context": context_messages,
+        }
+        queue.append(pending)
+        state.setdefault("last_seen_inbound", {})[contact] = inbound_fingerprint
+        sync_pending_state(state, queue)
+        self.save_state(state)
+        if draft_text:
+            self.append_event(
+                "draft_saved_locally",
+                contact=contact,
+                inbound_text=inbound_text,
+                draft_text=draft_text,
+                due_at=pending["due_at"],
+                idle_seconds=round(idle_seconds, 2),
+                context_turns=len(context_messages),
+                queue_length=len(queue),
+                queue_contacts=queued_contacts(queue),
+            )
+        self._remember_contact_memory(
+            config,
+            contact,
+            context_messages=context_messages,
+            inbound_text=inbound_text,
+            source="draft_saved" if draft_text else "draft_retry_scheduled",
+        )
+        return "added"
+
     def _handle_claim(
         self,
         config: dict[str, Any],
@@ -1919,7 +2118,7 @@ class AutoReplyRunner:
         *,
         claim_trigger: str = "menu_signal",
     ) -> dict[str, Any]:
-        idle_threshold = float(config.get("idle_threshold_seconds", 30))
+        idle_threshold = float(config.get("idle_threshold_seconds", 20))
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:
             return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="pre_handle")
@@ -1928,12 +2127,11 @@ class AutoReplyRunner:
         if live_idle_seconds < idle_threshold:
             return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="pre_open_recheck")
         state["last_roster_sweep_at"] = now
-        restore_app = self._open_wechat_foreground(
-            reason="claim_scan",
+        with self._foreground_session(
+            "claim_scan",
             trigger=claim_trigger,
             queue_contacts=queued_contacts(sync_pending_state(state)),
-        )
-        try:
+        ):
             if self._live_idle_seconds() < idle_threshold:
                 return self._claim_abort_user_active(state, idle_threshold=idle_threshold, phase="after_open")
             allowed_contacts = list(config.get("allowed_contacts", []))
@@ -1966,6 +2164,15 @@ class AutoReplyRunner:
                     screenshot=str(probe_result.get("screenshot") or ""),
                 )
                 return {"status": "login_required"}
+            if str(probe_result.get("status") or "") == "service_accounts":
+                state["claim_retry_candidate"] = stored_retry or None
+                state["claim_retry_pending"] = bool(stored_retry)
+                self.append_event("service_accounts_recovery_deferred", screenshot=probe_result.get("screenshot", ""))
+                return {"status": "service_accounts"}
+            if str(probe_result.get("status") or "") == "window_unreadable":
+                state["wechat_window_unavailable"] = True
+                self.append_event("claim_window_unreadable", screenshot=probe_result.get("screenshot", ""))
+                return {"status": "window_unreadable"}
             if str(probe_result.get("status") or "") == "ok":
                 self._mark_wechat_available(state)
             _update_badge_streaks(state, probe_result, allowed_contacts)
@@ -2127,6 +2334,24 @@ class AutoReplyRunner:
                 trigger=claim_trigger,
                 queue_contacts=queued_contacts(queue),
             )
+            opportunities = state.setdefault("background_claim_opportunities", {})
+            current_contacts = {candidate_contact_name(row) for row in candidates}
+            for contact, observed in list(opportunities.items()):
+                if contact not in allowed_contacts:
+                    del opportunities[contact]
+                    continue
+                if contact in current_contacts:
+                    continue
+                rows = [r for r in visible_chats if normalize_text(r.get("name")) == normalize_text(contact)]
+                if len(rows) > 1:
+                    continue
+                # An offscreen contact must be found again by name, never by a saved coordinate.
+                row = rows[0] if rows else {}
+                preview = str(row.get("preview") or observed.get("preview") or "").strip()
+                if preview:
+                    candidates.append(dict(row, name=contact, matchedContact=contact, preview=preview,
+                                           time=row.get("time") or observed.get("time", ""),
+                                           source="background_deferred", hadNumericUnreadBadge=True))
             if not candidates and is_actionable_menu_signal(str(state.get("last_menu_signal") or "")):
                 preview_fallback = choose_whitelist_preview_fallback_candidate(
                     probe_result,
@@ -2211,13 +2436,11 @@ class AutoReplyRunner:
             added: list[str] = []
             refreshed: list[str] = []
             abort_result: dict[str, Any] | None = None
-            queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
             llm = self._build_llm(config)
             recent_outbound_ttl = _recent_auto_outbound_ttl(config)
 
             def process_candidates(snapshot_candidates: list[dict[str, Any]]) -> None:
                 nonlocal queue
-                nonlocal queue_fingerprints
                 nonlocal abort_result
                 for candidate in snapshot_candidates:
                     if self._live_idle_seconds() < idle_threshold:
@@ -2322,6 +2545,17 @@ class AutoReplyRunner:
 
                     panel = selected.get("chatPanel", {}) or {}
                     preview_text = str(candidate.get("preview") or "")
+                    if candidate.get("source") == "background_deferred":
+                        # The user opening the conversation can clear its badge. Recheck who spoke last.
+                        if not selected.get("selectionConfirmed") or normalize_text(selected.get("activeChat")) != normalize_text(contact):
+                            continue
+                        if latest_message_is_outbound(panel):
+                            opportunities.pop(contact, None)
+                            continue
+                        if not (latest_panel_bubble_is_inbound_gray(panel)
+                                and not latest_bubble_is_unresolved(panel)
+                                and preview_panel_equivalent(preview_text, choose_inbound_text(panel))):
+                            continue
                     outbound_snapshot = latest_committed_outbound(panel)
                     badge_panel_confirms_inbound = bool(
                         _has_row_numeric_unread_badge(candidate)
@@ -2363,7 +2597,6 @@ class AutoReplyRunner:
                                 current_outbound=outbound_snapshot,
                             )
                             queue = sync_pending_state(state)
-                            queue_fingerprints = {str(item.get("inbound_fingerprint", "")) for item in queue}
                         self.append_event(
                             "claim_skipped",
                             reason="preview_matches_outbound",
@@ -2575,119 +2808,15 @@ class AutoReplyRunner:
                             quoted_sender=str(inbound_payload.get("quoted_sender") or "").strip(),
                         )
 
-                    context_messages = build_reply_context(
-                        panel,
-                        inbound_text,
-                        max_messages=int(config.get("reply_context_messages", 8)),
-                        quoted_message=inbound_payload,
+                    change = self._record_confirmed_claim(
+                        config, state, candidate, selected, inbound_payload, inbound_text,
+                        outbound_snapshot, idle_seconds, now, llm=llm,
                     )
-                    message_time = str(candidate.get("time") or "")
-                    inbound_fingerprint = fingerprint(contact, inbound_text, message_time)
-                    if existing_index >= 0:
-                        existing = queue[existing_index]
-                        if inbound_variant_equivalent(
-                            str(existing.get("inbound_text", "")),
-                            inbound_text,
-                            pending_time=str(existing.get("message_time", "")),
-                            current_time=message_time,
-                        ):
-                            self.append_event("claim_skipped", reason="inbound_variant_equivalent", contact=contact)
-                            continue
-                        if inbound_fingerprint == existing.get("inbound_fingerprint"):
-                            self.append_event("claim_skipped", reason="already_queued", contact=contact)
-                            continue
-                        updated = self._refresh_pending(
-                            config,
-                            state,
-                            queue,
-                            existing_index,
-                            inbound_text,
-                            outbound_snapshot,
-                            selected,
-                            idle_seconds,
-                            now,
-                            reason="latest_message_seen",
-                            message_time=message_time,
-                            llm=llm,
-                            context_messages=context_messages,
-                            inbound_payload=inbound_payload,
-                        )
-                        queue_fingerprints.discard(str(existing.get("inbound_fingerprint", "")))
-                        if updated is None:
-                            continue
-                        queue_fingerprints.add(str(updated.get("inbound_fingerprint", "")))
+                    opportunities.pop(contact, None)
+                    if change == "added":
+                        added.append(contact)
+                    elif change == "refreshed":
                         refreshed.append(contact)
-                        continue
-                    if state.get("last_seen_inbound", {}).get(contact) == inbound_fingerprint:
-                        self.append_event("claim_skipped", reason="already_seen", contact=contact)
-                        continue
-                    if inbound_fingerprint in queue_fingerprints:
-                        self.append_event("claim_skipped", reason="already_queued", contact=contact)
-                        continue
-
-                    contact_memory = self._load_contact_memory(config, contact)
-                    draft_text = self._generate_guarded_reply(
-                        config,
-                        state,
-                        llm,
-                        contact,
-                        inbound_text,
-                        now=now,
-                        conversation_context=context_messages,
-                        contact_memory=contact_memory,
-                        screenshot_path=_preferred_chat_screenshot(selected),
-                        quoted_message=inbound_payload,
-                    )
-                    if not draft_text:
-                        self.append_event(
-                            "draft_retry_scheduled",
-                            contact=contact,
-                            reason="duplicate_draft_blocked",
-                            inbound_text=inbound_text,
-                            retry_seconds=120,
-                        )
-                    pending = {
-                        "contact": contact,
-                        "inbound_text": inbound_text,
-                        "quoted_text": str(inbound_payload.get("quoted_text") or "").strip(),
-                        "quoted_role": str(inbound_payload.get("quoted_role") or "").strip(),
-                        "quoted_sender": str(inbound_payload.get("quoted_sender") or "").strip(),
-                        "message_time": message_time,
-                        "inbound_fingerprint": inbound_fingerprint,
-                        "draft_text": draft_text,
-                        "created_at": now,
-                        "due_at": now + (120 if not draft_text else float(config.get("send_delay_seconds", 300))),
-                        "draft_retry_count": 0,
-                        "low_confidence_retries": 0,
-                        "outbound_snapshot": outbound_snapshot,
-                        "active_chat_title": selected.get("activeChat", ""),
-                        "chat_context": context_messages,
-                    }
-                    queue.append(pending)
-                    queue_fingerprints.add(inbound_fingerprint)
-                    state.setdefault("last_seen_inbound", {})[contact] = inbound_fingerprint
-                    sync_pending_state(state, queue)
-                    self.save_state(state)
-                    added.append(contact)
-                    if draft_text:
-                        self.append_event(
-                            "draft_saved_locally",
-                            contact=contact,
-                            inbound_text=inbound_text,
-                            draft_text=draft_text,
-                            due_at=pending["due_at"],
-                            idle_seconds=round(idle_seconds, 2),
-                            context_turns=len(context_messages),
-                            queue_length=len(queue),
-                            queue_contacts=queued_contacts(queue),
-                        )
-                    self._remember_contact_memory(
-                        config,
-                        contact,
-                        context_messages=context_messages,
-                        inbound_text=inbound_text,
-                        source="draft_saved" if draft_text else "draft_retry_scheduled",
-                    )
 
             process_candidates(candidates)
             if abort_result is not None:
@@ -2749,6 +2878,8 @@ class AutoReplyRunner:
             if claim_trigger != "passive_roster_sweep":
                 try:
                     _clear_non_whitelist_unread(follow_up_probe)
+                except (_UserActivityPause, wechat_ui.WeChatNotFrontmost):
+                    raise
                 except Exception as exc:
                     self.append_event(
                         "non_whitelist_clear_failed",
@@ -2763,12 +2894,6 @@ class AutoReplyRunner:
             if len(changed) == 1:
                 return {"status": "draft_saved", "contact": changed[0], "queue_length": len(queue)}
             return {"status": "drafts_saved", "contacts": changed, "queue_length": len(queue)}
-        finally:
-            self._close_wechat_foreground(
-                reason="claim_scan",
-                restore_app=restore_app,
-                trigger=claim_trigger,
-            )
 
     def _refresh_pending(
         self,
@@ -2839,6 +2964,22 @@ class AutoReplyRunner:
                 "chat_context": context_messages,
             }
         )
+        if int(existing.get("send_attempts", 0) or 0) > 0:
+            self._finalize_unconfirmed_send(
+                config,
+                state,
+                existing,
+                confirmation="superseded_draft",
+                send_age_seconds=now - float(existing.get("last_send_attempt_at", now) or now),
+                confirmation_attempts=int(existing.get("send_confirmation_attempts", 0) or 0),
+                reason="new_inbound_replaced_pending",
+            )
+        # Delivery evidence belongs to the old draft, never to its replacement.
+        for key in (
+            "send_attempts", "last_send_attempt_at", "send_confirmation_attempts",
+            "selection_retry_count", "selection_snooze_count", "prepared_draft",
+        ):
+            updated.pop(key, None)
         queue[pending_index] = updated
         sync_pending_state(state, queue)
         state.setdefault("last_seen_inbound", {})[contact] = str(updated.get("inbound_fingerprint", ""))
@@ -2912,34 +3053,98 @@ class AutoReplyRunner:
         sync_pending_state(state, remaining)
         contact = str(pending.get("contact", "")).strip()
         draft_text = str(pending.get("draft_text", "")).strip()
-        self._remember_contact_memory(
-            config,
-            contact,
-            context_messages=list(pending.get("chat_context") or []),
-            inbound_text=str(pending.get("inbound_text") or ""),
-            outbound_text=draft_text,
-            source="auto_sent_unconfirmed_ui",
-        )
+        # Missing UI evidence is not delivery confirmation; retain it for human review.
+        state.setdefault("unconfirmed_sends", []).append({
+            "contact": contact,
+            "draft_text": draft_text,
+            "inbound_fingerprint": str(pending.get("inbound_fingerprint") or ""),
+            "last_send_attempt_at": pending.get("last_send_attempt_at"),
+            "reason": reason,
+            "recorded_at": utc_now_iso(),
+        })
         self.append_event(
-            "auto_sent",
+            "send_unconfirmed",
             contact=contact,
             draft_text=draft_text,
             remaining_queue=len(remaining),
             queue_contacts=queued_contacts(remaining),
             confirmation=confirmation,
-            inferred=True,
             reason=reason,
             send_attempts=int(pending.get("send_attempts", 0) or 0),
             confirmation_attempts=confirmation_attempts,
             send_age_seconds=round(max(0.0, send_age_seconds), 2),
         )
         return {
-            "status": "sent",
+            "status": "send_unconfirmed",
             "contact": contact,
             "queue_length": len(remaining),
             "confirmation": confirmation,
-            "inferred": True,
         }
+
+    def _retry_missing_draft(
+        self, config: dict[str, Any], state: dict[str, Any], pending: dict[str, Any],
+        queue: list[dict[str, Any]], now: float,
+    ) -> dict[str, Any]:
+        contact = str(pending.get("contact") or "").strip()
+        created_at = float(pending.get("created_at", now) or now)
+        if now - created_at >= 3600 and int(pending.get("draft_retry_count") or 0) > 0:
+            sync_pending_state(state, remove_pending_by_fingerprint(queue, pending))
+            self.save_state(state)
+            self.append_event(
+                "draft_retry_expired",
+                contact=contact,
+                inbound_text=str(pending.get("inbound_text") or ""),
+                retry_count=int(pending.get("draft_retry_count", 0) or 0),
+            )
+            return {"status": "draft_retry_expired", "contact": contact, "queue_length": len(sync_pending_state(state))}
+        retry_count = int(pending.get("draft_retry_count", 0) or 0) + 1
+        quoted_message = {
+            "quoted_text": str(pending.get("quoted_text") or ""),
+            "quoted_role": str(pending.get("quoted_role") or ""),
+            "quoted_sender": str(pending.get("quoted_sender") or ""),
+        }
+        try:
+            draft_text = self._generate_guarded_reply(
+                config,
+                state,
+                self._build_llm(config),
+                contact,
+                str(pending.get("inbound_text") or ""),
+                now=now,
+                conversation_context=list(pending.get("chat_context") or []),
+                contact_memory=None,
+                screenshot_path=None,
+                quoted_message=quoted_message,
+            )
+        except Exception as exc:
+            draft_text = ""
+            self.append_event("draft_retry_failed", contact=contact, error=str(exc))
+        pending["draft_retry_count"] = retry_count
+        if draft_text:
+            pending["draft_text"] = draft_text
+            pending["due_at"] = now + float(config.get("send_delay_seconds", 300))
+            self.append_event(
+                "draft_retry_recovered",
+                contact=contact,
+                inbound_text=str(pending.get("inbound_text") or ""),
+                draft_text=draft_text,
+                retry_count=retry_count,
+            )
+            status = "draft_retry_recovered"
+        else:
+            retry_seconds = min(120 * (2 ** min(retry_count - 1, 4)), 1800)
+            pending["due_at"] = now + retry_seconds
+            self.append_event(
+                "draft_retry_scheduled",
+                contact=contact,
+                reason="duplicate_or_generation_failed",
+                retry_count=retry_count,
+                retry_seconds=retry_seconds,
+            )
+            status = "draft_retry_wait"
+        sync_pending_state(state, queue)
+        self.save_state(state)
+        return {"status": status, "contact": contact, "queue_length": len(queue)}
 
     def _handle_pending(
         self,
@@ -2959,7 +3164,15 @@ class AutoReplyRunner:
         )
         last_send_attempt_at = float(pending.get("last_send_attempt_at", 0.0) or 0.0)
         send_age_seconds = max(0.0, now - last_send_attempt_at) if last_send_attempt_at > 0 else 0.0
-        if send_attempts > 0 and last_send_attempt_at > 0 and send_age_seconds >= confirmation_timeout_seconds:
+        if pending.get("contact") not in (config.get("allowed_contacts") or []):
+            if send_attempts:
+                return self._finalize_unconfirmed_send(
+                    config, state, pending, confirmation="contact_removed", send_age_seconds=send_age_seconds,
+                    confirmation_attempts=confirmation_attempts, reason="contact_removed_from_allowlist",
+                )
+            return self._cancel_pending(state, "contact_removed_from_allowlist", pending)
+        was_waiting = bool(pending.get("awaiting_foreground"))
+        if not was_waiting and send_attempts > 0 and last_send_attempt_at > 0 and send_age_seconds >= confirmation_timeout_seconds:
             return self._finalize_unconfirmed_send(
                 config,
                 state,
@@ -2979,7 +3192,7 @@ class AutoReplyRunner:
                 confirmation_attempts=confirmation_attempts,
                 reason="confirmation_attempt_budget_exhausted",
             )
-        idle_threshold = float(config.get("idle_threshold_seconds", 30))
+        idle_threshold = float(config.get("idle_threshold_seconds", 20))
         if idle_seconds < idle_threshold:
             return {
                 "status": "pending_wait_user_active",
@@ -3011,66 +3224,7 @@ class AutoReplyRunner:
                 "queue_length": len(queue),
             }
         if not str(pending.get("draft_text") or "").strip():
-            contact = str(pending.get("contact") or "").strip()
-            created_at = float(pending.get("created_at", now) or now)
-            if now - created_at >= 3600:
-                sync_pending_state(state, remove_pending_by_fingerprint(queue, pending))
-                self.save_state(state)
-                self.append_event(
-                    "draft_retry_expired",
-                    contact=contact,
-                    inbound_text=str(pending.get("inbound_text") or ""),
-                    retry_count=int(pending.get("draft_retry_count", 0) or 0),
-                )
-                return {"status": "draft_retry_expired", "contact": contact, "queue_length": len(sync_pending_state(state))}
-            retry_count = int(pending.get("draft_retry_count", 0) or 0) + 1
-            quoted_message = {
-                "quoted_text": str(pending.get("quoted_text") or ""),
-                "quoted_role": str(pending.get("quoted_role") or ""),
-                "quoted_sender": str(pending.get("quoted_sender") or ""),
-            }
-            try:
-                draft_text = self._generate_guarded_reply(
-                    config,
-                    state,
-                    self._build_llm(config),
-                    contact,
-                    str(pending.get("inbound_text") or ""),
-                    now=now,
-                    conversation_context=[],
-                    contact_memory=None,
-                    screenshot_path=None,
-                    quoted_message=quoted_message,
-                )
-            except Exception as exc:
-                draft_text = ""
-                self.append_event("draft_retry_failed", contact=contact, error=str(exc))
-            pending["draft_retry_count"] = retry_count
-            if draft_text:
-                pending["draft_text"] = draft_text
-                pending["due_at"] = now + float(config.get("send_delay_seconds", 300))
-                self.append_event(
-                    "draft_retry_recovered",
-                    contact=contact,
-                    inbound_text=str(pending.get("inbound_text") or ""),
-                    draft_text=draft_text,
-                    retry_count=retry_count,
-                )
-                status = "draft_retry_recovered"
-            else:
-                retry_seconds = min(120 * (2 ** min(retry_count - 1, 4)), 1800)
-                pending["due_at"] = now + retry_seconds
-                self.append_event(
-                    "draft_retry_scheduled",
-                    contact=contact,
-                    reason="duplicate_or_generation_failed",
-                    retry_count=retry_count,
-                    retry_seconds=retry_seconds,
-                )
-                status = "draft_retry_wait"
-            sync_pending_state(state, queue)
-            self.save_state(state)
-            return {"status": status, "contact": contact, "queue_length": len(queue)}
+            return self._retry_missing_draft(config, state, pending, queue, now)
         # Recheck right before foreground UI action to avoid stale idle snapshots.
         live_idle_seconds = self._live_idle_seconds()
         if live_idle_seconds < idle_threshold:
@@ -3091,8 +3245,8 @@ class AutoReplyRunner:
             }
 
         contact = str(pending.get("contact", "")).strip()
-        restore_app = self._open_wechat_foreground(reason="pending_send_due", contact=contact)
-        try:
+        with self._foreground_session("pending_send_due", contact=contact):
+            pending.pop("awaiting_foreground", None)
             def _schedule_selection_retry(reason: str) -> dict[str, Any]:
                 if send_attempts > 0:
                     next_confirmation_attempt = int(pending.get("send_confirmation_attempts", 0) or 0) + 1
@@ -3205,6 +3359,13 @@ class AutoReplyRunner:
                     "contact": contact,
                     "queue_length": len(queue),
                 }
+            if str(selected.get("status") or "") == "window_unreadable":
+                pending["due_at"] = now + 300.0
+                state["wechat_window_unavailable"] = True
+                sync_pending_state(state, queue)
+                self.save_state(state)
+                self.append_event("pending_window_unreadable_deferred", contact=contact, screenshot=selected.get("screenshot", ""))
+                return {"status": "pending_window_unreadable", "contact": contact, "queue_length": len(queue)}
             if str(selected.get("status") or "") == "ok":
                 self._mark_wechat_available(state)
             selection_evidence = pending_selection_panel_evidence(selected, contact)
@@ -3486,6 +3647,8 @@ class AutoReplyRunner:
                     )
                 try:
                     voted_probe = self._probe_ui(select_chat=contact, sleep_after_click=vote_interval)
+                except (_UserActivityPause, wechat_ui.WeChatNotFrontmost):
+                    raise
                 except Exception as exc:
                     self.append_event(
                         "pending_recheck_vote_probe_failed",
@@ -3687,6 +3850,10 @@ class AutoReplyRunner:
                     inbound_top=latest_inbound_top,
                 )
 
+            # A newer unclassified bubble may be the user's reply, not permission to send an old draft.
+            if latest_bubble_is_unresolved(samples[-1].get("panel") or {}):
+                return _schedule_selection_retry("unresolved_latest_bubble")
+
             confidence_values = [
                 float(item.get("panel_confidence"))
                 for item in samples
@@ -3802,6 +3969,8 @@ class AutoReplyRunner:
                         for _ in range(debounce_frames - len(expanded_samples)):
                             try:
                                 voted_probe = self._probe_ui(select_chat=contact, sleep_after_click=vote_interval)
+                            except (_UserActivityPause, wechat_ui.WeChatNotFrontmost):
+                                raise
                             except Exception as exc:
                                 self.append_event(
                                     "pending_change_vote_probe_failed",
@@ -3877,6 +4046,8 @@ class AutoReplyRunner:
                             queue_length=len(queue),
                             queue_contacts=queued_contacts(queue),
                         )
+                        if changed_vote_count and equivalent_votes + similarity_suppressed_votes < min_votes:
+                            return _schedule_selection_retry("unstable_changed_inbound")
                         current_inbound = pending_inbound or current_inbound
                         current_time = pending_time or current_time
                         current_fingerprint = str(pending.get("inbound_fingerprint", "")) or fingerprint(
@@ -3908,7 +4079,7 @@ class AutoReplyRunner:
                     config,
                     state,
                     queue,
-                    0,
+                    queue.index(pending),
                     current_inbound,
                     current_outbound,
                     selected,
@@ -3957,11 +4128,14 @@ class AutoReplyRunner:
                     )
                 try:
                     manual_input = self._read_input_box_text_ui(selected)
+                except (_UserActivityPause, wechat_ui.WeChatNotFrontmost):
+                    raise
                 except Exception as exc:
                     return self._cancel_pending(state, "input_box_probe_failed", pending, error=str(exc))
                 if manual_input:
                     retry_input_match_mode = _draft_match_mode(draft_text, manual_input)
-            if manual_input and not (send_attempts > 0 and retry_input_match_mode):
+            prepared_input = bool(manual_input and pending.get("prepared_draft") == draft_text == manual_input)
+            if manual_input and not (prepared_input or (send_attempts > 0 and retry_input_match_mode)):
                 return self._cancel_pending(
                     state,
                     "input_box_modified",
@@ -3977,10 +4151,18 @@ class AutoReplyRunner:
                     phase="pre_send",
                 )
             confirmed = None
+            window_id = int((selected.get("chatWindow") or selected.get("window") or {}).get("window_id") or 0)
             confirmation_probe_reason = "initial_send"
             send_action_performed = False
+            def _persist_send_attempt() -> None:
+                attempted_at = float(self.now())
+                pending["send_attempts"] = send_attempts + 1
+                pending["last_send_attempt_at"] = attempted_at
+                pending["due_at"] = attempted_at + float(config.get("send_verify_retry_seconds", 45))
+                sync_pending_state(state, queue)
+                self.save_state(state)
             if send_attempts > 0:
-                if retry_input_match_mode:
+                if retry_input_match_mode and send_attempts < int(config.get("send_max_attempts", 2)):
                     self.append_event(
                         "send_retry_resend_from_input_buffer",
                         contact=contact,
@@ -3997,9 +4179,11 @@ class AutoReplyRunner:
                             idle_threshold=idle_threshold,
                             phase="retry_after_focus_input",
                         )
-                    self._send_message_ui()
-                    send_action_performed = True
+                    self._verify_input_target(selected, contact)
+                    _persist_send_attempt()
                     _record_recent_auto_outbound("send_attempt_retry")
+                    self._send_message_ui(window_id)
+                    send_action_performed = True
                     confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
                     confirmation_probe_reason = "retry_resend"
                 else:
@@ -4020,7 +4204,11 @@ class AutoReplyRunner:
                         idle_threshold=idle_threshold,
                         phase="after_focus_input",
                     )
-                self._paste_text_ui(draft_text)
+                if not prepared_input:
+                    self._verify_input_target(selected, contact)
+                    self._paste_text_ui(draft_text, window_id)
+                    pending["prepared_draft"] = draft_text
+                    self.save_state(state)
                 if self._live_idle_seconds() < idle_threshold:
                     return self._pending_abort_user_active(
                         state,
@@ -4028,9 +4216,11 @@ class AutoReplyRunner:
                         idle_threshold=idle_threshold,
                         phase="after_paste",
                     )
-                self._send_message_ui()
-                send_action_performed = True
+                self._verify_input_target(selected, contact)
+                _persist_send_attempt()
                 _record_recent_auto_outbound("send_attempt")
+                self._send_message_ui(window_id)
+                send_action_performed = True
                 confirmed = self._probe_ui(select_chat=contact, sleep_after_click=0.4)
             confirmed_panel = confirmed.get("chatPanel", {}) or {}
             confirmed_outbound = latest_committed_outbound(confirmed_panel)
@@ -4103,19 +4293,19 @@ class AutoReplyRunner:
             updated["send_confirmation_attempts"] = int(
                 pending.get("send_confirmation_attempts", 0) or 0
             ) + 1
-            if send_action_performed:
-                updated["last_send_attempt_at"] = now
-            updated["due_at"] = now + float(config.get("send_verify_retry_seconds", 45))
+            updated["due_at"] = float(self.now()) + float(config.get("send_verify_retry_seconds", 45))
             if replace_pending(queue, pending, updated) < 0:
                 raise RuntimeError(f"pending queue item disappeared during send confirmation: {contact}")
             sync_pending_state(state, queue)
             if send_action_performed and updated["send_attempts"] >= int(config.get("send_max_attempts", 2)):
-                return self._cancel_pending(
+                return self._finalize_unconfirmed_send(
+                    config,
                     state,
-                    "send_not_confirmed",
                     updated,
-                    current_outbound=confirmed_outbound,
-                    send_attempts=updated["send_attempts"],
+                    confirmation="send_attempts_exhausted",
+                    send_age_seconds=0.0,
+                    confirmation_attempts=updated["send_confirmation_attempts"],
+                    reason="send_not_confirmed",
                 )
             if updated["send_confirmation_attempts"] >= max_confirmation_attempts:
                 return self._finalize_unconfirmed_send(
@@ -4145,13 +4335,6 @@ class AutoReplyRunner:
                 "send_attempts": updated["send_attempts"],
                 "confirmation_attempts": updated["send_confirmation_attempts"],
             }
-        finally:
-            self._close_wechat_foreground(
-                reason="pending_send_due",
-                restore_app=restore_app,
-                contact=contact,
-            )
-
 
 class _VisionSensor:
     def unread_signal(self) -> str:
