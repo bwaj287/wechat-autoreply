@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageOps
-from AppKit import NSRunningApplication, NSWorkspace
 from Quartz import CGWindowListCopyWindowInfo, kCGNullWindowID, kCGWindowListOptionAll, kCGWindowListOptionOnScreenOnly
 
 from .badge_detection import fallback_row_badge_detection as _fallback_row_badge_detection
@@ -70,14 +69,9 @@ class WeChatNotFrontmost(RuntimeError):
 
 def _existing_windows(*, onscreen_only: bool = False, verified_pid: int | None = None) -> list[dict[str, Any]]:
     if verified_pid is None:
-        front = NSWorkspace.sharedWorkspace().frontmostApplication()
-        if front and front.bundleIdentifier() == WECHAT_BUNDLE_ID:
-            verified_pid = int(front.processIdentifier())
-        else:
-            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
-            if len(apps) != 1:
-                return []
-            verified_pid = int(apps[0].processIdentifier())
+        verified_pid = _running_wechat_pid()
+        if not verified_pid:
+            return []
     option = kCGWindowListOptionOnScreenOnly if onscreen_only else kCGWindowListOptionAll
     windows = []
     for entry in CGWindowListCopyWindowInfo(option, kCGNullWindowID) or []:
@@ -109,18 +103,14 @@ tell application "System Events"
 end tell
 '''
     try:
-        workspace = NSWorkspace.sharedWorkspace()
-        app = workspace.frontmostApplication()
-        if not app or app.bundleIdentifier() != WECHAT_BUNDLE_ID or app.isHidden():
-            raise WeChatNotFrontmost("WeChat is not frontmost")
         answer = run(["osascript", "-e", script], timeout=3).stdout.strip().split("\n", 1)
-        # The bundle lookup can briefly return no processes immediately after an AX query.
-        windows = _existing_windows(onscreen_only=True, verified_pid=int(app.processIdentifier()))
-        if len(answer) == 2 and answer[1] and windows:
+        if len(answer) != 2 or not answer[0].isdigit() or not answer[1]:
+            raise WeChatNotFrontmost("WeChat has no focused, visible standard window")
+        pid = int(answer[0])
+        windows = _existing_windows(onscreen_only=True, verified_pid=pid)
+        if windows:
             front = windows[0]
-            current = workspace.frontmostApplication()
-            if (current and current.processIdentifier() == front["pid"] and str(front["pid"]) == answer[0]
-                    and not current.isHidden() and front["title"] == answer[1]
+            if (_frontmost_pid() == pid == front["pid"] and front["title"] == answer[1]
                     and (window_id is None or window_id == front["window_id"])):
                 return front
     except WeChatNotFrontmost:
@@ -276,44 +266,73 @@ def _looks_like_system_call_preview(text: str) -> bool:
     return bool(SYSTEM_CALL_PREVIEW_RE.fullmatch(value))
 
 
-def _running_app_handle(app: Any) -> str:
-    if not app or app.isTerminated() or not app.bundleIdentifier() or not app.launchDate():
-        return ""
-    return f"{app.processIdentifier()}:{app.launchDate().timeIntervalSince1970()}:{app.bundleIdentifier()}"
+def _running_app_handle(pid: int) -> str:
+    # A fresh process reads immutable identity. AppKit's process list goes stale in the blocking runner.
+    script = '''
+ObjC.import("AppKit");
+function run(args) {
+    const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(args[0]));
+    if (!app || app.isNil()) return "";
+    const bundle = ObjC.unwrap(app.bundleIdentifier), date = app.launchDate;
+    if (!bundle || !date || date.isNil()) return "";
+    return [args[0], date.timeIntervalSince1970, bundle].join(":");
+}
+'''
+    try:
+        return run(["osascript", "-l", "JavaScript", "-e", script, str(pid)], timeout=3).stdout.strip()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WeChatNotFrontmost("Could not read the foreground process identity") from exc
+
+
+def _running_wechat_pid() -> int:
+    script = f'tell application "System Events" to get unix id of every application process whose bundle identifier is "{WECHAT_BUNDLE_ID}"'
+    try:
+        value = run(["osascript", "-e", script], timeout=3).stdout.strip()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WeChatNotFrontmost("Could not query running WeChat processes") from exc
+    return int(value) if value.isdigit() else 0
+
+
+def _frontmost_pid() -> int:
+    # AppKit caches changing application state until the main run loop advances. The runner is a blocking CLI.
+    script = 'tell application "System Events" to get unix id of first application process whose frontmost is true'
+    try:
+        return int(run(["osascript", "-e", script], timeout=3).stdout.strip())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WeChatNotFrontmost("Could not read the current foreground owner") from exc
 
 
 def activate_wechat(expected_front: str | None = None) -> None:
-    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
-    current = NSWorkspace.sharedWorkspace().frontmostApplication()
-    if len(apps) != 1 or not current:
-        raise WeChatNotFrontmost("No running WeChat or foreground owner")
-    target = apps[0]
-    owner_pid = int(current.processIdentifier())
-    pid = int(target.processIdentifier())
-    owner = "" if owner_pid == pid else _running_app_handle(current)
+    pid = _running_wechat_pid()
+    if not pid:
+        raise WeChatNotFrontmost("Expected one running WeChat process")
+    owner_pid = _frontmost_pid()
+    owner = "" if owner_pid == pid else _running_app_handle(owner_pid)
     if expected_front is not None and (expected_front != owner or (not owner and owner_pid != pid)):
         raise WeChatNotFrontmost("Foreground owner changed before activating WeChat")
 
     # All commands address living processes. Activation happens at most once, even if focus never arrives.
     script = f'''
 tell application "System Events"
-  set p to first application process whose unix id is {pid}
-  if bundle identifier of p is not "{WECHAT_BUNDLE_ID}" then return false
+  set candidates to every application process whose bundle identifier is "{WECHAT_BUNDLE_ID}"
+  if (count candidates) is not 1 then return "target_changed"
+  set p to item 1 of candidates
+  if (unix id of p) is not {pid} then return "target_changed"
   set ownerPID to unix id of first application process whose frontmost is true
-  if ownerPID is not {owner_pid} then return false
+  if ownerPID is not {owner_pid} then return "owner_changed_before_unhide"
   if not (visible of p) then set visible of p to true
   set ownerPID to unix id of first application process whose frontmost is true
   if ownerPID is not {pid} then
-    if ownerPID is not {owner_pid} then return false
+    if ownerPID is not {owner_pid} then return "owner_changed_after_unhide"
     set frontmost of p to true
   end if
   repeat 10 times
     set ownerPID to unix id of first application process whose frontmost is true
     if ownerPID is {pid} then exit repeat
-    if ownerPID is not {owner_pid} then return false
+    if ownerPID is not {owner_pid} then return "owner_changed_during_activation"
     delay 0.05
   end repeat
-  if not (frontmost of p) then return false
+  if not (frontmost of p) then return "foreground_request_unconfirmed"
   set mainWindows to {{}}
   repeat with w in windows of p
     if subrole of w is "AXStandardWindow" and (name of w is in {{"WeChat", "Weixin", "微信"}}) then set end of mainWindows to contents of w
@@ -321,7 +340,7 @@ tell application "System Events"
   if (count mainWindows) is 1 then
     set mainWindow to item 1 of mainWindows
     if value of attribute "AXMinimized" of mainWindow is true then
-      if not (frontmost of p) then return false
+      if not (frontmost of p) then return "owner_changed_before_unminimize"
       set value of attribute "AXMinimized" of mainWindow to false
     end if
   end if
@@ -329,11 +348,11 @@ tell application "System Events"
 end tell
 '''
     try:
-        accepted = run(["osascript", "-e", script], timeout=4).stdout.strip() == "true"
+        result = run(["osascript", "-e", script], timeout=4).stdout.strip()
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise WeChatNotFrontmost("Could not activate the existing WeChat window") from exc
-    if not accepted:
-        raise WeChatNotFrontmost("WeChat activation was interrupted or refused")
+    if result != "true":
+        raise WeChatNotFrontmost(f"WeChat activation deferred: {result}")
 
 
 def _escape_applescript_string(value: str) -> str:
@@ -341,25 +360,24 @@ def _escape_applescript_string(value: str) -> str:
 
 
 def capture_frontmost_app() -> str:
-    app = NSWorkspace.sharedWorkspace().frontmostApplication()
-    if not app or app.bundleIdentifier() == WECHAT_BUNDLE_ID:
-        return ""
-    return _running_app_handle(app)
+    handle = _running_app_handle(_frontmost_pid())
+    if not handle:
+        raise WeChatNotFrontmost("Could not identify the original foreground process")
+    return "" if handle.endswith(":" + WECHAT_BUNDLE_ID) else handle
 
 
 def restore_frontmost_app(handle: str) -> None:
     pid, _, _ = handle.partition(":")
     if not pid.isdigit():
         return
-    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
-    if _running_app_handle(app) != handle or app.bundleIdentifier() == WECHAT_BUNDLE_ID or app.isHidden():
+    if handle.endswith(":" + WECHAT_BUNDLE_ID) or _running_app_handle(int(pid)) != handle:
         return
-    current = NSWorkspace.sharedWorkspace().frontmostApplication()
-    if not current or int(current.processIdentifier()) == int(pid):
+    current_pid = _frontmost_pid()
+    if current_pid == int(pid):
         return
     script = f'''
 tell application "System Events"
-  if (unix id of first application process whose frontmost is true) is not {int(current.processIdentifier())} then return false
+  if (unix id of first application process whose frontmost is true) is not {current_pid} then return false
   set p to first application process whose unix id is {int(pid)}
   if not (visible of p) then return false
   set frontmost of p to true
@@ -370,11 +388,23 @@ end tell
 
 
 def hide_wechat() -> bool:
-    app = NSWorkspace.sharedWorkspace().frontmostApplication()
-    if not app or app.bundleIdentifier() != WECHAT_BUNDLE_ID or app.isHidden():
+    script = f'''
+tell application "System Events"
+  set p to first application process whose frontmost is true
+  if bundle identifier of p is not "{WECHAT_BUNDLE_ID}" then return "not_owner"
+  set visible of p to false
+  repeat 10 times
+    if not (visible of p) then return "hidden"
+    delay 0.05
+  end repeat
+  return "hide_unconfirmed"
+end tell
+'''
+    result = run(["osascript", "-e", script], timeout=3).stdout.strip()
+    if result == "not_owner":
         return False
-    if not app.hide():
-        raise RuntimeError("WeChat refused the hide request")
+    if result != "hidden":
+        raise RuntimeError("Could not confirm that WeChat was hidden")
     return True
 
 
@@ -909,7 +939,88 @@ def _annotate_bubble_roles(items: list[dict[str, Any]], image_path: Path) -> Non
             items[index]["grayPixels"] = int(role_item.get("grayPixels", 0))
 
 
+def _timestamp_aligned_chats(obs_list: list[dict[str, Any]], window_info: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Locate roster cells from their right-aligned times and common name column."""
+    time_label = re.compile(r"(?i)(?:(?:today|yesterday|今天|昨天)\s*)?\d{1,2}[:：]\d{2}(?:\s*[ap]m)?")
+    stamps = [
+        item for item in obs_list if 0.04 < item["bbox"]["top"] < 0.985
+        and 0.06 < item["bbox"]["left"] < 0.45 and time_label.fullmatch(item["text"].strip())
+    ]
+    if len(stamps) < 3:
+        return None
+
+    def right(item):
+        return item["bbox"]["left"] + item["bbox"]["w"]
+
+    def cy(item):
+        return item["bbox"]["top"] + item["bbox"]["h"] / 2
+
+    # Separate the roster's timestamp column from any clocks in a chat bubble.
+    header = _pick_selected_title(obs_list)
+    header_lefts = [item["bbox"]["left"] for item in obs_list
+                    if item["bbox"]["top"] <= .06 and .25 <= item["bbox"]["left"] <= .62
+                    and header and _sanitize_chat_title_text(item.get("contactText", item["text"])) == header]
+    roster_right = min(header_lefts, default=_roster_band_profiles(window_info)[-1][1])
+    stamps = [stamp for stamp in stamps if right(stamp) < roster_right]
+    if len(stamps) < 3:
+        return None
+    column = max(([s for s in stamps if abs(right(s) - right(anchor)) <= 0.009] for anchor in stamps), key=len)
+    anchors = []
+    for stamp in sorted(column, key=cy):
+        if not anchors or cy(stamp) - cy(anchors[-1]) > 0.012:
+            anchors.append(stamp)
+    if len(anchors) < 3:
+        return None
+    gaps = [cy(b) - cy(a) for a, b in zip(anchors, anchors[1:])]
+    pitch = min(gaps, key=lambda gap: (-sum(abs(gap - other) <= gap * .12 for other in gaps), gap))
+    if not 0.025 <= pitch <= 0.20 or sum(abs(gap - pitch) <= pitch * .12 for gap in gaps) < 2:
+        return None
+
+    ignored = {normalize_text(item) for item in IGNORE_TEXTS}
+    left_limit = _roster_band_profiles(window_info)[-1][0]
+    items = [
+        item for item in obs_list if left_limit < item["bbox"]["left"] < right(anchors[0])
+        and 0.04 < item["bbox"]["top"] < 0.985 and normalize_text(item["text"]) not in ignored
+        and not time_label.fullmatch(item["text"].strip())
+    ]
+    title_lefts = []
+    for stamp in anchors:
+        aligned = [item["bbox"]["left"] for item in items
+                   if abs(cy(item) - cy(stamp)) < pitch * .15 and item["bbox"]["left"] < stamp["bbox"]["left"]]
+        if aligned:
+            title_lefts.append(min(aligned))
+    if len(title_lefts) < 2:
+        return None
+    title_left = sorted(title_lefts)[len(title_lefts) // 2]
+    labels = sorted((item for item in items if abs(item["bbox"]["left"] - title_left) <= 0.013), key=cy)
+    rows = []
+    last_title_y = -1.0
+    for title in labels:
+        y = cy(title)
+        if y - last_title_y < pitch * .3:
+            continue
+        stamp = min(anchors, key=lambda item: abs(cy(item) - y))
+        offset = round((y - cy(stamp)) / pitch)
+        if abs(offset) > 1 or abs(y - cy(stamp) - offset * pitch) > pitch * .15:
+            continue
+        last_title_y = y
+        if _is_service_chat_name(title["text"]):
+            continue
+        preview = next((item["text"] for item in labels if pitch * .18 < cy(item) - y < pitch * .60), "")
+        gx, gy = _global_coords(window_info, title)
+        rows.append({
+            "name": title.get("contactText", title["text"]), "preview": preview,
+            "time": stamp["text"] if offset == 0 else "",
+            "ocrTop": round(title["bbox"]["top"], 4), "ocrLeft": round(title["bbox"]["left"], 4),
+            "click": {"x": gx, "y": gy},
+        })
+    return rows
+
+
 def extract_visible_chats(obs_list: list[dict[str, Any]], window_info: dict[str, Any]) -> list[dict[str, Any]]:
+    aligned = _timestamp_aligned_chats(obs_list, window_info)
+    if aligned is not None:
+        return aligned
     ignored = {normalize_text(item) for item in IGNORE_TEXTS}
 
     def parse_chats(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1659,10 +1770,11 @@ def _verified_panel(contact: str, roster: dict[str, Any], window: dict[str, Any]
             panel = _extract_chat_panel(obs, selected_title=title, standalone_window=detached)
             path = str(image)
         if normalize_text(title) != normalize_text(contact):
-            return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+            return {"status": "selection_unconfirmed", "selectionConfirmed": False,
+                    "selectionReason": "chat_header_mismatch" if title else "chat_header_unreadable"}
         frames.append({"title": title, "panel": panel, "path": path})
     if not _panel_read_is_stable(frames, contact):
-        return {"status": "window_unreadable", "selectionConfirmed": False}
+        return {"status": "window_unreadable", "selectionConfirmed": False, "selectionReason": "panel_frames_disagree"}
     last = frames[-1]
     return {
         **roster, "chatWindow": window if detached else None,
@@ -1751,10 +1863,10 @@ def _strict_probe(contact: str, sleep_after_click: float, ui_action: Callable[..
                 click(*_roster_search_coords(front))
                 time.sleep(0.15)
                 if not _search_field_focused(front["pid"]):
-                    return {"status": "chat_not_visible", "selectionConfirmed": False}
+                    return {"status": "chat_not_visible", "selectionConfirmed": False, "selectionReason": "search_field_not_focused"}
                 interact("hotkey", "--keys", "cmd,a")
                 if not _search_field_focused(front["pid"]):
-                    return {"status": "chat_not_visible", "selectionConfirmed": False}
+                    return {"status": "chat_not_visible", "selectionConfirmed": False, "selectionReason": "search_field_lost_focus"}
                 interact("paste", "--text", contact)
                 time.sleep(max(sleep_after_click, 0.45))
                 matches = probe_roster_background()
@@ -1762,7 +1874,7 @@ def _strict_probe(contact: str, sleep_after_click: float, ui_action: Callable[..
                     row = _exact_row(matches, contact)
             if not row:
                 interact("press", "escape")
-                return {"status": "chat_not_visible", "selectionConfirmed": False}
+                return {"status": "chat_not_visible", "selectionConfirmed": False, "selectionReason": "no_unique_search_result"}
             click(int(row["click"]["x"]), int(row["click"]["y"]))
             if searching:
                 time.sleep(0.2)
@@ -1772,7 +1884,7 @@ def _strict_probe(contact: str, sleep_after_click: float, ui_action: Callable[..
             if roster["status"] != "ok" or roster["window"]["window_id"] != front["window_id"]:
                 return {"status": "selection_unconfirmed", "selectionConfirmed": False}
     elif normalize_text(front["title"]) != normalize_text(contact):
-        return {"status": "selection_unconfirmed", "selectionConfirmed": False}
+        return {"status": "selection_unconfirmed", "selectionConfirmed": False, "selectionReason": "different_detached_chat"}
     selected = _verified_panel(contact, roster, front)
     _require_front_window(front["window_id"])
     return selected

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from wechat_autoreply import wechat_ui as ui
 
@@ -20,13 +20,9 @@ class BackgroundUITests(unittest.TestCase):
         }
 
     def test_mismatched_or_unreadable_foreground_fails_closed(self):
-        with patch.object(ui, "NSWorkspace") as workspace, patch.object(
-            ui, "_existing_windows", return_value=[self.window]
+        with patch.object(ui, "_existing_windows", return_value=[self.window]), patch.object(
+            ui, "_frontmost_pid", return_value=123
         ), patch.object(ui, "run") as run:
-            app = workspace.sharedWorkspace.return_value.frontmostApplication.return_value
-            app.bundleIdentifier.return_value = ui.WECHAT_BUNDLE_ID
-            app.processIdentifier.return_value = 123
-            app.isHidden.return_value = False
             for answer in ("", "0\nWeixin", "123\nOther Window"):
                 with self.subTest(answer=answer):
                     run.return_value.stdout = answer
@@ -35,18 +31,15 @@ class BackgroundUITests(unittest.TestCase):
             self.assertFalse(ui.is_wechat_frontmost())
 
     def test_window_guard_requires_matching_live_pid_title_and_window_id(self):
-        app = Mock()
-        app.bundleIdentifier.return_value = ui.WECHAT_BUNDLE_ID
-        app.processIdentifier.return_value = 123
-        app.isHidden.return_value = False
-        with patch.object(ui, "NSWorkspace") as workspace, patch.object(
+        with patch.object(ui, "_frontmost_pid", return_value=123) as owner, patch.object(
             ui, "_existing_windows", return_value=[self.window]
-        ), patch.object(ui, "run", return_value=SimpleNamespace(stdout="123\nWeixin")):
-            workspace.sharedWorkspace.return_value.frontmostApplication.return_value = app
+        ), patch.object(ui, "run", return_value=SimpleNamespace(stdout="123\nWeixin")) as ax:
             self.assertEqual(ui._require_front_window(42), self.window)
             with self.assertRaises(ui.WeChatNotFrontmost):
                 ui._require_front_window(99)
-            app.isHidden.return_value = True
+            owner.return_value = 777
+            self.assertFalse(ui.is_wechat_frontmost())
+            ax.return_value.stdout = ""
             self.assertFalse(ui.is_wechat_frontmost())
 
     def test_front_window_survives_transient_empty_bundle_lookup(self):
@@ -54,17 +47,15 @@ class BackgroundUITests(unittest.TestCase):
             return {"kCGWindowOwnerPID": pid, "kCGWindowLayer": 0, "kCGWindowNumber": pid + 1,
                     "kCGWindowName": "Weixin", "kCGWindowBounds": {"Width": 900, "Height": 700}}
 
-        with patch.object(ui, "NSWorkspace") as workspace, patch.object(ui, "NSRunningApplication") as running, \
+        with patch.object(ui, "_running_wechat_pid", return_value=0) as lookup, \
+                patch.object(ui, "_frontmost_pid", return_value=123), \
                 patch.object(ui, "CGWindowListCopyWindowInfo", return_value=[entry(77), entry(123)]), \
                 patch.object(ui, "run", return_value=SimpleNamespace(stdout="123\nWeixin")):
-            app = workspace.sharedWorkspace.return_value.frontmostApplication.return_value
-            app.bundleIdentifier.return_value = ui.WECHAT_BUNDLE_ID
-            app.processIdentifier.return_value = 123
-            app.isHidden.return_value = False
-            running.runningApplicationsWithBundleIdentifier_.return_value = []
             self.assertEqual(ui._require_front_window()["window_id"], 124)
+            lookup.assert_not_called()
+            self.assertEqual(ui._existing_windows(), [])
+            lookup.return_value = 123
             self.assertEqual([w["pid"] for w in ui._existing_windows()], [123])
-            running.runningApplicationsWithBundleIdentifier_.assert_not_called()
 
     def test_background_capture_only_uses_existing_window_id(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(ui, "run") as run, patch.object(

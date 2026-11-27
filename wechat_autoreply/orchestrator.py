@@ -3397,7 +3397,8 @@ class AutoReplyRunner:
                 state["wechat_window_unavailable"] = True
                 sync_pending_state(state, queue)
                 self.save_state(state)
-                self.append_event("pending_window_unreadable_deferred", contact=contact, screenshot=selected.get("screenshot", ""))
+                self.append_event("pending_window_unreadable_deferred", contact=contact, screenshot=selected.get("screenshot", ""),
+                                  reason=selected.get("selectionReason", "window_unreadable"))
                 return {"status": "pending_window_unreadable", "contact": contact, "queue_length": len(queue)}
             if str(selected.get("status") or "") == "ok":
                 self._mark_wechat_available(state)
@@ -3423,8 +3424,8 @@ class AutoReplyRunner:
                         )
                     selected_retry = self._probe_ui(select_chat=contact, sleep_after_click=0.65)
                     retry_evidence = pending_selection_panel_evidence(selected_retry, contact)
+                    selected = selected_retry
                     if retry_evidence:
-                        selected = selected_retry
                         selection_evidence = retry_evidence
                         self.append_event(
                             "pending_selection_recovered",
@@ -3433,7 +3434,7 @@ class AutoReplyRunner:
                             mode=str(retry_evidence.get("mode") or ""),
                         )
             if not selection_evidence:
-                return _schedule_selection_retry("selection_not_confirmed")
+                return _schedule_selection_retry(selected.get("selectionReason") or "selection_not_confirmed")
             if not bool(selected.get("selectionConfirmed")):
                 selected["panelSelectionConfirmed"] = True
                 self.append_event(
