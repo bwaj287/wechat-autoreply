@@ -49,6 +49,23 @@ class BackgroundUITests(unittest.TestCase):
             app.isHidden.return_value = True
             self.assertFalse(ui.is_wechat_frontmost())
 
+    def test_front_window_survives_transient_empty_bundle_lookup(self):
+        def entry(pid):
+            return {"kCGWindowOwnerPID": pid, "kCGWindowLayer": 0, "kCGWindowNumber": pid + 1,
+                    "kCGWindowName": "Weixin", "kCGWindowBounds": {"Width": 900, "Height": 700}}
+
+        with patch.object(ui, "NSWorkspace") as workspace, patch.object(ui, "NSRunningApplication") as running, \
+                patch.object(ui, "CGWindowListCopyWindowInfo", return_value=[entry(77), entry(123)]), \
+                patch.object(ui, "run", return_value=SimpleNamespace(stdout="123\nWeixin")):
+            app = workspace.sharedWorkspace.return_value.frontmostApplication.return_value
+            app.bundleIdentifier.return_value = ui.WECHAT_BUNDLE_ID
+            app.processIdentifier.return_value = 123
+            app.isHidden.return_value = False
+            running.runningApplicationsWithBundleIdentifier_.return_value = []
+            self.assertEqual(ui._require_front_window()["window_id"], 124)
+            self.assertEqual([w["pid"] for w in ui._existing_windows()], [123])
+            running.runningApplicationsWithBundleIdentifier_.assert_not_called()
+
     def test_background_capture_only_uses_existing_window_id(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(ui, "run") as run, patch.object(
             ui, "run_peekaboo_variants", side_effect=AssertionError("passive capture must not use app targeting")

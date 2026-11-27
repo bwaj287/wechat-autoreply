@@ -68,16 +68,21 @@ class WeChatNotFrontmost(RuntimeError):
     pass
 
 
-def _existing_windows(*, onscreen_only: bool = False) -> list[dict[str, Any]]:
-    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
-    pids = {int(app.processIdentifier()) for app in apps}
-    if len(pids) != 1:
-        return []
+def _existing_windows(*, onscreen_only: bool = False, verified_pid: int | None = None) -> list[dict[str, Any]]:
+    if verified_pid is None:
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front and front.bundleIdentifier() == WECHAT_BUNDLE_ID:
+            verified_pid = int(front.processIdentifier())
+        else:
+            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
+            if len(apps) != 1:
+                return []
+            verified_pid = int(apps[0].processIdentifier())
     option = kCGWindowListOptionOnScreenOnly if onscreen_only else kCGWindowListOptionAll
     windows = []
     for entry in CGWindowListCopyWindowInfo(option, kCGNullWindowID) or []:
         pid = int(entry.get("kCGWindowOwnerPID", 0))
-        if pid not in pids or entry.get("kCGWindowLayer") != 0:
+        if pid != verified_pid or entry.get("kCGWindowLayer") != 0:
             continue
         bounds = entry.get("kCGWindowBounds") or {}
         width, height = int(bounds.get("Width", 0)), int(bounds.get("Height", 0))
@@ -109,7 +114,8 @@ end tell
         if not app or app.bundleIdentifier() != WECHAT_BUNDLE_ID or app.isHidden():
             raise WeChatNotFrontmost("WeChat is not frontmost")
         answer = run(["osascript", "-e", script], timeout=3).stdout.strip().split("\n", 1)
-        windows = _existing_windows(onscreen_only=True)
+        # The bundle lookup can briefly return no processes immediately after an AX query.
+        windows = _existing_windows(onscreen_only=True, verified_pid=int(app.processIdentifier()))
         if len(answer) == 2 and answer[1] and windows:
             front = windows[0]
             current = workspace.frontmostApplication()

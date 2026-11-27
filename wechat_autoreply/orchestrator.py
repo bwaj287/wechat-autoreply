@@ -1857,7 +1857,7 @@ class AutoReplyRunner:
                 "wechat_login_required" if bool(state.get("wechat_login_required")) else ""
             )
             return result
-        except wechat_ui.WeChatNotFrontmost:
+        except wechat_ui.WeChatNotFrontmost as exc:
             if claim_in_progress:
                 state["foreground_scan_pending"] = True
                 state["deferred_scan_retry_at"] = 0
@@ -1865,7 +1865,7 @@ class AutoReplyRunner:
             for item in queue:
                 item["awaiting_foreground"] = True
             state["last_error"] = ""
-            return {"status": "waiting_for_wechat", "queue_length": len(queue)}
+            return {"status": "waiting_for_wechat", "reason": str(exc), "queue_length": len(queue)}
         except _UserActivityPause:
             # A paused send already lives in the queue; it needs no new roster claim.
             state["claim_retry_pending"] = bool(state.get("claim_retry_pending")) or claim_in_progress
