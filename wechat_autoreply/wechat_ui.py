@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from Foundation import NSAppleEventDescriptor, NSAppleEventSendNeverInteract, NSAppleEventSendNoReply
 from PIL import Image, ImageOps
 from Quartz import CGWindowListCopyWindowInfo, kCGNullWindowID, kCGWindowListOptionAll, kCGWindowListOptionOnScreenOnly
 
@@ -302,7 +303,7 @@ def _frontmost_pid() -> int:
         raise WeChatNotFrontmost("Could not read the current foreground owner") from exc
 
 
-def activate_wechat(expected_front: str | None = None) -> None:
+def activate_wechat(expected_front: str | None = None, *, ensure_idle: Callable[[], None] | None = None) -> None:
     pid = _running_wechat_pid()
     if not pid:
         raise WeChatNotFrontmost("Expected one running WeChat process")
@@ -333,6 +334,7 @@ tell application "System Events"
     delay 0.05
   end repeat
   if not (frontmost of p) then return "foreground_request_unconfirmed"
+  if not (exists window 1 of p) then return "no_windows"
   set mainWindows to {{}}
   repeat with w in windows of p
     if subrole of w is "AXStandardWindow" and (name of w is in {{"WeChat", "Weixin", "微信"}}) then set end of mainWindows to contents of w
@@ -351,6 +353,38 @@ end tell
         result = run(["osascript", "-e", script], timeout=4).stdout.strip()
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise WeChatNotFrontmost("Could not activate the existing WeChat window") from exc
+    if result == "no_windows":
+        if _existing_windows(onscreen_only=True, verified_pid=pid):
+            return
+        if ensure_idle is None:
+            raise WeChatNotFrontmost("Cannot reopen a WeChat window without checking user activity")
+        # The Dock's reopen event restores a closed main window. Address the existing PID only.
+        target = NSAppleEventDescriptor.descriptorWithProcessIdentifier_(pid)
+        event = NSAppleEventDescriptor.appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_(
+            int.from_bytes(b"aevt", "big"), int.from_bytes(b"rapp", "big"), target, -1, 0,
+        )
+        guard = f'''
+tell application "System Events"
+  set p to first application process whose frontmost is true
+  if (unix id of p) is not {pid} or (bundle identifier of p) is not "{WECHAT_BUNDLE_ID}" or not (visible of p) then return "owner_changed"
+  if exists window 1 of p then return "window_appeared"
+  return "reopen"
+end tell
+'''
+        try:
+            result = run(["osascript", "-e", guard], timeout=3).stdout.strip()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            raise WeChatNotFrontmost("Could not verify windowless foreground WeChat") from exc
+        if result == "window_appeared":
+            return
+        if result == "reopen":
+            ensure_idle()
+            _, error = event.sendEventWithOptions_timeout_error_(
+                NSAppleEventSendNoReply | NSAppleEventSendNeverInteract, 1.0, None,
+            )
+            if error is not None:
+                raise WeChatNotFrontmost(f"WeChat window reopen request failed ({error.code()})")
+            return
     if result != "true":
         raise WeChatNotFrontmost(f"WeChat activation deferred: {result}")
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from wechat_autoreply import wechat_ui as ui
 
@@ -61,6 +61,51 @@ class ForegroundOwnershipTests(unittest.TestCase):
         with self.assertRaisesRegex(ui.WeChatNotFrontmost, "foreground_request_unconfirmed"):
             ui.activate_wechat(ui.capture_frontmost_app())
         self.run_script.assert_called_once()
+
+    def test_windowless_reopen_targets_existing_foreground_pid_after_idle_check(self):
+        checked = Mock()
+        self.run_script.side_effect = [Mock(stdout="no_windows"), Mock(stdout="reopen")]
+        with patch.object(ui, "_existing_windows", return_value=[]) as windows, patch.object(ui, "NSAppleEventDescriptor") as desc:
+            make_event = desc.appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_
+            send = make_event.return_value.sendEventWithOptions_timeout_error_
+            def submit(options, timeout, error):
+                checked.assert_called_once_with()
+                self.assertEqual(options, ui.NSAppleEventSendNeverInteract | ui.NSAppleEventSendNoReply)
+                return None, None
+            send.side_effect = submit
+            ui.activate_wechat(ui.capture_frontmost_app(), ensure_idle=checked)
+            windows.assert_called_once_with(onscreen_only=True, verified_pid=42)
+            desc.descriptorWithProcessIdentifier_.assert_called_once_with(42)
+            make_event.assert_called_once_with(0x61657674, 0x72617070, desc.descriptorWithProcessIdentifier_.return_value, -1, 0)
+            send.assert_called_once()
+            guard = self.run_script.call_args.args[0][-1]
+            self.assertIn('first application process whose frontmost is true', guard)
+            self.assertIn('(unix id of p) is not 42', guard)
+            self.assertIn('if exists window 1 of p then return "window_appeared"', guard)
+
+    def test_no_reopen_over_an_existing_window_new_activity_or_foreground_switch(self):
+        with patch.object(ui, "_existing_windows") as windows, patch.object(ui, "NSAppleEventDescriptor") as desc:
+            checked = Mock(side_effect=InterruptedError("user active"))
+            send = desc.appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_.return_value.sendEventWithOptions_timeout_error_
+            windows.return_value = [{"window_id": 8}]
+            self.run_script.return_value.stdout = "no_windows"
+            ui.activate_wechat(ui.capture_frontmost_app(), ensure_idle=checked)
+            desc.descriptorWithProcessIdentifier_.assert_not_called()
+            windows.return_value = []
+            with self.assertRaisesRegex(ui.WeChatNotFrontmost, "without checking user activity"):
+                ui.activate_wechat(ui.capture_frontmost_app())
+            for verdict in ("owner_changed", "window_appeared", "reopen"):
+                self.run_script.side_effect = [Mock(stdout="no_windows"), Mock(stdout=verdict)]
+                if verdict == "owner_changed":
+                    with self.assertRaisesRegex(ui.WeChatNotFrontmost, "owner_changed"):
+                        ui.activate_wechat(ui.capture_frontmost_app(), ensure_idle=checked)
+                elif verdict == "reopen":
+                    with self.assertRaisesRegex(InterruptedError, "user active"):
+                        ui.activate_wechat(ui.capture_frontmost_app(), ensure_idle=checked)
+                else:
+                    ui.activate_wechat(ui.capture_frontmost_app(), ensure_idle=checked)
+            checked.assert_called_once()
+            send.assert_not_called()
 
     def test_hide_targets_only_frontmost_wechat_and_never_hides_other_app(self):
         self.run_script.return_value.stdout = "not_owner"

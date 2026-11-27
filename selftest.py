@@ -162,7 +162,7 @@ class FakeUI:
         self.other_app = app
         self.frontmost = app == "WeChat"
 
-    def activate_wechat(self, expected_front=None):
+    def activate_wechat(self, expected_front=None, *, ensure_idle=None):
         if expected_front is not None and expected_front != self.capture_frontmost_app():
             raise WeChatNotFrontmost("The original app lost focus")
         self.calls.append("activate")

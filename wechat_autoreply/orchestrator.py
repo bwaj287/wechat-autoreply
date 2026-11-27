@@ -1504,7 +1504,7 @@ class AutoReplyRunner:
                 raise wechat_ui.WeChatNotFrontmost("Waiting to retry opening WeChat")
             self._ensure_user_idle()
             self._next_window_activation_at = self.now() + max(5.0, self._idle_threshold)
-            self.ui.activate_wechat(previous)
+            self.ui.activate_wechat(previous, ensure_idle=self._ensure_user_idle)
             try:
                 deadline = time.monotonic() + 1.5
                 while not self._wechat_frontmost():
