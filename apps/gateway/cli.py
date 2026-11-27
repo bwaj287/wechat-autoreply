@@ -391,7 +391,7 @@ def _foreground_wait_lines(state: dict[str, Any]) -> list[str]:
     observations = state.get("background_claim_opportunities") or {}
     deferred = sum(bool(item.get("awaiting_foreground")) for item in _pending_queue(state))
     if observations or deferred or state.get("foreground_scan_pending"):
-        lines = [f"等待微信处于前台并空闲：待核对会话 {len(observations)} 个，待复核草稿 {deferred} 条"]
+        lines = [f"电脑空闲后会按需自动打开微信，待核对会话 {len(observations)} 个，待复核草稿 {deferred} 条"]
         if state.get("foreground_scan_pending"):
             lines.append("待核对未读角标")
         return lines

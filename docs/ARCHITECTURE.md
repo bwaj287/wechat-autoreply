@@ -12,7 +12,7 @@
 
 1. `AutoReplyRunner.tick()` samples idle time and the Dock/menu unread signal.
 2. `claim_policy` decides whether evidence is strong enough to enter claim flow.
-3. A background window capture can confirm a changed allowlisted row against an already-open chat. Unconfirmed observations persist across restarts. Interactive checks resume when the user brings WeChat to the foreground and becomes idle.
+3. While the user is active, a background capture can confirm a changed allowlisted row against an already-open chat and queue a draft. Unconfirmed observations persist across restarts. When work needs the window, the runner waits for the configured idle threshold (20 seconds by default) and brings WeChat forward automatically.
 4. `wechat_ui` captures windows and returns OCR observations, badge evidence, and panel bubbles.
 5. Claim flow resolves inbound text, suppresses self-echoes, and appends a draft to the FIFO queue.
 6. Pending flow waits for the delay, collects multi-frame OCR samples, and asks `recheck_policy` for consensus.
@@ -58,7 +58,7 @@
 - A pending item is identified and removed by inbound fingerprint, not contact name.
 - `pending` is only a compatibility mirror of `pending_queue[0]`.
 - Event logging and retention cleanup cannot terminate the reply state machine.
-- A foreground session emits begin/end events and leaves window visibility and app focus under user control.
+- A foreground session emits begin/end events. At session end, the runner hides WeChat even if it was already frontmost, then restores the previous app when it is known and different from WeChat. User activity or an app switch interrupts that cleanup.
 
 ## Verification
 

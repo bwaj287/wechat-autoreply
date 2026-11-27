@@ -17,6 +17,7 @@ from wechat_autoreply.json_output import load_first_json_object
 from wechat_autoreply.orchestrator import AutoReplyRunner, choose_inbound_text, fingerprint
 from wechat_autoreply.state_store import default_state
 from wechat_autoreply.wechat_ui import (
+    WeChatNotFrontmost,
     _extract_chat_panel,
     _pick_selected_title,
     find_chat,
@@ -148,18 +149,31 @@ class FakeUI:
         self.probes = list(probes)
         self.calls: list = []
         self.frontmost = True
+        self.other_app = "Safari"
+
+    def capture_frontmost_app(self):
+        return "" if self.frontmost else self.other_app
 
     def is_wechat_frontmost(self):
         return self.frontmost
 
     def restore_frontmost_app(self, app):
         self.calls.append(("restore", app))
+        self.other_app = app
+        self.frontmost = app == "WeChat"
 
-    def activate_wechat(self):
+    def activate_wechat(self, expected_front=None):
+        if expected_front is not None and expected_front != self.capture_frontmost_app():
+            raise WeChatNotFrontmost("The original app lost focus")
         self.calls.append("activate")
+        self.frontmost = True
 
     def hide_wechat(self):
+        if not self.frontmost:
+            return False
         self.calls.append("hide")
+        self.frontmost = False
+        return True
 
     def probe(self, select_chat=None, sleep_after_click=1.0, select_chat_click=None, ui_action=None, *, strict_foreground):
         assert strict_foreground and self.frontmost
@@ -1099,6 +1113,7 @@ def run_no_claim_sweep_while_pending_wait_path() -> None:
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
+        "hide",
     ], fake_ui.calls
 
 
@@ -1184,7 +1199,7 @@ def run_empty_claim_menu_flicker_does_not_reopen_path() -> None:
     clock["now"] = 9_140.0
     third = runner.tick()
     assert third["status"] == "idle_wait", third
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
     assert sum(1 for event in store.events if event["type"] == "claim_candidates") == 1, store.events
 
 
@@ -1257,9 +1272,13 @@ def run_queue_claims_on_menu_rising_path() -> None:
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
+        "hide",
+        "activate",
         ("probe", None),
         ("probe", "May"),
         ("probe", None),
+        "hide",
+        ("restore", "Safari"),
     ], fake_ui.calls
 
 
@@ -1332,6 +1351,7 @@ def run_queue_claims_while_pending_after_sweep_interval_path() -> None:
         ("probe", None),
         ("probe", "shawn"),
         ("probe", None),
+        "hide",
     ], fake_ui.calls
 
 
@@ -2237,7 +2257,7 @@ def run_active_whitelist_chat_latest_outbound_skips_path() -> None:
     result = runner.tick()
     assert result["status"] == "no_candidate", result
     assert store.state["pending"] is None
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
 
 def run_whitelist_preview_fallback_claim_path() -> None:
@@ -2470,6 +2490,7 @@ def run_unread_whitelist_candidate_latest_outbound_skips_path() -> None:
         ("probe", "Barrys"),
         ("probe", "Barrys"),
         ("probe", None),
+        "hide",
     ], fake_ui.calls
 
 
@@ -2653,12 +2674,12 @@ def run_empty_queue_persistent_unread_waits_for_signal_change_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
     clock["now"] = 9170.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
 
 def run_empty_queue_persistent_unread_suppresses_repeat_claim_path() -> None:
@@ -2693,18 +2714,18 @@ def run_empty_queue_persistent_unread_suppresses_repeat_claim_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
     clock["now"] = 9_170.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
     clock["now"] = 9_182.0
     third = runner.tick()
     assert third["status"] == "idle_wait", third
     assert third["menu_unread"] is True, third
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
 
 def run_same_menu_signal_with_passive_sweep_does_not_reopen_path() -> None:
@@ -2736,13 +2757,13 @@ def run_same_menu_signal_with_passive_sweep_does_not_reopen_path() -> None:
 
     first = runner.tick()
     assert first["status"] == "no_candidate", first
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
     clock["now"] = 9_182.0
     second = runner.tick()
     assert second["status"] == "idle_wait", second
     assert second["menu_unread"] is True, second
-    assert fake_ui.calls == [("probe", None)], fake_ui.calls
+    assert fake_ui.calls == [("probe", None), "hide"], fake_ui.calls
 
 
 def run_send_confirmation_retry_path() -> None:
@@ -2990,7 +3011,7 @@ def run_unconfirmed_send_selection_failures_have_finite_budget_path() -> None:
     assert result["confirmation"] == "send_confirmation_exhausted", result
     assert state["pending"] is None
     assert fake_ui.calls.count("send") == 0, fake_ui.calls
-    assert "activate" not in fake_ui.calls and "hide" not in fake_ui.calls, fake_ui.calls
+    assert "activate" not in fake_ui.calls and fake_ui.calls[-1] == "hide", fake_ui.calls
 
 
 def run_send_confirmation_self_echo_marks_sent_path() -> None:

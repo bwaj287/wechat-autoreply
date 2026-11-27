@@ -1336,6 +1336,7 @@ class AutoReplyRunner:
         self._internal_ui_action_end_at = 0.0
         self._idle_threshold = 20.0
         self._user_activity_pause = False
+        self._next_window_activation_at = 0.0
 
     def _contact_memory_enabled(self, config: dict[str, Any]) -> bool:
         return bool(config.get("contact_memory_enabled", True))
@@ -1481,14 +1482,51 @@ class AutoReplyRunner:
         self._require_interactive_wechat()
         return str(value or "").strip()
 
+    def _hide_and_restore(self, previous: str, reason: str) -> None:
+        if self._user_activity_pause:
+            return
+        try:
+            self._ensure_user_idle()
+            if self.ui.hide_wechat() and previous:
+                self._ensure_user_idle()
+                self.ui.restore_frontmost_app(previous)
+        except _UserActivityPause:
+            pass
+        except Exception as exc:
+            self.append_event("wechat_window_cleanup_failed", reason=reason, error=str(exc))
+
     @contextmanager
     def _foreground_session(self, reason: str, **details: Any):
+        self._ensure_user_idle()
+        previous = self.ui.capture_frontmost_app()
+        if not self._wechat_frontmost():
+            if self.now() < self._next_window_activation_at:
+                raise wechat_ui.WeChatNotFrontmost("Waiting to retry opening WeChat")
+            self._ensure_user_idle()
+            self._next_window_activation_at = self.now() + max(5.0, self._idle_threshold)
+            self.ui.activate_wechat(previous)
+            try:
+                deadline = time.monotonic() + 1.5
+                while not self._wechat_frontmost():
+                    self._ensure_user_idle()
+                    if time.monotonic() >= deadline:
+                        raise wechat_ui.WeChatNotFrontmost("Could not open a usable WeChat window")
+                    time.sleep(0.1)
+            except wechat_ui.WeChatNotFrontmost:
+                if previous:
+                    self._hide_and_restore(previous, reason)
+                raise
         self._require_interactive_wechat()
+        self._next_window_activation_at = 0.0
         self.append_event("wechat_foreground_session", action="begin", reason=reason, **details)
         try:
             yield
+        except (_UserActivityPause, wechat_ui.WeChatNotFrontmost):
+            self._user_activity_pause = True
+            raise
         finally:
             self.append_event("wechat_foreground_session", action="end", reason=reason, **details)
+            self._hide_and_restore(previous, reason)
 
     def _claim_abort_user_active(
         self,
@@ -1560,8 +1598,7 @@ class AutoReplyRunner:
 
             idle_seconds = self._live_idle_seconds()
             idle_threshold = self._idle_threshold
-            frontmost = self._wechat_frontmost()
-            interactive = frontmost and idle_seconds >= idle_threshold
+            interactive = idle_seconds >= idle_threshold
             idle_probe_armed = bool(state.get("idle_probe_armed", True))
             if not interactive:
                 state["idle_probe_armed"] = True
@@ -1687,10 +1724,6 @@ class AutoReplyRunner:
                         return self._retry_missing_draft(config, state, item, queue, now)
                 if background_result.get("draft_count"):
                     return background_result
-                work_waiting = bool(queue or state.get("background_claim_opportunities")
-                                    or state.get("foreground_scan_pending") or state.get("claim_retry_pending"))
-                if not frontmost and work_waiting:
-                    return {"status": "waiting_for_wechat", "queue_length": len(queue)}
                 return {"status": "pending_wait_user_active" if queue else "idle_wait",
                         "idle_seconds": round(idle_seconds, 2), "queue_length": len(queue)}
 

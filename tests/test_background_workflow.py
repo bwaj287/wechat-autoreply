@@ -45,16 +45,11 @@ class BackgroundWorkflowTests(unittest.TestCase):
             "created_at": self.now - 20, "due_at": self.now - 1,
         }]
 
-    def tearDown(self):
-        for call in self.ui.calls:
-            self.assertNotIn(call if isinstance(call, str) else call[0], {"activate", "hide", "restore"})
-        self.assertFalse(any(e["type"] == "wechat_window_action" for e in self.store.events))
-
     def test_read_only_badge_survives_restart_and_disappearing_digit(self):
         self.store.config["passive_roster_sweep_enabled"] = True
         self.idle.value = 1
         self.ui.background_probes = [{"status": "ok", "activeChat": "Darren", "visibleChats": [BADGE]}]
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
+        self.assertEqual(self.runner().tick()["status"], "idle_wait")
         self.assertIn("May", self.store.state["background_claim_opportunities"])
         self.assertEqual(self.ui.calls, [("probe_background", None)])
         self.assertEqual(self.llm.calls, [])
@@ -82,8 +77,9 @@ class BackgroundWorkflowTests(unittest.TestCase):
     def test_exact_saved_contact_now_offscreen_is_selected_and_verified(self):
         self.store.config["passive_roster_sweep_enabled"] = True
         self.ui.background_probes = [{"status": "ok", "visibleChats": [BADGE]}]
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
-        self.ui.frontmost = True
+        self.idle.value = 1
+        self.assertEqual(self.runner().tick()["status"], "idle_wait")
+        self.idle.value = 20
         self.now += 2
         self.ui.probes = [
             {"status": "ok", "visibleChats": [{"name": "Darren", "preview": "other chat"}]},
@@ -97,14 +93,30 @@ class BackgroundWorkflowTests(unittest.TestCase):
         self.assertEqual(self.llm.calls, [("May", "hello")])
         self.assertNotIn("May", self.store.state["background_claim_opportunities"])
 
-    def test_menu_only_trigger_waits_across_restart_until_foreground_and_idle(self):
+    def test_new_badge_can_wake_wechat_at_twenty_seconds_idle(self):
+        self.idle.value = 20
+        self.store.config["passive_roster_sweep_enabled"] = True
+        self.ui.background_probes = [{"status": "ok", "visibleChats": [BADGE]}]
+        self.ui.probes = [
+            {"status": "ok", "visibleChats": [BADGE]},
+            panel(latestInbound="hello", inbound=[
+                {"text": "hello", "top": .65, "left": .32, "width": .13, "grayPixels": 80}
+            ]), {"status": "ok", "visibleChats": []},
+        ]
+        result = self.runner().tick()
+        self.assertEqual(result["status"], "draft_saved", result)
+        self.assertEqual(self.ui.calls[:2], [("probe_background", None), "activate"])
+        self.assertEqual(self.ui.calls[-2:], ["hide", ("restore", "Safari")])
+        self.assertNotIn("send", self.ui.calls)
+
+    def test_menu_only_trigger_wakes_wechat_after_restart_and_idle(self):
+        self.idle.value = 10
         self.vision.values = ["1", "", ""]
         self.ui.background_probes = [{"status": "ok", "visibleChats": []}]
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
+        self.assertEqual(self.runner().tick()["status"], "idle_wait")
         self.assertTrue(self.store.state["foreground_scan_pending"])
         self.assertEqual(self.ui.calls, [("probe_background", None)])
         self.now += 20
-        self.ui.frontmost = True
         self.idle.value = 1
         self.runner().tick()
         self.assertTrue(self.store.state["foreground_scan_pending"])
@@ -114,43 +126,93 @@ class BackgroundWorkflowTests(unittest.TestCase):
         self.ui.probes = [{"status": "ok", "visibleChats": []}]
         result = self.runner().tick()
         self.assertEqual(result["status"], "no_candidate", result)
-        self.assertEqual(self.ui.calls, [("probe_background", None), ("probe", None)])
+        self.assertEqual(self.ui.calls, [("probe_background", None), "activate", ("probe", None),
+                                         "hide", ("restore", "Safari")])
         self.assertFalse(self.store.state["foreground_scan_pending"])
 
-    def test_due_draft_waits_past_ttl_and_sends_once_after_restart(self):
+    def test_due_draft_waits_past_ttl_then_wakes_sends_and_restores(self):
         self.add_due_draft()
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
+        self.idle.value = 19.9
+        self.assertEqual(self.runner().tick()["status"], "pending_wait_user_active")
         self.now += 120
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
+        self.assertEqual(self.runner().tick()["status"], "pending_wait_user_active")
         self.assertEqual(self.store.state["pending"]["draft_text"], "hi there")
-        self.ui.frontmost = True
         self.idle.value = 0
         self.runner().tick()
         self.assertEqual(self.store.state["pending"]["draft_text"], "hi there")
         self.assertEqual(self.ui.calls, [])
 
         self.now += 30
-        self.idle.value = 30
+        self.idle.value = 20
         self.ui.probes = [panel(latestInbound="hello"), panel(latestOutbound="hi there")]
         result = self.runner().tick()
         self.assertEqual(result["status"], "sent", result)
         self.assertEqual(self.store.state["pending_queue"], [])
         self.assertEqual(self.ui.calls.count("send"), 1)
         self.assertIn(("probe", "May"), self.ui.calls)
+        self.assertEqual(self.ui.calls[0], "activate")
+        self.assertEqual(self.ui.calls[-2:], ["hide", ("restore", "Safari")])
+        self.assertEqual(self.ui.capture_frontmost_app(), "Safari")
+
+    def test_hidden_without_work_or_before_due_stays_hidden(self):
+        self.store.config["passive_roster_sweep_enabled"] = True
+        self.ui.background_probes = [{"status": "ok", "visibleChats": []}]
+        self.runner().tick()
+        self.assertEqual(self.ui.calls, [("probe_background", None)])
+        self.add_due_draft()
+        self.store.state["pending_queue"][0]["due_at"] = self.now + 60
+        self.runner().tick()
+        self.assertEqual(self.ui.calls, [("probe_background", None)])
+        self.assertFalse(self.ui.frontmost)
+        self.assertEqual(len(self.store.state["pending_queue"]), 1)
+
+    def test_user_open_wechat_only_hides_after_foreground_work(self):
+        self.ui.frontmost = True
+        self.runner().tick()
+        self.assertTrue(self.ui.frontmost)
+        self.assertEqual(self.ui.calls, [])
+        self.add_due_draft()
+        self.ui.probes = [panel(latestInbound="hello"), panel(latestOutbound="hi there")]
+        self.assertEqual(self.runner().tick()["status"], "sent")
+        self.assertEqual(self.ui.calls[-1], "hide")
+        self.assertNotIn("activate", self.ui.calls)
+        self.assertFalse(any(isinstance(call, tuple) and call[0] == "restore" for call in self.ui.calls))
+
+    def test_switch_just_before_hide_does_not_restore_over_user_choice(self):
+        self.add_due_draft()
+        self.ui.probes = [panel(latestInbound="hello"), panel(latestOutbound="hi there")]
+        hide = self.ui.hide_wechat
+
+        def switch_at_hide():
+            self.ui.frontmost = False
+            self.ui.other_app = "Xcode"
+            return hide()
+
+        with patch.object(self.ui, "hide_wechat", side_effect=switch_at_hide) as attempted_hide:
+            result = self.runner().tick()
+        self.assertEqual(result["status"], "sent", result)
+        attempted_hide.assert_called_once()
+        self.assertNotIn("hide", self.ui.calls)
+        self.assertNotIn(("restore", "Safari"), self.ui.calls)
+        self.assertEqual(self.ui.capture_frontmost_app(), "Xcode")
 
     def interrupt_at(self, step):
         self.add_due_draft()
-        self.ui.frontmost = True
         self.ui.probes = [panel(latestInbound="hello")]
         original = getattr(self.ui, step)
 
         def switch(*args, **kwargs):
             original(*args, **kwargs)
             self.ui.frontmost = False
+            self.ui.other_app = "Xcode"
 
         with patch.object(self.ui, step, side_effect=switch):
             result = self.runner().tick()
         self.assertEqual(result["status"], "waiting_for_wechat", result)
+        self.assertEqual(self.ui.calls[0], "activate")
+        self.assertNotIn("hide", self.ui.calls)
+        self.assertNotIn(("restore", "Safari"), self.ui.calls)
+        self.assertEqual(self.ui.capture_frontmost_app(), "Xcode")
         self.assertNotIn("send", self.ui.calls)
         self.assertEqual(self.store.state["pending"]["draft_text"], "hi there")
         self.assertFalse(any(e["type"] == "auto_sent" for e in self.store.events))
@@ -186,19 +248,22 @@ class BackgroundWorkflowTests(unittest.TestCase):
 
     def test_switch_after_return_rechecks_the_send_without_repeating_it(self):
         self.add_due_draft()
-        self.ui.frontmost = True
         self.ui.probes = [panel(latestInbound="hello")]
         send = self.ui.send_message
 
         def switch_after_send(**kwargs):
             send(**kwargs)
             self.ui.frontmost = False
+            self.ui.other_app = "Xcode"
 
         with patch.object(self.ui, "send_message", side_effect=switch_after_send):
             result = self.runner().tick()
         self.assertEqual(result["status"], "waiting_for_wechat", result)
         self.assertEqual(self.store.state["pending"]["send_attempts"], 1)
         self.assertEqual(self.ui.calls.count("send"), 1)
+        self.assertEqual(self.ui.calls[0], "activate")
+        self.assertNotIn("hide", self.ui.calls)
+        self.assertNotIn(("restore", "Safari"), self.ui.calls)
 
         self.now += self.store.config["send_confirmation_timeout_seconds"] + 1
         self.ui.frontmost = True
@@ -210,7 +275,6 @@ class BackgroundWorkflowTests(unittest.TestCase):
 
     def test_user_switch_in_same_window_during_ocr_stops_before_input(self):
         self.add_due_draft()
-        self.ui.frontmost = True
         self.ui.probes = [panel(latestInbound="hello")]
         probe = self.ui.probe
 
@@ -223,7 +287,8 @@ class BackgroundWorkflowTests(unittest.TestCase):
         with patch.object(self.ui, "probe", side_effect=switched_during_read):
             result = self.runner().tick()
         self.assertEqual(result["status"], "pending_wait_user_active", result)
-        self.assertEqual(self.ui.calls, [("probe", "May")])
+        self.assertEqual(self.ui.calls, ["activate", ("probe", "May")])
+        self.assertTrue(self.ui.frontmost)
         self.assertEqual(self.store.state["pending"]["draft_text"], "hi there")
 
     def test_same_window_must_still_show_recipient_before_paste_and_return(self):
@@ -259,16 +324,17 @@ class BackgroundWorkflowTests(unittest.TestCase):
 
     def test_failed_frontmost_lookup_cannot_authorize_input(self):
         self.add_due_draft()
-        self.ui.frontmost = True
         with patch.object(self.ui, "is_wechat_frontmost", side_effect=RuntimeError("unavailable")):
             result = self.runner().tick()
         self.assertEqual(result["status"], "waiting_for_wechat", result)
-        self.assertEqual(self.ui.calls, [])
+        self.assertEqual(self.ui.calls, ["activate", "hide", ("restore", "Safari")])
         self.assertEqual(self.store.state["pending"]["draft_text"], "hi there")
 
     def test_pending_contact_removed_while_hidden_cannot_receive_a_send(self):
         self.add_due_draft()
-        self.assertEqual(self.runner().tick()["status"], "waiting_for_wechat")
+        self.idle.value = 15
+        self.assertEqual(self.runner().tick()["status"], "pending_wait_user_active")
+        self.idle.value = 20
         self.store.config["allowed_contacts"].remove("May")
         self.ui.frontmost = True
         result = self.runner().tick()

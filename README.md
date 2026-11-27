@@ -96,9 +96,9 @@ See [incident-derived invariants](docs/INCIDENT_INVARIANTS.md) for the rules and
 ## Safety invariants
 
 - Only a verified numeric badge can enter the claim flow. Red pixels alone are insufficient, and warm avatar colors cannot override confirmed digit evidence.
-- The runner reads the roster in the background. Selecting a chat or sending requires WeChat to already be frontmost and the user to be idle.
+- The runner can read the roster and draft a confirmed reply while the user is active. It keeps the draft queued until its send time and the next idle period.
 - Global unread activity without a visible numeric allowlist badge is treated as non-allowlisted activity. Clear only visible non-allowlist badges; do not search through allowlisted contacts.
-- UI automation pauses when keyboard or mouse activity is detected and resumes after 20 seconds of inactivity by default.
+- When a check or a due send needs the window, the runner waits for `idle_threshold_seconds` (20 seconds by default), then automatically brings WeChat to the foreground. Keyboard or mouse activity pauses further input.
 - Persist drafts in insertion order, schedule the earliest due item, and re-read the chat with multi-frame consensus before sending.
 - Cancel or postpone on reliable manual-reply evidence, input-box content, or changed messages.
 - Identify pending items by inbound fingerprint, not contact name or queue position.
@@ -107,7 +107,7 @@ See [incident-derived invariants](docs/INCIDENT_INVARIANTS.md) for the rules and
 - If a click clears a badge, continue only when contact-row evidence, preview text, and the gray inbound bubble agree. Retry uncertainty within a finite budget.
 - Report the login screen as `wechat_login_required`, not an empty healthy roster.
 - Logging and cleanup failures must not stop the reply state machine.
-- Leave window visibility and the frontmost application under user control throughout the operation.
+- After a foreground check or send, the runner hides WeChat, including when it was already frontmost. It restores the previously active app if that app is known and different from WeChat. If the user starts interacting or switches apps during the work, the runner leaves focus with the user.
 
 ## Runtime flow
 
@@ -116,12 +116,13 @@ Dock unread or periodic scan → read the existing roster window
   ├─ fresh matching preview, contact, and incoming bubble → draft in background
   └─ insufficient evidence → save the contact or scan for a later foreground check
 
-User opens WeChat and becomes idle → recheck deferred work
+Window needed + Mac idle for the configured interval → automatically bring WeChat forward
+  ├─ pending observation → select the contact and recheck the conversation
   └─ due draft → verify contact, latest messages, and input box → send and verify
 ```
 
-A static or unreadable hidden window leaves the work pending. While WeChat is hidden,
-another app has focus, or the user is active, saved drafts stay in the queue.
+A static or unreadable hidden window can leave a conversation for a foreground check.
+While the user is active, saved drafts stay in the queue and background checks can continue.
 An overdue draft still goes through the normal manual-reply and send checks.
 Switching apps during a send pauses further input. Once a Return may have been sent,
 the runner keeps the attempt for confirmation.
@@ -390,7 +391,7 @@ Text replies primarily use OCR and chat context. Image/photo/sticker messages ca
 | `menu_bar_checked` | Dock/menu unread sample |
 | `passive_roster_preflight` | Roster check without focusing WeChat |
 | `wechat_login_required` | Runner alive, WeChat login required |
-| `wechat_foreground_session` | Begin or end of work in the already-frontmost WeChat window |
+| `wechat_foreground_session` | Begin or end of a foreground check or send |
 | `claim_candidates` | Candidate rows detected this tick |
 | `draft_saved_locally` | Draft queued |
 | `pending_recheck_voted` | Multi-frame pre-send result |
@@ -430,7 +431,7 @@ Check, in order: the switch, runner health, login status, allowlist membership, 
 
 ### WeChat opens without a new message
 
-Inspect `wechat_window_action`. Normal reasons are `claim_scan` and `pending_send_due`. If `claim_scan` follows `badge_detected=false`, retain the events and capture as a regression sample.
+Inspect `wechat_foreground_session` for `claim_scan` or `pending_send_due`. An unread observation from earlier, or a draft that has just become due, can explain an automatic opening during idle time even when no new message has arrived.
 
 ### Red avatar mistaken for unread
 

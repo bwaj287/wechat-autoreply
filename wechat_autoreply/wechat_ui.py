@@ -28,7 +28,6 @@ IGNORE_TEXTS = {
 }
 LOGIN_ENTRY_TEXTS = {"enter weixin", "enter wechat"}
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
-DOCK_WECHAT_NAMES = ["WeChat", "Weixin"]
 TEXT_SIGNAL_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
 EMOJI_CHAR_RE = re.compile(
     "["
@@ -271,29 +270,64 @@ def _looks_like_system_call_preview(text: str) -> bool:
     return bool(SYSTEM_CALL_PREVIEW_RE.fullmatch(value))
 
 
-def _click_dock_item(name: str) -> bool:
-    script = f"""
+def _running_app_handle(app: Any) -> str:
+    if not app or app.isTerminated() or not app.bundleIdentifier() or not app.launchDate():
+        return ""
+    return f"{app.processIdentifier()}:{app.launchDate().timeIntervalSince1970()}:{app.bundleIdentifier()}"
+
+
+def activate_wechat(expected_front: str | None = None) -> None:
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(WECHAT_BUNDLE_ID)
+    current = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if len(apps) != 1 or not current:
+        raise WeChatNotFrontmost("No running WeChat or foreground owner")
+    target = apps[0]
+    owner_pid = int(current.processIdentifier())
+    pid = int(target.processIdentifier())
+    owner = "" if owner_pid == pid else _running_app_handle(current)
+    if expected_front is not None and (expected_front != owner or (not owner and owner_pid != pid)):
+        raise WeChatNotFrontmost("Foreground owner changed before activating WeChat")
+
+    # All commands address living processes. Activation happens at most once, even if focus never arrives.
+    script = f'''
 tell application "System Events"
-  tell process "Dock"
-    try
-      click UI element "{name}" of list 1
-      return "clicked"
-    on error
-      return "missing"
-    end try
-  end tell
+  set p to first application process whose unix id is {pid}
+  if bundle identifier of p is not "{WECHAT_BUNDLE_ID}" then return false
+  set ownerPID to unix id of first application process whose frontmost is true
+  if ownerPID is not {owner_pid} then return false
+  if not (visible of p) then set visible of p to true
+  set ownerPID to unix id of first application process whose frontmost is true
+  if ownerPID is not {pid} then
+    if ownerPID is not {owner_pid} then return false
+    set frontmost of p to true
+  end if
+  repeat 10 times
+    set ownerPID to unix id of first application process whose frontmost is true
+    if ownerPID is {pid} then exit repeat
+    if ownerPID is not {owner_pid} then return false
+    delay 0.05
+  end repeat
+  if not (frontmost of p) then return false
+  set mainWindows to {{}}
+  repeat with w in windows of p
+    if subrole of w is "AXStandardWindow" and (name of w is in {{"WeChat", "Weixin", "微信"}}) then set end of mainWindows to contents of w
+  end repeat
+  if (count mainWindows) is 1 then
+    set mainWindow to item 1 of mainWindows
+    if value of attribute "AXMinimized" of mainWindow is true then
+      if not (frontmost of p) then return false
+      set value of attribute "AXMinimized" of mainWindow to false
+    end if
+  end if
+  return true
 end tell
-"""
-    out = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
-    return out == "clicked"
-
-
-def activate_wechat() -> None:
-    for name in DOCK_WECHAT_NAMES:
-        if _click_dock_item(name):
-            time.sleep(0.5)
-            return
-    run(["osascript", "-e", 'tell application "WeChat" to activate', "-e", "delay 0.4"], timeout=30)
+'''
+    try:
+        accepted = run(["osascript", "-e", script], timeout=4).stdout.strip() == "true"
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WeChatNotFrontmost("Could not activate the existing WeChat window") from exc
+    if not accepted:
+        raise WeChatNotFrontmost("WeChat activation was interrupted or refused")
 
 
 def _escape_applescript_string(value: str) -> str:
@@ -301,108 +335,41 @@ def _escape_applescript_string(value: str) -> str:
 
 
 def capture_frontmost_app() -> str:
-    script = """
-tell application "System Events"
-  try
-    return name of first process whose frontmost is true
-  on error
-    return ""
-  end try
-end tell
-"""
-    try:
-        return run(["osascript", "-e", script], timeout=30).stdout.strip()
-    except Exception:
+    app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if not app or app.bundleIdentifier() == WECHAT_BUNDLE_ID:
         return ""
+    return _running_app_handle(app)
 
 
-def restore_frontmost_app(app_name: str) -> None:
-    target = str(app_name or "").strip()
-    if not target or target in {"WeChat", "Weixin"}:
+def restore_frontmost_app(handle: str) -> None:
+    pid, _, _ = handle.partition(":")
+    if not pid.isdigit():
         return
-    run(["osascript", "-e", f'tell application "{_escape_applescript_string(target)}" to activate'], timeout=30)
-
-
-def _process_visible(name: str) -> bool | None:
-    target = str(name or "").strip()
-    if not target:
-        return None
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
+    if _running_app_handle(app) != handle or app.bundleIdentifier() == WECHAT_BUNDLE_ID or app.isHidden():
+        return
+    current = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if not current or int(current.processIdentifier()) == int(pid):
+        return
     script = f'''
 tell application "System Events"
-  if exists process "{_escape_applescript_string(target)}" then
-    return visible of process "{_escape_applescript_string(target)}"
-  end if
+  if (unix id of first application process whose frontmost is true) is not {int(current.processIdentifier())} then return false
+  set p to first application process whose unix id is {int(pid)}
+  if not (visible of p) then return false
+  set frontmost of p to true
+  return true
 end tell
-return "missing"
 '''
-    try:
-        out = run(["osascript", "-e", script], timeout=30).stdout.strip().lower()
-    except Exception:
-        return None
-    if out == "true":
-        return True
-    if out == "false":
+    run(["osascript", "-e", script], timeout=3)
+
+
+def hide_wechat() -> bool:
+    app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if not app or app.bundleIdentifier() != WECHAT_BUNDLE_ID or app.isHidden():
         return False
-    return None
-
-
-def _any_wechat_visible() -> bool:
-    seen = False
-    for name in DOCK_WECHAT_NAMES:
-        visible = _process_visible(name)
-        if visible is None:
-            continue
-        seen = True
-        if visible:
-            return True
-    return False
-
-
-def hide_wechat() -> None:
-    scripts = [
-        """
-tell application "System Events"
-  if exists process "WeChat" then
-    set visible of process "WeChat" to false
-    return "hidden"
-  end if
-end tell
-return "missing"
-""",
-        """
-tell application "System Events"
-  if exists process "Weixin" then
-    set visible of process "Weixin" to false
-    return "hidden"
-  end if
-end tell
-return "missing"
-""",
-        """
-tell application "WeChat" to hide
-return "hidden"
-""",
-        """
-tell application "Weixin" to hide
-return "hidden"
-""",
-        """
-tell application "System Events"
-  keystroke "h" using {command down}
-end tell
-return "hidden"
-""",
-    ]
-    errors: list[str] = []
-    for script in scripts:
-        try:
-            run(["osascript", "-e", script], timeout=30)
-            time.sleep(0.12)
-            if not _any_wechat_visible():
-                return
-        except Exception as exc:  # pragma: no cover - exercised only on macOS host
-            errors.append(str(exc))
-    raise RuntimeError(" ; ".join(errors) or "failed to hide wechat")
+    if not app.hide():
+        raise RuntimeError("WeChat refused the hide request")
+    return True
 
 
 def _read_clipboard_text(*, strict: bool = False) -> str:
