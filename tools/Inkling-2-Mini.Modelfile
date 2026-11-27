@@ -1,0 +1,4 @@
+FROM ./Inkling-2-Mini-UD-IQ3_XXS.gguf
+RENDERER inkling2
+PARSER inkling2
+PARAMETER num_ctx 2048

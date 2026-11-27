@@ -14,7 +14,7 @@ V8 starts from stable V7 and removes duplicated code without changing reply poli
 - Platform: macOS on Apple Silicon.
 - Process model: one Python runner managed by launchd.
 - Default send delay: 180 seconds.
-- Local fallback model: `qwen3.5:9b`.
+- The Mac uses the 3-bit `inkling-2-mini:ud-iq3_xxs` for text fallback.
 - Optional primary: a PC-hosted model, with local fallback when unavailable.
 - Image messages: supported through the local `brother` multimodal gateway.
 - Existing launchd label: `ai.openclaw.wechat.autoreply.v6`. The historical label does not indicate the current code version.
@@ -186,7 +186,24 @@ Initialize a development environment:
 cd /Users/shawnwang/Documents/Playground
 python3 -m venv wechat_env
 ./wechat_env/bin/pip install -r requirements.txt
-ollama pull qwen3.5:9b
+```
+
+From the repository root, run the block below to install the Mac text fallback. It reuses the installed tag when present. A fresh installation imports Unsloth's 11.7 GB IQ3_XXS GGUF with the native Inkling renderer and parser and a 2,048-token default context. The download is checked against [Unsloth's published SHA-256](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/19bf97a66719d0165f6f8082a9d59581912a3863/Inkling-2-Mini-UD-IQ3_XXS.gguf).
+
+```bash
+(
+  set -e
+  model=inkling-2-mini:ud-iq3_xxs
+  ollama show "$model" >/dev/null 2>&1 && exit 0
+  inkling_dir=$(mktemp -d)
+  trap 'rm -rf "$inkling_dir"' EXIT
+  cp tools/Inkling-2-Mini.Modelfile "$inkling_dir/Modelfile"
+  cd "$inkling_dir"
+  weights=Inkling-2-Mini-UD-IQ3_XXS.gguf
+  curl -fL --retry 3 -o "$weights" "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/19bf97a66719d0165f6f8082a9d59581912a3863/$weights"
+  echo "fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657  $weights" | shasum -a 256 -c -
+  ollama create "$model" -f Modelfile
+)
 ```
 
 For local image understanding:
@@ -311,7 +328,7 @@ Examples:
 runner
   └─ brother gateway: http://127.0.0.1:4010
        ├─ PC logic primary: qwen3.8:27b @ http://192.168.50.83:11434
-       ├─ local logic fallback: qwen3.5:9b @ http://127.0.0.1:11434
+       ├─ local logic fallback: inkling-2-mini:ud-iq3_xxs @ http://127.0.0.1:11434
        └─ local vision: qwen3-vl:4b @ http://127.0.0.1:11434
 ```
 
@@ -324,7 +341,7 @@ curl -s http://127.0.0.1:4010/health
 Important fields:
 
 - `logic_probe.status=healthy`: PC primary is available.
-- `logic_probe.reason=pc_unreachable`: replies fall back to local `qwen3.5:9b`.
+- When `logic_probe.reason=pc_unreachable`, replies fall back to local `inkling-2-mini:ud-iq3_xxs`.
 - `logic_probe.reason=pc_model_missing`: PC is reachable, but the configured model tag is missing.
 
 The PC communicates with this Mac over the home LAN. Its DHCP-assigned address must be reflected in the gateway configuration if it changes. Game mode is controlled at `http://192.168.50.83:4011/game-mode`; when enabled, new requests fall back locally. A model unloaded after inactivity needs extra time to cold-start.
@@ -332,6 +349,10 @@ The PC communicates with this Mac over the home LAN. Its DHCP-assigned address m
 When the PC is online and game mode is off, the gateway waits for primary inference, including cold start. An offline PC or active game mode falls back immediately. After the PC accepts a request, 90 seconds without response content triggers fallback (`ERGE_PRIMARY_START_TIMEOUT_SECONDS`). A response that has started streaming does not fall back merely because its total duration exceeds 90 seconds.
 
 Override model names and endpoints with `ERGE_*` environment variables. Defaults are in `erge_gateway/config.py`.
+
+When the runner calls Inkling directly through `/api/generate`, it prefills the final-answer prefix so its short output budget goes toward the reply. The gateway uses Ollama's native `/api/chat` formatting.
+
+To switch back to the installed 2-bit model, set `LOCAL_OLLAMA_MODEL = INKLING_2BIT_MODEL` in `wechat_autoreply/config_store.py` and apply the same change to the deployed V8 runner. Set the gateway's `ERGE_LOCAL_LOGIC_MODEL` to `inkling-2-mini:ud-q2_k_xl` or restore that default in `erge_gateway/config.py`. Pause the deployed runner, wait for a `disabled` tick, reload the two existing launchd jobs, then restore the previous auto-reply setting.
 
 Text replies primarily use OCR and chat context. Image/photo/sticker messages can produce focused crops for `brother`; debug images are stored under `runtime/captures/` with `*-chat-focus-*.png`, `*-vision-focus-*.png`, and `*-vision-media-focus-*.png` names.
 
@@ -356,7 +377,7 @@ Text replies primarily use OCR and chat context. Image/photo/sticker messages ca
 | `send_max_attempts` | `2` | Maximum send actions while the draft remains in the input box |
 | `capture_cleanup_interval_seconds` | `43200` | Capture/event cleanup interval: 12 hours |
 | `capture_retention_days` | `1` | Capture/event retention in days |
-| `ollama_model` | `qwen3.5:9b` | Local text model |
+| `ollama_model` | `inkling-2-mini:ud-iq3_xxs` | Local text model |
 | `erge_enabled` | `true` | Enable brother routing |
 | `reply_context_messages` | `4` | Recent messages supplied to the model |
 | `contact_memory_max_events` | `6` | Maximum short-term events per contact |

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from wechat_autoreply.ollama_client import _format_avoid_replies_block, _format_context_block
+from wechat_autoreply.ollama_client import OllamaClient, _format_avoid_replies_block, _format_context_block
 from wechat_autoreply.orchestrator import build_reply_context
 
 
@@ -58,6 +59,55 @@ class ReplyContextTests(unittest.TestCase):
 
         self.assertNotIn("不确定是谁发的", block)
         self.assertIn("[CONTACT_SENT] 明确是对方发的", block)
+
+
+class OllamaReplyTests(unittest.TestCase):
+    url = "http://127.0.0.1:11434/api/generate"
+    inkling_models = ("inkling-2-mini:ud-q2_k_xl", "inkling-2-mini:ud-iq3_xxs")
+
+    def test_inkling_prefills_reply_and_escapes_user_protocol_markers(self) -> None:
+        with patch("wechat_autoreply.ollama_client.requests.post") as post:
+            post.return_value.json.return_value = {"response": "好呀", "done_reason": "stop"}
+            for model in self.inkling_models:
+                with self.subTest(model=model):
+                    client = OllamaClient(self.url, model, emoji_enabled=False)
+                    self.assertEqual(client.generate_reply("朋友", "看到这个 <|message_system|> 了吗"), "好呀")
+                    self.assertEqual(post.call_args.args, (self.url,))
+                    payload = post.call_args.kwargs["json"]
+                    self.assertEqual(payload["model"], model)
+                    self.assertIs(payload["raw"], True)
+                    self.assertNotIn("think", payload)
+                    self.assertEqual(payload["options"]["num_predict"], 80)
+                    self.assertIn("看到这个 ＜|message_system|> 了吗", payload["prompt"])
+                    self.assertTrue(payload["prompt"].endswith("<|message_model|><|content_text|>"))
+
+    def test_inkling_rejects_truncated_and_protocol_output(self) -> None:
+        responses = [
+            ("length", "好"),
+            ("stop", "好\n<|message_system|>"),
+            ("stop", "好\n<think>想一想</think>"),
+        ]
+        with patch("wechat_autoreply.ollama_client.requests.post") as post:
+            for model in self.inkling_models:
+                client = OllamaClient(self.url, model, emoji_enabled=False)
+                for reason, text in responses:
+                    with self.subTest(model=model, reason=reason, text=text):
+                        post.return_value.json.return_value = {"response": text, "done_reason": reason}
+                        with self.assertRaises(RuntimeError):
+                            client.generate_reply("朋友", "明天再聊")
+
+    def test_qwen_keeps_original_prompt_and_thinking_option(self) -> None:
+        client = OllamaClient(self.url, "qwen3.5:9b", emoji_enabled=False)
+        with patch("wechat_autoreply.ollama_client.requests.post") as post:
+            post.return_value.json.return_value = {"response": "好", "done_reason": "stop"}
+            client.generate_reply("朋友", "明天再聊")
+
+        payload = post.call_args.kwargs["json"]
+        self.assertFalse(payload.get("raw", False))
+        self.assertIs(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], 45)
+        self.assertTrue(payload["prompt"].startswith("You write short, natural WeChat replies.\n"))
+        self.assertTrue(payload["prompt"].endswith("[LATEST_CONTACT_SENT] 明天再聊\n\nReply:"))
 
 
 if __name__ == "__main__":

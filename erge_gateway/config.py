@@ -21,7 +21,7 @@ class Settings:
     logic_primary_model: str = os.getenv("ERGE_LOGIC_MODEL", "qwen3.8:27b")
 
     logic_local_base_url: str = os.getenv("ERGE_LOCAL_LOGIC_BASE_URL", "http://127.0.0.1:11434")
-    logic_local_model: str = os.getenv("ERGE_LOCAL_LOGIC_MODEL", "qwen3.5:9b")
+    logic_local_model: str = os.getenv("ERGE_LOCAL_LOGIC_MODEL", "inkling-2-mini:ud-iq3_xxs")
 
     health_pc_base_url: str = os.getenv("ERGE_HEALTH_PC_BASE_URL", "http://192.168.50.83:11434")
     health_pc_model: str = os.getenv("ERGE_HEALTH_PC_MODEL", "qwen3.8:27b")

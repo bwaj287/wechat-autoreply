@@ -5,6 +5,7 @@ import re
 
 import requests
 
+from .config_store import INKLING_2BIT_MODEL, INKLING_3BIT_MODEL
 from .emoji_library import build_wechat_emoji_codes, load_wechat_emoji_names
 
 
@@ -275,24 +276,34 @@ class OllamaClient:
             f"[LATEST_CONTACT_SENT] {inbound_text}\n\n"
             "Reply:"
         )
-        response = requests.post(
-            self.url,
-            json={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "think": False,
-                "options": {
-                    "num_ctx": 1024,
-                    "num_predict": num_predict,
-                    "temperature": 0.7,
-                },
-            },
-            timeout=(5, 120),
-        )
+        options: dict[str, Any] = {"num_ctx": 1024, "num_predict": num_predict, "temperature": 0.7}
+        request = {"model": self.model, "prompt": prompt, "stream": False, "options": options}
+        is_inkling = self.model in (INKLING_2BIT_MODEL, INKLING_3BIT_MODEL)
+        if is_inkling:
+            # Prefill the answer channel: Inkling can exhaust a short budget even with think=False.
+            request["raw"] = True
+            request["prompt"] = (
+                "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+                "<|message_system|><|content_text|>你在替本人回复微信。用来信的语言自然地回一句，尽量在三十字内说完。"
+                "以聊天中明确提到的事实为准；缺信息就简短询问，不代本人声称或承诺办事，不猜看不清的图片或未知情况。"
+                "以对方最后一句为准，尊重对方说停。<|end_message|>"
+                "<|message_user|><|content_text|>" + prompt.replace("<|", "＜|")
+                + "<|end_message|><|message_model|><|content_text|>"
+            )
+            options["num_predict"] = 80
+            options["stop"] = [
+                "<|end_message|>", "<|content_model_end_sampling|>", "<|message_model|>", "<|content_thinking|>",
+            ]
+        else:
+            request["think"] = False
+        response = requests.post(self.url, json=request, timeout=(5, 120))
         response.raise_for_status()
         payload = response.json()
-        text = str(payload.get("response", "")).strip()
+        text = str(payload.get("response") or "").strip()
+        if is_inkling and (
+            payload.get("done_reason") == "length" or re.search(r"<\||</?think\b", text, re.IGNORECASE)
+        ):
+            raise RuntimeError("Inkling returned an incomplete or malformed reply")
         text = _normalize_reply_text(text)
         if not text:
             raise RuntimeError("ollama returned an empty reply")

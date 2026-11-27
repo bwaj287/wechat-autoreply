@@ -6,7 +6,9 @@ from .json_output import write_json_atomically as _atomic_write
 from .paths import CONFIG_PATH, SWITCH_PATH, WHITELIST_PATH, ensure_runtime_dirs
 
 
-LOCAL_OLLAMA_MODEL = "qwen3.5:9b"
+INKLING_2BIT_MODEL = "inkling-2-mini:ud-q2_k_xl"
+INKLING_3BIT_MODEL = "inkling-2-mini:ud-iq3_xxs"
+LOCAL_OLLAMA_MODEL = INKLING_3BIT_MODEL
 LOCAL_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
 
