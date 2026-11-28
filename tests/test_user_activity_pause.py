@@ -17,6 +17,26 @@ class Idle:
 
 
 class UserActivityPauseTests(unittest.TestCase):
+    def test_window_capture_waits_for_passive_recovery_with_queue_intact(self):
+        store = MemoryStore()
+        clock = [1000.]
+        store.state["pending_queue"] = [{"contact": "May", "due_at": 900., "draft_text": "hello"}]
+        runner = AutoReplyRunner(vision_sensor=FakeVision([]), idle_sensor=Idle(60), ui=FakeUI([]),
+                                 load_config_fn=store.load_config, load_state_fn=store.load_state,
+                                 save_state_fn=store.save_state, append_event_fn=store.append_event,
+                                 now_fn=lambda: clock[0])
+        with patch.object(runner, "_handle_pending", side_effect=[
+            RuntimeError("could not create image from window"), {"status": "rechecked"}
+        ]) as handle, patch.object(runner, "_probe_roster_background_ui",
+                                   side_effect=[RuntimeError("still unavailable"), {"status": "ok"}]) as probe:
+            for clock[0] in (1000., 1005., 1060., 1065.):
+                self.assertEqual(runner.tick()["status"], "waiting_for_window_capture")
+                self.assertEqual(store.state["pending_queue"][0]["draft_text"], "hello")
+            self.assertEqual((handle.call_count, probe.call_count), (1, 1))
+            clock[0] = 1120.
+            self.assertEqual(runner.tick()["status"], "rechecked")
+            self.assertNotIn("capture_retry_at", store.state)
+
     def test_interrupted_pending_does_not_schedule_an_unrelated_claim(self) -> None:
         for phase in ("claim", "pending"):
             with self.subTest(phase=phase):

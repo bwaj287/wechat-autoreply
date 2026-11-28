@@ -1596,6 +1596,22 @@ class AutoReplyRunner:
                 result = {"status": "disabled"}
                 return result
 
+            if state.get("capture_retry_at"):
+                if now < state["capture_retry_at"]:
+                    return {"status": "waiting_for_window_capture"}
+                state["capture_retry_at"] = now + 60
+                try:
+                    readable = self._probe_roster_background_ui().get("status") == "ok"
+                except Exception as exc:
+                    state["last_error"] = str(exc)
+                    readable = False
+                if not readable:
+                    return {"status": "waiting_for_window_capture"}
+                state.pop("capture_retry_at")
+                for item in sync_pending_state(state):
+                    item["due_at"] = max(now, float(item.get("due_at") or 0))
+                self.append_event("window_capture_recovered")
+
             idle_seconds = self._live_idle_seconds()
             idle_threshold = self._idle_threshold
             interactive = idle_seconds >= idle_threshold
@@ -1700,6 +1716,8 @@ class AutoReplyRunner:
                     try:
                         roster = self._probe_roster_background_ui()
                     except Exception as exc:
+                        if "could not create image from window" in str(exc).lower():
+                            raise
                         roster = {"status": "window_unreadable"}
                         self.append_event("background_roster_unavailable", error=str(exc))
                     page_status = roster.get("status")
@@ -1794,6 +1812,8 @@ class AutoReplyRunner:
                     )
                 except Exception as exc:
                     # A failed background probe should not run again every tick.
+                    if "could not create image from window" in str(exc).lower():
+                        raise
                     state["last_roster_sweep_at"] = now
                     error = str(exc)
                     if "APP_NOT_FOUND" in error or "no roster window found" in error:
@@ -1887,6 +1907,12 @@ class AutoReplyRunner:
             }
         except Exception as exc:
             state["last_error"] = str(exc)
+            if "could not create image from window" in str(exc).lower():
+                state["capture_retry_at"] = float(self.now()) + 60
+                if claim_in_progress:
+                    state["foreground_scan_pending"] = True
+                self.append_event("window_capture_paused", error=str(exc))
+                return {"status": "waiting_for_window_capture"}
             self.append_event("runner_error", error=str(exc))
             return {"status": "error", "reason": str(exc)}
         finally:

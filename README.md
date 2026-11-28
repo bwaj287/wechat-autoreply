@@ -413,6 +413,10 @@ menu_bar_checked
 
 ## Troubleshooting
 
+### Window capture keeps failing
+
+After `could not create image from window`, the runner records `window_capture_paused` and reports `waiting_for_window_capture`. It keeps queued drafts and checks the roster in the background at most once per minute without focusing WeChat. Once the roster is readable, it records `window_capture_recovered` and resumes normal idle and send-time checks. No queue reset is needed.
+
 ### New message, no reply
 
 ```bash
